@@ -1,0 +1,49 @@
+{
+  "name": "@webergency-utils/mongodb-model",
+  "version": "0.0.1",
+  "description": "Type-safe MongoDB model abstraction",
+  "author": "radixxko",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist/**/*"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "build": "tsc && tsc -p tsconfig.esm.json && echo '{\"type\":\"module\"}' > dist/esm/package.json",
+    "version": "npm i && npm run build && npm publish --access public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/webergency-utils/mongodb-model.git"
+  },
+  "dependencies": {
+    "@liqd-js/flow": "^1.5.0",
+    "@webergency-utils/aggregator": "file:../aggregator",
+    "@webergency-utils/mongodb-query-optimizer": "file:../mongodb-query-optimizer",
+    "@webergency-utils/object-hash": "file:../object-hash",
+    "mongodb": "^7.0.0",
+    "snappy": "^7.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@vitest/coverage-v8": "^4.1.9",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}
