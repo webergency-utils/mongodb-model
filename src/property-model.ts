@@ -87,7 +87,7 @@ export abstract class AbstractPropertyModel
     Extensions extends PropertyModelExtensions<DBE, AbstractPropertyModelSmartFilters<any, any>, AbstractPropertyModelComputedProperties<any, any>>
 >
 {
-    #findAggregator: Aggregator<DTO['id'], Array<DBE | null>>;
+     #findAggregator: Aggregator<DTO['id'] | DBE['id'], DBE | null>;
     #paths: { path: string, array: boolean }[];
     #prefix: string;
     #converters: ConverterManager<DBE>;
@@ -454,7 +454,7 @@ export abstract class AbstractPropertyModel
         if( access.denied ){ return null }
 
         const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
-        const documents = await this.#findAggregator.call( Arr( id ), conversion ) as Array<DBE | null>;
+        const documents = await this.#findAggregator.execute( Arr( id ) as Array<DTO['id'] | DBE['id']>, conversion ) as Array<DBE | null>;
 
         benchmark?.step( 'QUERY' );
 
@@ -479,7 +479,7 @@ export abstract class AbstractPropertyModel
         }
 
         const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
-        const documents = await this.#findAggregator.call( ids as DTO['id'][], conversion ) as Array<DBE | null>;
+        const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion ) as Array<DBE | null>;
 
         benchmark?.step( 'QUERY' );
 

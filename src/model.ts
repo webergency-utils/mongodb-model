@@ -68,7 +68,7 @@ export abstract class AbstractModel
     Extensions extends ModelExtensions<DBE, AbstractModelSmartFilters<ExtractSmartFilters<Extensions>>, AbstractModelProperties<ExtractComputedProperties<Extensions>>>
 >
 {
-    #findAggregator: Aggregator<DTO['id'], Array<DBE | null>>;
+    #findAggregator: Aggregator<DTO['id'], DBE | null>;
     #converters: ConverterManager<DBE>;
     #access: AccessControl<DBE>;
     #smartFilters: SmartFilterResolver;
@@ -317,7 +317,7 @@ export abstract class AbstractModel
         if( access.denied ){ return null }
 
         const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
-        const documents = await this.#findAggregator.call( Arr( id ), conversion, access.filter ) as Array<DBE | null>;
+        const documents = await this.#findAggregator.execute( Arr( id ), conversion, access.filter ) as Array<DBE | null>;
 
         benchmark?.step( 'QUERY' );
 
@@ -342,7 +342,7 @@ export abstract class AbstractModel
         }
 
         const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
-        const documents = await this.#findAggregator.call( ids as DTO['id'][], conversion, access.filter ) as Array<DBE | null>;
+        const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion, access.filter ) as Array<DBE | null>;
 
         benchmark?.step( 'QUERY' );
 
