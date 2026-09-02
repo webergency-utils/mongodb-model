@@ -80,7 +80,9 @@ function applyPick<DBE extends Document>( dbe: DBE, pick: readonly string[], ctx
 
         if( key in dbe )
         {
-            result[key] = ( dbe as Record<string, unknown>)[key];
+            const value = ( dbe as Record<string, unknown>)[key];
+
+            result[key] = key === 'id' ? ctx.dtoID( value ) : value;
         }
     }
 

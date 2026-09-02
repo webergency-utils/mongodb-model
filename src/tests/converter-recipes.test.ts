@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest';
+import { Document } from 'mongodb';
 import { compileConverters, ConverterRecipeError } from '../converter-recipes.js';
 import { createDefaultConverters } from '../default-converters.js';
 import type { MongoRootDocument } from '../types/external.js';
@@ -168,6 +169,21 @@ describe( 'compileConverters recipes', () =>
         expect( converters.customDTO.projection ).toEqual({ _id: 1 });
         expect( converters.customDTO.computedProperties ).toEqual([ 'score' ]);
         expect( await converters.adminDTO.converter({ _id: '1', name: 'Tag', type: 'x' })).toEqual({ id: '1', name: 'Tag' });
+    });
+
+    test( 'pick applies dtoID when selecting id', async() =>
+    {
+        type AppDBE = Document & { id: string, status: string };
+
+        const converters = compileConverters<AppDBE>(
+        {
+            basicDTO: { pick: [ 'id', 'status' ] }
+        },
+        { dtoID: ( id ) => `dto:${id}` });
+
+        const result = await converters.basicDTO.converter({ id: 'app-1', status: 'submitted' }) as Record<string, unknown>;
+
+        expect( result ).toEqual({ id: 'dto:app-1', status: 'submitted' });
     });
 
     test( 'circular extends throws cycle path', () =>
