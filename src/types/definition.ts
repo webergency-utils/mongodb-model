@@ -1,5 +1,5 @@
 import { Document, FindOptions } from 'mongodb';
-import { AbstractModelConverter, AbstractModelConverters, MongoPropertyDocument, MongoRootDocument } from './external.js';
+import { AbstractModelConverter, AbstractModelConverters, ModelAccessConfig, MongoPropertyDocument, MongoRootDocument } from './external.js';
 import { ComputedPropertiesParam } from './internal.js';
 
 export type CompileConverterContext =
@@ -77,6 +77,7 @@ export type RootModelDefinition
     converters?          : ConverterRecipeMap<DBE>
     smartFilters?        : SmartFilters
     computedProperties?  : ComputedProperties
+    access?              : ModelAccessConfig<DBE>
     dtoID?               : ( id: unknown ) => string
 }
 
@@ -92,6 +93,7 @@ export type PropertyModelDefinition
     converters?          : ConverterRecipeMap<DBE>
     smartFilters?        : SmartFilters
     computedProperties?  : ComputedProperties
+    access?              : ModelAccessConfig<DBE>
     dtoID?               : ( id: unknown ) => string
 }
 

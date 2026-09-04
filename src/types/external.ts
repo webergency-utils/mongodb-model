@@ -13,8 +13,9 @@ import
 }
 from './internal.js';
 
-export type ModelCreateOptions = { duplicateIgnore?: boolean };
-export type ModelUpdateOptions = { documentBefore?: boolean, documentAfter?: boolean };
+export type ModelCreateOptions = { duplicateIgnore?: boolean, access?: string };
+export type ModelUpdateOptions = { documentBefore?: boolean, documentAfter?: boolean, access?: string };
+export type ModelDeleteOptions = { access?: string };
 export type MongoRootDocument = Document & { _id: any };
 export type MongoPropertyDocument = Document & { id: any };
 
@@ -27,13 +28,15 @@ export type ListResult<T> =
 
 export type GetOptions<K extends string | number | symbol = 'dto'> =
 {
-    as? : K
+    as?     : K
+    access? : string
 }
 
 export type GetManyOptions<K extends string | number | symbol = 'dto'> =
 {
     as?     : K
     filter? : boolean
+    access? : string
 }
 
 export type ModelSmartFilter<T> = { [K in PublicMethodNames<T>]?: FirstParameter<T[K]> }
@@ -49,6 +52,7 @@ export type ModelListOptions<DBE extends Document, Filters = never> = FindOption
     count?       : boolean
     sample?      : number
     countLimit?  : number
+    access?      : string
 };
 
 export type ModelStreamOptions<DBE extends Document, Filters = never> =
@@ -70,6 +74,7 @@ export type PropertyModelListOptions
     count?       : boolean
     sample?      : number
     countLimit?  : number
+    access?      : string
 };
 
 export type PropertyModelStreamOptions
@@ -84,6 +89,7 @@ export type ModelFindOptions<DBE extends Document, Filters = never> =
 {
     filter?      : Filter<DBE>
     smartFilter? : ModelSmartFilter<Filters>
+    access?      : string
 }
 
 export type PropertyModelFindOptions
@@ -96,6 +102,7 @@ export type PropertyModelFindOptions
 {
     filter?      : PropertyModelFilter<RootDBE, DBE>
     smartFilter? : ModelSmartFilter<SecondType<Filters>>
+    access?      : string
 }
 
 export type ModelAggregateOptions
@@ -111,6 +118,7 @@ export type ModelAggregateOptions
     computedProperties? : ComputedPropertiesParam<Properties>
     projection?         : FindOptions['projection']
     sort?               : FindOptions['sort']
+    access?             : string
 };
 
 export type PropertyModelAggregateOptions
@@ -127,6 +135,7 @@ export type PropertyModelAggregateOptions
     computedProperties? : ComputedPropertiesParam<SecondType<Properties>>
     projection?         : FindOptions['projection']
     sort?               : FindOptions['sort']
+    access?             : string
 };
 
 export type FirstType<T> = T extends [ infer U, ...unknown[] ] ? U : undefined;
@@ -197,6 +206,7 @@ export type ModelExtensions
     converters          : AbstractModelConverters<DBE>
     smartFilters?       : SmartFilters
     computedProperties? : ComputedProperties
+    access?             : ModelAccessConfig<DBE>
 }
 
 export type PropertyModelExtensions
@@ -210,6 +220,7 @@ export type PropertyModelExtensions
     converters          : AbstractModelConverters<DBE>
     smartFilters?       : SmartFilters
     computedProperties? : ComputedProperties
+    access?             : ModelAccessConfig<DBE>
 }
 
 export type MongoBSONTypes<T> = T extends ObjectId

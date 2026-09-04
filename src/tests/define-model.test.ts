@@ -132,4 +132,29 @@ describe( 'Model factory', () =>
 
         expect( dto ).toEqual({ id: 'cfg:1', name: 'TypeScript' });
     });
+
+    test( 'access filters and defaults apply on list', async() =>
+    {
+        const aggregate = vi.fn(() => ({ toArray: async() => [] }));
+
+        class SkillModel extends Model<SkillDBE, SkillDTO>(
+        {
+            access:
+            {
+                filters  : { 'org-read': async() => ({ name: 'TypeScript' }) },
+                defaults : { read: 'org-read' }
+            }
+        })
+        {}
+
+        const models = new TestModels();
+        const skills = new SkillModel( models, { collectionName: 'skills', aggregate } as any );
+
+        await skills.list({ count: false });
+
+        const pipeline = aggregate.mock.calls[0][0] as any[];
+        const serialized = JSON.stringify( pipeline );
+
+        expect( serialized ).toContain( '"name":"TypeScript"' );
+    });
 });

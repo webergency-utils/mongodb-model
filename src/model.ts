@@ -47,6 +47,7 @@ import
     ListResult,
     ModelAggregateOptions,
     ModelCreateOptions,
+    ModelDeleteOptions,
     ModelExtensions,
     ModelFindOptions,
     ModelListOptions,
@@ -68,6 +69,7 @@ export abstract class AbstractModel
     Extensions extends ModelExtensions<DBE, AbstractModelSmartFilters<ExtractSmartFilters<Extensions>>, AbstractModelProperties<ExtractComputedProperties<Extensions>>>
 >
 {
+    #models: AbstractModels;
     #findAggregator: Aggregator<DTO['id'], DBE | null>;
     #converters: ConverterManager<DBE>;
     #access: AccessControl<DBE>;
@@ -81,10 +83,17 @@ export abstract class AbstractModel
 
     protected constructor( models: AbstractModels, public collection: Collection<DBE>, params: Extensions )
     {
+        this.#models = models;
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this.smartFilters = params.smartFilters;
         this.#converters = new ConverterManager( this, this.converters );
-        this.#access = new AccessControl( this, () => this.accessFilter() );
+        this.#access = new AccessControl(
+        {
+            model            : this,
+            config           : params.access,
+            filterOverridden : this.accessFilter !== AbstractModel.prototype.accessFilter,
+            invokeFilter     : ( name ) => this.accessFilter( name )
+        });
         this.#smartFilters = new SmartFilterResolver( this, this.smartFilters );
         this.#computedProperties = new ComputedPropertyResolver( this, params.computedProperties );
 
@@ -185,13 +194,38 @@ export abstract class AbstractModel
         return dbeID as DTO['id'];
     }
 
+    protected ensureOpen(): void
+    {
+        this.#models.assertOpen();
+    }
+
+    protected trackOperation(): () => void
+    {
+        return this.#models.trackOperation();
+    }
+
+    protected async runOperation<T>( operation: () => Promise<T> ): Promise<T>
+    {
+        const release = this.trackOperation();
+
+        try
+        {
+            return await operation();
+        }
+        finally
+        {
+            release();
+        }
+    }
+
     protected async pipeline<K extends keyof Extensions['converters']>(
         options: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>,
-        conversion?: K
+        conversion?: K,
+        method: string = 'pipeline'
     ): Promise<Document[]>
     {
         const { computedProperties: converterComputedProperties } = this.converters[conversion ?? 'dto'];
-        const { filter, sort, projection, computedProperties: optionsComputedProperties, smartFilter } = resolveBSONObject( options ) as ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>;
+        const { filter, sort, projection, computedProperties: optionsComputedProperties, smartFilter, access } = resolveBSONObject( options ) as ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>;
 
         const converterProperties = { '': await this.resolveComputedProperties( converterComputedProperties ) };
         const optionsProperties = { '': await this.resolveComputedProperties( optionsComputedProperties ) };
@@ -204,29 +238,45 @@ export abstract class AbstractModel
             computedProperties,
             sort,
             smartFilter : smartFilter && await this.resolveSmartFilter( smartFilter ) || undefined,
-            accessFilter: await this.#access.resolve()
+            accessFilter: await this.#access.resolve({ operation: 'read', method, access })
         });
     }
 
     public async create( dbe: Omit<DBE, '_id'>, id?: DTO['id'], options?: ModelCreateOptions ): Promise<DTO['id']>
     {
-        const _id: DTO['id'] = id ?? await this.id();
+        const release = this.trackOperation();
 
         try
         {
-            await this.collection.insertOne({ ...dbe, _id: this.dbeID( _id ) } as OptionalUnlessRequiredId<DBE> );
-        }
-        catch( e: any )
-        {
-            if( options?.duplicateIgnore === true && e.code === 11000 )
+            const access = await this.#access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
+
+            if( access.denied )
             {
-                return this.dtoID( await this.collection.findOne( e.keyValue, { projection: { _id: 1 }, collation: { locale: 'en' } }).then( r => r?._id ));
+                throw new ModelAccessDeniedError( this );
             }
 
-            throw e;
-        }
+            const _id: DTO['id'] = id ?? await this.id();
 
-        return _id;
+            try
+            {
+                await this.collection.insertOne( resolveBSONObject({ ...dbe, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE> );
+            }
+            catch( e: any )
+            {
+                if( options?.duplicateIgnore === true && e.code === 11000 )
+                {
+                    return this.dtoID( await this.collection.findOne( e.keyValue, { projection: { _id: 1 }, collation: { locale: 'en' } }).then( r => r?._id ));
+                }
+
+                throw e;
+            }
+
+            return _id;
+        }
+        finally
+        {
+            release();
+        }
     }
 
     /**
@@ -240,57 +290,85 @@ export abstract class AbstractModel
 
     public async update( id: DTO['id'] | DBE['_id'], update: Partial<DBE> | UpdateFilter<DBE>, options?: ModelUpdateOptions ): Promise<ModelUpdateResponse<DBE>>
     {
-        const match = await this.#access.match({ _id: this.dbeID( id ) } as Filter<DBE> );
+        const release = this.trackOperation();
 
-        if( !match )
+        try
         {
-            return { matchedCount: 0, modifiedCount: 0 };
-        }
-
-        if( options?.documentBefore || options?.documentAfter )
-        {
-            const result = await this.collection.findOneAndUpdate(
-                match,
-                toUpdateOperations( update ),
-                {
-                    returnDocument  : options.documentAfter ? 'after' : 'before',
-                    collation       : { locale: 'en' }
-                }
+            const match = await this.#access.match(
+                resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
+                { operation: 'update', method: 'update', access: options?.access }
             );
 
-            const document = ( result as DBE | null ) || undefined;
+            if( !match )
+            {
+                return { matchedCount: 0, modifiedCount: 0 };
+            }
+
+            if( options?.documentBefore || options?.documentAfter )
+            {
+                const result = await this.collection.findOneAndUpdate(
+                    match,
+                    toUpdateOperations( update ),
+                    {
+                        returnDocument  : options.documentAfter ? 'after' : 'before',
+                        collation       : { locale: 'en' }
+                    }
+                );
+
+                const document = ( result as DBE | null ) || undefined;
+
+                return {
+                    matchedCount    : document ? 1 : 0,
+                    modifiedCount   : document ? 1 : 0,
+                    documentBefore  : options.documentBefore && !options.documentAfter ? document : undefined,
+                    documentAfter   : options.documentAfter ? document : undefined
+                };
+            }
+
+            const res = await this.collection.updateOne( match, toUpdateOperations( update ));
 
             return {
-                matchedCount    : document ? 1 : 0,
-                modifiedCount   : document ? 1 : 0,
-                documentBefore  : options.documentBefore && !options.documentAfter ? document : undefined,
-                documentAfter   : options.documentAfter ? document : undefined
+                matchedCount    : res.matchedCount,
+                modifiedCount   : res.modifiedCount
             };
         }
-
-        const res = await this.collection.updateOne( match, toUpdateOperations( update ));
-
-        return {
-            matchedCount    : res.matchedCount,
-            modifiedCount   : res.modifiedCount
-        };
+        finally
+        {
+            release();
+        }
     }
 
-    public async updateMany( ids: DTO['id'][] | DBE['_id'][], update: Partial<DBE> | UpdateFilter<DBE> ): Promise<ModelUpdateResponse<DBE>>
+    public async updateMany(
+        ids: DTO['id'][] | DBE['_id'][],
+        update: Partial<DBE> | UpdateFilter<DBE>,
+        options?: ModelUpdateOptions
+    ): Promise<ModelUpdateResponse<DBE>>
     {
-        const match = await this.#access.match({ _id: { $in: ids.map( id => this.dbeID( id )) } } as Filter<DBE> );
+        const release = this.trackOperation();
 
-        if( !match )
+        try
         {
-            return { matchedCount: 0, modifiedCount: 0 };
+            const match = await this.#access.match(
+                resolveBSONObject({ _id: { $in: ids.map( id => this.dbeID( id )) } }) as Filter<DBE>,
+                { operation: 'update', method: 'updateMany', access: options?.access }
+            );
+
+            if( !match )
+            {
+                return { matchedCount: 0, modifiedCount: 0 };
+            }
+
+            const res = await this.collection.updateMany( match, toUpdateOperations( update ));
+
+            return {
+                matchedCount    : res.matchedCount,
+                modifiedCount   : res.modifiedCount
+            };
         }
-
-        const res = await this.collection.updateMany( match, toUpdateOperations( update ));
-
-        return {
-            matchedCount    : res.matchedCount,
-            modifiedCount   : res.modifiedCount
-        };
+        finally
+        {
+            release();
+        }
     }
 
     /**
@@ -311,21 +389,30 @@ export abstract class AbstractModel
         options?: GetOptions<K>
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
     {
-        const conversion = ( options?.as ?? 'dto' ) as K;
-        const access = await this.#access.resolveOrDeny();
+        const release = this.trackOperation();
 
-        if( access.denied ){ return null }
+        try
+        {
+            const conversion = ( options?.as ?? 'dto' ) as K;
+            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'get', access: options?.access });
 
-        const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
-        const documents = await this.#findAggregator.execute( Arr( id ), conversion, access.filter ) as Array<DBE | null>;
+            if( access.denied ){ return null }
 
-        benchmark?.step( 'QUERY' );
+            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
+            const documents = await this.#findAggregator.execute( Arr( id ), conversion, access.filter ) as Array<DBE | null>;
 
-        const entries = await convertDocuments( this.#converters, documents, conversion );
+            benchmark?.step( 'QUERY' );
 
-        benchmark?.step( 'CONVERTER' );
+            const entries = await convertDocuments( this.#converters, documents, conversion );
 
-        return ( entries[0] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
+            benchmark?.step( 'CONVERTER' );
+
+            return ( entries[0] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
@@ -333,24 +420,33 @@ export abstract class AbstractModel
         options?: GetManyOptions<K>
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>
     {
-        const conversion = ( options?.as ?? 'dto' ) as K;
-        const access = await this.#access.resolveOrDeny();
+        const release = this.trackOperation();
 
-        if( access.denied )
+        try
         {
-            return options?.filter ? [] : ids.map(() => null );
+            const conversion = ( options?.as ?? 'dto' ) as K;
+            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'getMany', access: options?.access });
+
+            if( access.denied )
+            {
+                return options?.filter ? [] : ids.map(() => null );
+            }
+
+            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
+            const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion, access.filter ) as Array<DBE | null>;
+
+            benchmark?.step( 'QUERY' );
+
+            const entries = await convertDocuments( this.#converters, documents, conversion, options?.filter === true );
+
+            benchmark?.step( 'CONVERTER' );
+
+            return entries as Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
         }
-
-        const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
-        const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion, access.filter ) as Array<DBE | null>;
-
-        benchmark?.step( 'QUERY' );
-
-        const entries = await convertDocuments( this.#converters, documents, conversion, options?.filter === true );
-
-        benchmark?.step( 'CONVERTER' );
-
-        return entries as Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
+        finally
+        {
+            release();
+        }
     }
 
     public async find<K extends keyof Extensions['converters']>(
@@ -377,6 +473,10 @@ export abstract class AbstractModel
         conversion: K = 'dto' as K
     ): Promise<ListResult<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>
     {
+        const release = this.trackOperation();
+
+        try
+        {
         const { computedProperties: compProps } = this.converters[conversion];
         let { filter = {}, sort = { _id: 1 }, cursor, limit, countLimit, ...rest } = resolveBSONObject( options );
         const prev = cursor?.startsWith( 'prev:' );
@@ -392,7 +492,7 @@ export abstract class AbstractModel
 
         try
         {
-            accessFilter = await this.#access.resolve();
+            accessFilter = await this.#access.resolve({ operation: 'read', method: 'list', access: options.access });
         }
         catch( e )
         {
@@ -480,6 +580,11 @@ export abstract class AbstractModel
                 next    : last ? getCursor( last, sort ) : undefined
             }
         };
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async *stream<K extends keyof Extensions['converters']>(
@@ -487,6 +592,10 @@ export abstract class AbstractModel
         conversion: K = 'dto' as K
     ): AsyncGenerator<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>
     {
+        const release = this.trackOperation();
+
+        try
+        {
         const { computedProperties: compProps } = this.converters[conversion];
         let { filter = {}, sort = { _id: 1 }, cursor, limit, ...rest } = resolveBSONObject( options );
         const prev = cursor?.startsWith( 'prev:' );
@@ -500,7 +609,7 @@ export abstract class AbstractModel
 
         try
         {
-            accessFilter = await this.#access.resolve();
+            accessFilter = await this.#access.resolve({ operation: 'read', method: 'stream', access: options.access });
         }
         catch( e )
         {
@@ -573,6 +682,11 @@ export abstract class AbstractModel
         {
             this.#emitQuery( 'stream', pipeline, Date.now() - start );
         }
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async aggregate<T>(
@@ -580,27 +694,43 @@ export abstract class AbstractModel
         options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
     ): Promise<T[]>
     {
-        let aggregationPipeline = isSet( options )
-            ? [ ...await this.pipeline( options!, 'dbe' ), ...( resolveBSONObject( pipeline ) as Document[] ) ]
-            : resolveBSONObject( pipeline ) as Document[];
-
-        flowGet( 'log' ) && DUMP( aggregationPipeline );
-
-        if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
+        return this.runOperation( async() =>
         {
-            aggregationPipeline = optimizePipeline( aggregationPipeline );
-        }
+            let aggregationPipeline: Document[];
 
-        const start = Date.now();
-        const res = await this.collection.aggregate( aggregationPipeline, { collation: { locale: 'en' } }).toArray() as T[];
-        const duration = Date.now() - start;
+            if( isSet( options ))
+            {
+                aggregationPipeline = [ ...await this.pipeline( options!, 'dbe', 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+            }
+            else
+            {
+                const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'aggregate' });
 
-        LOG_FILE( `Collection: ${this.collection.collectionName}` );
-        LOG_FILE( `TIME: ${duration} ms` );
-        LOG_FILE( aggregationPipeline, true );
-        this.#emitQuery( 'aggregate', aggregationPipeline, duration );
+                if( access.denied ){ return [] }
 
-        return res;
+                aggregationPipeline = access.filter
+                    ? [{ $match: access.filter }, ...( resolveBSONObject( pipeline ) as Document[] )]
+                    : resolveBSONObject( pipeline ) as Document[];
+            }
+
+            flowGet( 'log' ) && DUMP( aggregationPipeline );
+
+            if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
+            {
+                aggregationPipeline = optimizePipeline( aggregationPipeline );
+            }
+
+            const start = Date.now();
+            const res = await this.collection.aggregate( aggregationPipeline, { collation: { locale: 'en' } }).toArray() as T[];
+            const duration = Date.now() - start;
+
+            LOG_FILE( `Collection: ${this.collection.collectionName}` );
+            LOG_FILE( `TIME: ${duration} ms` );
+            LOG_FILE( aggregationPipeline, true );
+            this.#emitQuery( 'aggregate', aggregationPipeline, duration );
+
+            return res;
+        });
     }
 
     public async count(
@@ -618,7 +748,7 @@ export abstract class AbstractModel
         return this.aggregate<{ count: number }>( countPipeline, options ).then( r => r[0]?.count ?? 0 );
     }
 
-    protected async accessFilter(): Promise<AccessFilterResult<DBE>> {}
+    protected async accessFilter( _name: string ): Promise<AccessFilterResult<DBE>> {}
 
     public async resolveSmartFilter( smartFilter: Record<string, any> )
     {
@@ -630,12 +760,18 @@ export abstract class AbstractModel
         return this.#computedProperties.resolve( properties ) as Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>;
     }
 
-    public async delete( id: DTO['id'] | DBE['_id'] ): Promise<boolean>
+    public async delete( id: DTO['id'] | DBE['_id'], options?: ModelDeleteOptions ): Promise<boolean>
     {
-        const match = await this.#access.match({ _id: this.dbeID( id ) } as Filter<DBE> );
+        return this.runOperation( async() =>
+        {
+            const match = await this.#access.match(
+                resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
+                { operation: 'delete', method: 'delete', access: options?.access }
+            );
 
-        if( !match ){ return false }
+            if( !match ){ return false }
 
-        return ( await this.collection.deleteOne( match )).deletedCount === 1;
+            return ( await this.collection.deleteOne( match )).deletedCount === 1;
+        });
     }
 }

@@ -103,7 +103,7 @@ describe( 'AbstractModel get/getMany', () =>
 
         class SecureUserModel extends UserModel
         {
-            protected async accessFilter()
+            protected async accessFilter( _name: string )
             {
                 return { orgId: 'org-1' } as any;
             }

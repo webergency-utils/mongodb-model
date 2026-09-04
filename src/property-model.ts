@@ -61,6 +61,7 @@ import
     GetManyOptions,
     GetOptions,
     ListResult,
+    ModelCreateOptions,
     ModelUpdateOptions,
     MongoPropertyDocument,
     MongoRootDocument,
@@ -109,7 +110,13 @@ export abstract class AbstractPropertyModel
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this.smartFilters = params.smartFilters;
         this.#converters = new ConverterManager( this, this.converters );
-        this.#access = new AccessControl( this, () => this.accessFilter() as any );
+        this.#access = new AccessControl(
+        {
+            model            : this,
+            config           : params.access,
+            filterOverridden : this.accessFilter !== AbstractPropertyModel.prototype.accessFilter,
+            invokeFilter     : ( name ) => this.accessFilter( name ) as any
+        });
         this.#smartFilters = new SmartFilterResolver( this, this.smartFilters,
         {
             prefix          : this.#prefix,
@@ -131,7 +138,7 @@ export abstract class AbstractPropertyModel
             }
         });
 
-        this.#findAggregator = new Aggregator( async( ids: Array<DTO['id'] | DBE['id']>, conversion: keyof Extensions['converters'] ) =>
+        this.#findAggregator = new Aggregator( async( ids: Array<DTO['id'] | DBE['id']>, conversion: keyof Extensions['converters'], accessCtx?: { method: string, access?: string } ) =>
         {
             try
             {
@@ -140,8 +147,9 @@ export abstract class AbstractPropertyModel
                 const pipeline = await this.pipeline(
                 {
                     filter      : { id: { $in: ids.map( id => this.dbeID( id )) } },
-                    projection  : this.converters[conversion].projection
-                });
+                    projection  : this.converters[conversion].projection,
+                    access      : accessCtx?.access
+                }, conversion, accessCtx?.method ?? 'get' );
 
                 const start = Date.now();
                 const documents = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as DBE[];
@@ -220,9 +228,34 @@ export abstract class AbstractPropertyModel
         return dbeID as DTO['id'];
     }
 
+    protected ensureOpen(): void
+    {
+        this.#models.assertOpen();
+    }
+
+    protected trackOperation(): () => void
+    {
+        return this.#models.trackOperation();
+    }
+
+    protected async runOperation<T>( operation: () => Promise<T> ): Promise<T>
+    {
+        const release = this.trackOperation();
+
+        try
+        {
+            return await operation();
+        }
+        finally
+        {
+            release();
+        }
+    }
+
     protected async pipeline<K extends keyof Extensions['converters']>(
         options: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> & { computedProperties?: ComputedPropertiesParam<SecondType<ExtractComputedProperties<Extensions>>> } = {},
-        conversion?: K
+        conversion?: K,
+        method: string = 'list'
     ): Promise<Document[]>
     {
         const { computedProperties } = this.converters[conversion ?? 'dto'];
@@ -270,7 +303,7 @@ export abstract class AbstractPropertyModel
             }, { filter: {} as Filter<DBE>, pipeline: [] as Document[] });
         const needRoot = getUsedFields( gatheredFilters?.pipeline ?? [] ).used.some( el => el.startsWith( '_root.' ));
 
-        const stages = await this.#filterStages( options );
+        const stages = await this.#filterStages( options, method );
         const subPaths = getSubPaths( this.#paths );
 
         for( let i = 0; i <= subPaths.length; i++ )
@@ -340,8 +373,19 @@ export abstract class AbstractPropertyModel
         return pipeline;
     }
 
-    public async create( parentID: any, dbe: Omit<DBE, 'id'>, id?: DTO['id'] ): Promise<DTO['id']>
+    public async create( parentID: any, dbe: Omit<DBE, 'id'>, id?: DTO['id'], options?: ModelCreateOptions ): Promise<DTO['id']>
     {
+        const release = this.trackOperation();
+
+        try
+        {
+        const access = await this.#access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
+
+        if( access.denied )
+        {
+            throw new ModelAccessDeniedError( this );
+        }
+
         const _id: DTO['id'] = id ?? await this.id();
         const parentModel = this.#models[GET_PARENT]( this.collection.collectionName, this.#prefix );
         const parent = parentModel ? await parentModel.get( parentID ) : null;
@@ -354,18 +398,31 @@ export abstract class AbstractPropertyModel
         const { parentIDPath, updatePath, arrayFilters } = propertyModelUpdateParams( this.#paths, parentModel.dbeID( parentID ));
         const operation = this.#paths[this.#paths.length - 1].array ? '$push' : '$set';
 
-        await this.collection.updateOne({ [parentIDPath]: parentModel.dbeID( parentID ) } as any, { [operation]: { [updatePath]: { id: this.dbeID( _id ), ...dbe } } }, { arrayFilters });
+        await this.collection.updateOne(
+            resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
+            resolveBSONObject({ [operation]: { [updatePath]: { id: this.dbeID( _id ), ...dbe } } }),
+            resolveBSONObject({ arrayFilters })
+        );
 
         return _id;
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async update( id: DTO['id'] | DBE['id'], update: Partial<DBE> | UpdateFilter<DBE>, options?: ModelUpdateOptions ): Promise<PropertyModelUpdateResponse<DBE>>
     {
+        const release = this.trackOperation();
+
+        try
+        {
         const path = this.#paths.map( p => p.path ).join( '.' ) + '.id';
         let operations: Partial<RootDBE> | UpdateFilter<RootDBE> = {};
         let updateOptions: UpdateOptions = {};
 
-        const access = await this.#access.resolveOrDeny();
+        const access = await this.#access.resolveOrDeny({ operation: 'update', method: 'update', access: options?.access });
 
         if( access.denied )
         {
@@ -394,21 +451,34 @@ export abstract class AbstractPropertyModel
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
         const documentBefore = options?.documentBefore ? ( await this.get( id, { as: 'dbe' as any }) as DBE ) || undefined : undefined;
-        const res = await this.collection.updateOne( match, toUpdateOperations( operations ), updateOptions );
+        const res = await this.collection.updateOne(
+            resolveBSONObject( match ) as Filter<RootDBE>,
+            toUpdateOperations( operations ),
+            resolveBSONObject( updateOptions )
+        );
         const documentAfter = options?.documentAfter ? ( await this.get( id, { as: 'dbe' as any }) as DBE ) || undefined : undefined;
 
         flowGet( 'log' ) && LOG({ res });
 
         return { matchedRootCount: res.matchedCount, modifiedRootCount: res.modifiedCount, documentBefore, documentAfter };
+        }
+        finally
+        {
+            release();
+        }
     }
 
-    async updateMany( ids: DBE['id'][] | DTO['id'][], update: Partial<DBE> | UpdateFilter<DBE> ): Promise<PropertyModelUpdateResponse<DBE>>
+    async updateMany( ids: DBE['id'][] | DTO['id'][], update: Partial<DBE> | UpdateFilter<DBE>, options?: ModelUpdateOptions ): Promise<PropertyModelUpdateResponse<DBE>>
     {
+        const release = this.trackOperation();
+
+        try
+        {
         const path = this.#paths.map( p => p.path ).join( '.' ) + '.id';
         let operations: Partial<RootDBE> | UpdateFilter<RootDBE> = {};
-        let options: UpdateOptions = {};
+        let updateOptions: UpdateOptions = {};
 
-        const access = await this.#access.resolveOrDeny();
+        const access = await this.#access.resolveOrDeny({ operation: 'update', method: 'updateMany', access: options?.access });
 
         if( access.denied )
         {
@@ -422,25 +492,34 @@ export abstract class AbstractPropertyModel
         else if( this.#paths[this.#paths.length - 1].array )
         {
             operations = addPrefixToUpdate<RootDBE, DBE>( update, this.#paths.map( p => p.path ).join( '.$[].' ) + '.$[entry]' );
-            options = { ...options, arrayFilters: [{ 'entry.id': { $in: ids.map( id => this.dbeID( id )) } }]};
+            updateOptions = { ...updateOptions, arrayFilters: [{ 'entry.id': { $in: ids.map( id => this.dbeID( id )) } }]};
         }
         else
         {
             operations = addPrefixToUpdate<RootDBE, DBE>( update, this.#paths.slice( 0, this.#paths.length - 1 ).map( p => p.path ).join( '.$[].' ) + '.$[entry].' + this.#paths[this.#paths.length - 1].path );
-            options = { ...options, arrayFilters: [{[ 'entry.' + this.#paths[this.#paths.length - 1].path + '.id' ]: { $in: ids.map( id => this.dbeID( id )) } }]};
+            updateOptions = { ...updateOptions, arrayFilters: [{[ 'entry.' + this.#paths[this.#paths.length - 1].path + '.id' ]: { $in: ids.map( id => this.dbeID( id )) } }]};
         }
 
         const match: Filter<RootDBE> = access.filter
             ? { $and: [{ [path]: { $in: ids.map( id => this.dbeID( id )) } }, addPrefixToFilter( access.filter as any, this.#prefix ) ] } as any
             : { [path]: { $in: ids.map( id => this.dbeID( id )) } } as Filter<RootDBE>;
 
-        flowGet( 'log' ) && LOG({ match, operations, options });
+        flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
-        const res = await this.collection.updateMany( match, toUpdateOperations( operations ), options );
+        const res = await this.collection.updateMany(
+            resolveBSONObject( match ) as Filter<RootDBE>,
+            toUpdateOperations( operations ),
+            resolveBSONObject( updateOptions )
+        );
 
         flowGet( 'log' ) && LOG({ res });
 
         return { matchedRootCount: res.matchedCount, modifiedRootCount: res.modifiedCount };
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async get<K extends keyof Extensions['converters'] = 'dto'>(
@@ -448,13 +527,17 @@ export abstract class AbstractPropertyModel
         options?: GetOptions<K>
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
     {
+        const release = this.trackOperation();
+
+        try
+        {
         const conversion = ( options?.as ?? 'dto' ) as K;
-        const access = await this.#access.resolveOrDeny();
+        const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'get', access: options?.access });
 
         if( access.denied ){ return null }
 
         const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
-        const documents = await this.#findAggregator.execute( Arr( id ) as Array<DTO['id'] | DBE['id']>, conversion ) as Array<DBE | null>;
+        const documents = await this.#findAggregator.execute( Arr( id ) as Array<DTO['id'] | DBE['id']>, conversion, { method: 'get', access: options?.access } ) as Array<DBE | null>;
 
         benchmark?.step( 'QUERY' );
 
@@ -463,6 +546,11 @@ export abstract class AbstractPropertyModel
         benchmark?.step( 'CONVERTER' );
 
         return ( entries[0] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
@@ -470,8 +558,12 @@ export abstract class AbstractPropertyModel
         options?: GetManyOptions<K>
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>
     {
+        const release = this.trackOperation();
+
+        try
+        {
         const conversion = ( options?.as ?? 'dto' ) as K;
-        const access = await this.#access.resolveOrDeny();
+        const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'getMany', access: options?.access });
 
         if( access.denied )
         {
@@ -479,7 +571,7 @@ export abstract class AbstractPropertyModel
         }
 
         const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
-        const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion ) as Array<DBE | null>;
+        const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion, { method: 'getMany', access: options?.access } ) as Array<DBE | null>;
 
         benchmark?.step( 'QUERY' );
 
@@ -488,6 +580,11 @@ export abstract class AbstractPropertyModel
         benchmark?.step( 'CONVERTER' );
 
         return entries as Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async find<K extends keyof Extensions['converters']>(
@@ -496,32 +593,35 @@ export abstract class AbstractPropertyModel
         sort?: FindOptions['sort']
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
     {
-        const { projection } = this.converters[conversion];
-        const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':find(' + String( conversion ) + ')' ) : undefined;
-
-        let pipeline = await this.pipeline({ filter: options.filter, smartFilter: options.smartFilter, projection, sort, limit: 1 });
-
-        if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
+        return this.runOperation( async() =>
         {
-            pipeline = optimizePipeline( pipeline );
-        }
+            const { projection } = this.converters[conversion];
+            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':find(' + String( conversion ) + ')' ) : undefined;
 
-        flowGet( 'log' ) && ( console.log( this.constructor.name + '::find', options.filter ), DUMP( pipeline ));
+            let pipeline = await this.pipeline({ filter: options.filter, smartFilter: options.smartFilter, projection, sort, limit: 1, access: options.access }, conversion, 'find' );
 
-        const start = Date.now();
-        const dbe = ( await this.collection.aggregate( pipeline ).toArray())[0];
+            if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
+            {
+                pipeline = optimizePipeline( pipeline );
+            }
 
-        LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-        LOG_FILE( `TIME: ${Date.now() - start} ms` );
-        LOG_FILE( pipeline, true );
+            flowGet( 'log' ) && ( console.log( this.constructor.name + '::find', options.filter ), DUMP( pipeline ));
 
-        benchmark?.step( 'QUERY' );
+            const start = Date.now();
+            const dbe = ( await this.collection.aggregate( pipeline ).toArray())[0];
 
-        const data = dbe ? await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> : null;
+            LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
+            LOG_FILE( `TIME: ${Date.now() - start} ms` );
+            LOG_FILE( pipeline, true );
 
-        benchmark?.step( 'CONVERTER' );
+            benchmark?.step( 'QUERY' );
 
-        return data;
+            const data = dbe ? await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> : null;
+
+            benchmark?.step( 'CONVERTER' );
+
+            return data;
+        }) as Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
     }
 
     public async list<K extends keyof Extensions['converters']>(
@@ -529,13 +629,17 @@ export abstract class AbstractPropertyModel
         conversion: K = 'dto' as K
     ): Promise<ListResult<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>
     {
+        const release = this.trackOperation();
+
+        try
+        {
         const { projection } = this.converters[conversion];
         const prev = options.cursor?.startsWith( 'prev:' );
         const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
 
         try
         {
-            await this.#access.resolve();
+            await this.#access.resolve({ operation: 'read', method: 'list', access: options.access });
         }
         catch( e )
         {
@@ -555,8 +659,8 @@ export abstract class AbstractPropertyModel
             sort = { ...sort, id: 1 };
         }
 
-        let pipeline = await this.pipeline({ ...resolvedList, sort, projection }, conversion );
-        let countPipeline = this.#pipelineBuilder.buildCountPipeline( await this.pipeline({ ...countOptions, projection }), countLimit );
+        let pipeline = await this.pipeline({ ...resolvedList, sort, projection }, conversion, 'list' );
+        let countPipeline = this.#pipelineBuilder.buildCountPipeline( await this.pipeline({ ...countOptions, projection }, undefined, 'list' ), countLimit );
 
         if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
         {
@@ -615,6 +719,11 @@ export abstract class AbstractPropertyModel
                 next    : last ? getCursor( last, sort ) : undefined
             }
         };
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async *stream<K extends keyof Extensions['converters']>(
@@ -622,12 +731,16 @@ export abstract class AbstractPropertyModel
         conversion: K = 'dto' as K
     ): AsyncGenerator<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>
     {
+        const release = this.trackOperation();
+
+        try
+        {
         const { projection } = this.converters[conversion];
         const prev = options.cursor?.startsWith( 'prev:' );
 
         try
         {
-            await this.#access.resolve();
+            await this.#access.resolve({ operation: 'read', method: 'stream', access: options.access });
         }
         catch( e )
         {
@@ -647,7 +760,7 @@ export abstract class AbstractPropertyModel
             sort = { ...sort, id: 1 };
         }
 
-        let pipeline = await this.pipeline({ ...resolvedList, sort, projection }, conversion );
+        let pipeline = await this.pipeline({ ...resolvedList, sort, projection }, conversion, 'stream' );
 
         if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
         {
@@ -697,6 +810,11 @@ export abstract class AbstractPropertyModel
         {
             this.#emitQuery( 'stream', pipeline, Date.now() - start );
         }
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async aggregate<T>(
@@ -704,7 +822,24 @@ export abstract class AbstractPropertyModel
         options?: PropertyModelAggregateOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
     ): Promise<T[]>
     {
-        let aggregationPipeline = [ ...await this.pipeline( options, 'dbe' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+        const release = this.trackOperation();
+
+        try
+        {
+        let aggregationPipeline: Document[];
+
+        if( isSet( options ))
+        {
+            aggregationPipeline = [ ...await this.pipeline( options!, 'dbe', 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+        }
+        else
+        {
+            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'aggregate' });
+
+            if( access.denied ){ return [] }
+
+            aggregationPipeline = [ ...await this.pipeline({}, 'dbe', 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+        }
 
         if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
         {
@@ -723,6 +858,11 @@ export abstract class AbstractPropertyModel
         this.#emitQuery( 'aggregate', aggregationPipeline, duration );
 
         return res;
+        }
+        finally
+        {
+            release();
+        }
     }
 
     public async count(
@@ -740,7 +880,7 @@ export abstract class AbstractPropertyModel
         return await this.aggregate<{ count: number }>( countPipeline, options ).then( r => r[0]?.count ?? 0 );
     }
 
-    protected async accessFilter(): Promise<AccessFilterResult<PropertyModelFilter<RootDBE, DBE>>> {}
+    protected async accessFilter( _name: string ): Promise<AccessFilterResult<PropertyModelFilter<RootDBE, DBE>>> {}
 
     public async resolveSmartFilter( smartFilter: Record<string, any> )
     {
@@ -752,10 +892,10 @@ export abstract class AbstractPropertyModel
         return this.#computedProperties.resolve( properties ) as Promise<{ [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> }>;
     }
 
-    async #filterStages( list: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> )
+    async #filterStages( list: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>, method: string = 'list' )
     {
         const sort = list.sort ?? { id: -1 };
-        const access = await this.#access.resolveOrDeny();
+        const access = await this.#access.resolveOrDeny({ operation: 'read', method, access: list.access });
         const accessFilter = access.denied ? { _id: { $exists: false } } : access.filter;
         const cursorFilter = list.cursor ? generateCursorCondition( list.cursor, sort ) : undefined;
         const stageFilter = optimizeMatch({ $and: [ addPrefixToFilter({ $and: [ list.filter, accessFilter, cursorFilter ] }, this.#prefix ) ] } as MongoFilter<DBE> );

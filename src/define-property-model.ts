@@ -20,7 +20,8 @@ function buildPropertyExtensions<DBE extends MongoPropertyDocument>(
     return {
         converters          : compileConverters( config.converters, { dtoID }),
         smartFilters        : config.smartFilters,
-        computedProperties  : config.computedProperties
+        computedProperties  : config.computedProperties,
+        access              : config.access
     };
 }
 
