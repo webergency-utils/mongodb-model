@@ -73,19 +73,67 @@ function addPrefixToValue( filter: Filter | any, prefix: string, prefixKeys: boo
     return addPrefixToFilter( filter, prefix, prefixKeys );
 }
 
+export function isLibraryObjectId( value: unknown ): value is ObjectId
+{
+    return value instanceof ObjectId;
+}
+
+export function isForeignObjectIdLike( value: unknown ): boolean
+{
+    if( typeof value !== 'object' || value === null || Array.isArray( value ))
+    {
+        return false;
+    }
+
+    if( value instanceof Date || value instanceof RegExp || isLibraryObjectId( value ))
+    {
+        return false;
+    }
+
+    const candidate = value as { _bsontype?: string; constructor?: { name?: string }; toString?: () => string };
+
+    const hasShape =
+        candidate._bsontype === 'ObjectId' ||
+        candidate.constructor?.name === 'ObjectId';
+
+    if( !hasShape || typeof candidate.toString !== 'function' )
+    {
+        return false;
+    }
+
+    return ObjectId.isValid( candidate.toString());
+}
+
+export function coerceToLibraryObjectId( value: unknown ): unknown
+{
+    if( isLibraryObjectId( value ))
+    {
+        return value;
+    }
+
+    if( isForeignObjectIdLike( value ))
+    {
+        return new ObjectId(( value as { toString: () => string }).toString());
+    }
+
+    return value;
+}
+
 //export function resolveFilterValue( filter: Filter | any ): Filter | any
 export function resolveBSONValue( value: any ): any
 {
     if( typeof value === 'string' ){ return value; }
     if( typeof value !== 'object' || value === null ){ return value; }
-    if( typeof value === 'object' &&
-        (
-            ( value instanceof ObjectId ) ||
-            ( value instanceof Date )  ||
-            ( value instanceof RegExp ) // TODO is basic object alternative?
-        ))
+    if( value instanceof Date || value instanceof RegExp )
     {
         return value;
+    }
+
+    const coerced = coerceToLibraryObjectId( value );
+
+    if( isLibraryObjectId( coerced ))
+    {
+        return coerced;
     }
     if( typeof value === 'object' && Object.keys( value ).length === 1 )
     {
@@ -415,7 +463,9 @@ export function projectionToProject( projection: FindOptions['projection'] = {},
 
 export function bsonValue( value: any )
 {
-    if( value instanceof ObjectId ){ return { $oid: value.toString() }}
+    const coerced = coerceToLibraryObjectId( value );
+
+    if( isLibraryObjectId( coerced )){ return { $oid: coerced.toString() }}
     if( value instanceof Date ){ return { $date: value.getTime() }}
 
     return value;
@@ -430,13 +480,15 @@ export function toUpdateOperations<T>( update: Partial<T> | UpdateFilter<T> ): U
 {
     if( isUpdateOperator( update ))
     {
-        return update as UpdateFilter<T>;
+        return resolveBSONObject( update as Record<string, any> ) as UpdateFilter<T>;
     }
 
     const $set = deleteUndefinedProperties( update ) as Partial<T>;
     const $unset = Object.fromEntries( Object.entries( update ).filter(([ , value ]) => value === undefined ).map(([ key ]) => [ key, 1 ])) as OnlyFieldsOfType<T, 1>;
 
-    return Object.keys( $unset ).length ? { $unset, $set } : { $set };
+    const result = Object.keys( $unset ).length ? { $unset, $set } : { $set };
+
+    return resolveBSONObject( result ) as UpdateFilter<T>;
 }
 
 export function getCursor( dbe: Document, sort: Sort ): string
