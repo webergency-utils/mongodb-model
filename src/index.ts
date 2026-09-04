@@ -1,4 +1,28 @@
-export * from 'mongodb';
+export
+{
+    ObjectId,
+    MongoClient,
+    Db,
+    Collection,
+    MongoServerError
+}
+from 'mongodb';
+
+export type
+{
+    Document,
+    Filter,
+    UpdateFilter,
+    WithoutId,
+    FindOptions,
+    MongoClientOptions,
+    WithTransactionCallback,
+    WriteError,
+    Sort,
+    ClientSession
+}
+from 'mongodb';
+
 export * from './types/external.js';
 export * from './types/definition.js';
 export * from './errors.js';
