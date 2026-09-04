@@ -99,22 +99,16 @@ export abstract class AbstractModel
 
         models[REGISTER_MODEL]( this, collection.collectionName );
 
-        this.#findAggregator = new Aggregator( async( ids: Array<DTO['id']>, conversion: keyof Extensions['converters'], accessControl: Filter<DBE> | void ) =>
+        this.#findAggregator = new Aggregator( async( ids: Array<DTO['id']>, conversion: keyof Extensions['converters'], accessCtx?: { method: string, access?: string } ) =>
         {
             try
             {
                 const pipeline = await this.pipeline(
                 {
-                    filter:
-                    {
-                        $and:
-                        [
-                            { _id: { $in: ids.map( id => this.dbeID( id )) } },
-                            accessControl || {}
-                        ]
-                    } as Filter<DBE>,
-                    projection: this.converters[conversion].projection
-                }, conversion );
+                    filter      : { _id: { $in: ids.map( id => this.dbeID( id )) } } as Filter<DBE>,
+                    projection  : this.converters[conversion].projection,
+                    access      : accessCtx?.access
+                }, conversion, accessCtx?.method ?? 'get' );
 
                 flowGet( 'log' ) && DUMP( pipeline );
 
@@ -399,7 +393,7 @@ export abstract class AbstractModel
             if( access.denied ){ return null }
 
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
-            const documents = await this.#findAggregator.execute( Arr( id ), conversion, access.filter ) as Array<DBE | null>;
+            const documents = await this.#findAggregator.execute( Arr( id ), conversion, { method: 'get', access: options?.access } ) as Array<DBE | null>;
 
             benchmark?.step( 'QUERY' );
 
@@ -433,7 +427,7 @@ export abstract class AbstractModel
             }
 
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
-            const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion, access.filter ) as Array<DBE | null>;
+            const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion, { method: 'getMany', access: options?.access } ) as Array<DBE | null>;
 
             benchmark?.step( 'QUERY' );
 

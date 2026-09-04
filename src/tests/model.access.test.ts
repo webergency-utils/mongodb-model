@@ -111,6 +111,23 @@ describe( 'AbstractModel named access', () =>
         const match = pipeline.find(( s: any ) => s.$match );
 
         expect( JSON.stringify( match )).toContain( '"orgId":"2"' );
+        expect( JSON.stringify( match )).not.toContain( '"orgId":"1"' );
+    });
+
+    test( 'missing delete default denies', async() =>
+    {
+        const deleteOne = vi.fn( async() => ({ deletedCount: 1 }));
+
+        const model = makeModel(
+            { collectionName: 'docs', deleteOne },
+            {
+                filters  : { 'org-read': async() => ({ orgId: '1' }) },
+                defaults : { read: 'org-read' }
+            }
+        );
+
+        await expect( model.delete( '1' )).resolves.toBe( false );
+        expect( deleteOne ).not.toHaveBeenCalled();
     });
 
     test( 'create denies on false without insert', async() =>
