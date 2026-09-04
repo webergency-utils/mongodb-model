@@ -233,3 +233,26 @@ export type ModelUpdateDocument<T> =
 };
 
 export type AccessFilterResult<T> = Filter<T> | false | void;
+
+export type AccessOperation = 'create' | 'read' | 'update' | 'delete';
+
+export type AccessResolveContext =
+{
+    operation : AccessOperation
+    method    : string
+    access?   : string
+}
+
+export type AccessFilterFn<T> = ( name: string ) => Promise<AccessFilterResult<T>> | AccessFilterResult<T>;
+
+export type AccessDefaultsMap = Partial<Record<AccessOperation, string>>;
+
+export type AccessDefaultsFn = (
+    ctx: Pick<AccessResolveContext, 'operation' | 'method'>
+) => string | undefined | Promise<string | undefined>;
+
+export type ModelAccessConfig<T = Document> =
+{
+    filters?  : Record<string, AccessFilterFn<T>>
+    defaults? : AccessDefaultsMap | AccessDefaultsFn
+}

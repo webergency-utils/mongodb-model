@@ -1,35 +1,127 @@
 import { Filter } from 'mongodb';
-import { ModelAccessDeniedError } from './errors.js';
-import { AccessFilterResult } from './types/external.js';
+import { ModelAccessConfigError, ModelAccessDeniedError } from './errors.js';
+import
+{
+    AccessFilterFn,
+    AccessFilterResult,
+    AccessResolveContext,
+    ModelAccessConfig
+}
+from './types/external.js';
+
+export type AccessControlOptions<DBE> =
+{
+    model             : object
+    config?           : ModelAccessConfig<DBE>
+    filterOverridden? : boolean
+    invokeFilter      : AccessFilterFn<DBE>
+}
 
 export class AccessControl<DBE>
 {
-    #resolver: () => Promise<AccessFilterResult<DBE>> | AccessFilterResult<DBE>;
     #model: object;
+    #config?: ModelAccessConfig<DBE>;
+    #filterOverridden: boolean;
+    #invokeFilter: AccessFilterFn<DBE>;
 
-    constructor( model: object, resolver: () => Promise<AccessFilterResult<DBE>> | AccessFilterResult<DBE> )
+    constructor( options: AccessControlOptions<DBE> )
     {
-        this.#model = model;
-        this.#resolver = resolver;
+        this.#model = options.model;
+        this.#config = options.config;
+        this.#filterOverridden = options.filterOverridden ?? false;
+        this.#invokeFilter = options.invokeFilter;
     }
 
-    async resolve(): Promise<Filter<DBE> | undefined>
+    #isAclActive(): boolean
     {
-        const result = await this.#resolver();
+        if( this.#filterOverridden ){ return true }
 
-        if( result === false )
+        if( this.#config?.defaults !== undefined ){ return true }
+
+        if( this.#config?.filters && Object.keys( this.#config.filters ).length > 0 ){ return true }
+
+        return false;
+    }
+
+    #isLegacyMode(): boolean
+    {
+        if( !this.#filterOverridden ){ return false }
+
+        if( this.#config?.defaults !== undefined ){ return false }
+
+        if( this.#config?.filters && Object.keys( this.#config.filters ).length > 0 ){ return false }
+
+        return true;
+    }
+
+    async #resolveName( ctx: AccessResolveContext ): Promise<string | undefined>
+    {
+        if( ctx.access !== undefined && ctx.access !== '' ){ return ctx.access }
+
+        const defaults = this.#config?.defaults;
+
+        if( typeof defaults === 'function' )
+        {
+            const name = await defaults({ operation: ctx.operation, method: ctx.method });
+
+            if( name !== undefined && name !== '' ){ return name }
+        }
+        else if( defaults )
+        {
+            const name = defaults[ctx.operation];
+
+            if( name !== undefined && name !== '' ){ return name }
+        }
+
+        if( this.#isLegacyMode() ){ return 'default' }
+
+        return undefined;
+    }
+
+    async #invoke( name: string ): Promise<AccessFilterResult<DBE>>
+    {
+        const filters = this.#config?.filters;
+
+        if( filters !== undefined )
+        {
+            if( !( name in filters ))
+            {
+                throw new ModelAccessConfigError( this.#model, `Unknown access policy "${name}"` );
+            }
+
+            return filters[name]( name );
+        }
+
+        return this.#invokeFilter( name );
+    }
+
+    async resolve( ctx: AccessResolveContext ): Promise<Filter<DBE> | undefined>
+    {
+        const result = await this.resolveOrDeny( ctx );
+
+        if( result.denied )
         {
             throw new ModelAccessDeniedError( this.#model );
         }
 
-        if( !result ){ return undefined }
-
-        return result as Filter<DBE>;
+        return result.filter;
     }
 
-    async resolveOrDeny(): Promise<{ denied: true } | { denied: false, filter?: Filter<DBE> }>
+    async resolveOrDeny( ctx: AccessResolveContext ): Promise<{ denied: true } | { denied: false, filter?: Filter<DBE> }>
     {
-        const result = await this.#resolver();
+        if( !this.#isAclActive() )
+        {
+            return { denied: false };
+        }
+
+        const name = await this.#resolveName( ctx );
+
+        if( !name )
+        {
+            return { denied: true };
+        }
+
+        const result = await this.#invoke( name );
 
         if( result === false )
         {
@@ -39,9 +131,9 @@ export class AccessControl<DBE>
         return { denied: false, filter: result || undefined };
     }
 
-    async match( base: Filter<DBE> ): Promise<Filter<DBE> | null>
+    async match( base: Filter<DBE>, ctx: AccessResolveContext ): Promise<Filter<DBE> | null>
     {
-        const access = await this.resolveOrDeny();
+        const access = await this.resolveOrDeny( ctx );
 
         if( access.denied ){ return null }
 

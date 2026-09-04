@@ -41,3 +41,13 @@ export class ModelAccessDeniedError extends ModelError
         Error.captureStackTrace( this, this.constructor );
     }
 }
+
+export class ModelAccessConfigError extends ModelError
+{
+    constructor( model: object, message: string )
+    {
+        super( 'MODEL_ACCESS_CONFIG', model, message );
+
+        Error.captureStackTrace( this, this.constructor );
+    }
+}
