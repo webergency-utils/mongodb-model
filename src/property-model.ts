@@ -898,7 +898,10 @@ export abstract class AbstractPropertyModel
         const access = await this.#access.resolveOrDeny({ operation: 'read', method, access: list.access });
         const accessFilter = access.denied ? { _id: { $exists: false } } : access.filter;
         const cursorFilter = list.cursor ? generateCursorCondition( list.cursor, sort ) : undefined;
-        const stageFilter = optimizeMatch({ $and: [ addPrefixToFilter({ $and: [ list.filter, accessFilter, cursorFilter ] }, this.#prefix ) ] } as MongoFilter<DBE> );
+        const stageFilter = optimizeMatch( resolveBSONObject(
+        {
+            $and: [ addPrefixToFilter({ $and: [ list.filter, accessFilter, cursorFilter ] }, this.#prefix ) ]
+        }) as MongoFilter<DBE> );
 
         return splitFilterToStages( stageFilter as MongoFilter<DBE>, this.#paths ) as Filter<RootDBE>[];
     }

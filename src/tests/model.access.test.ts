@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from 'vitest';
+import { ObjectId } from 'mongodb';
 import { ModelAccessConfigError, ModelAccessDeniedError } from '../errors.js';
 import { AbstractModel } from '../model.js';
 import { AbstractModels } from '../models.js';
@@ -6,6 +7,16 @@ import type { MongoRootDocument } from '../types/external.js';
 
 type DocDBE = MongoRootDocument & { _id: string, orgId: string, name: string };
 type DocDTO = { id: string, orgId: string, name: string };
+
+const VALID_HEX = '507f1f77bcf86cd799439011';
+
+function foreignObjectId( hex: string = VALID_HEX )
+{
+    return {
+        _bsontype   : 'ObjectId',
+        toString    : () => hex
+    };
+}
 
 class TestModels extends AbstractModels
 {
@@ -163,6 +174,34 @@ describe( 'AbstractModel named access', () =>
         const pipeline = aggregate.mock.calls[0][0] as any[];
 
         expect( pipeline[0] ).toEqual({ $match: { orgId: '1' } });
+    });
+
+    test( 'update and bare aggregate coerce foreign ObjectId in access filter', async() =>
+    {
+        const foreign = foreignObjectId();
+        const updateOne = vi.fn( async() => ({ matchedCount: 0, modifiedCount: 0 }));
+        const aggregate = vi.fn(() => ({ toArray: async() => [] }));
+
+        const model = makeModel(
+            { collectionName: 'docs', updateOne, aggregate },
+            {
+                filters  : { 'org-write': async() => ({ orgId: foreign }) },
+                defaults : { update: 'org-write', read: 'org-write' }
+            }
+        );
+
+        await model.update( 'x', { name: 'n' });
+        await model.aggregate([{ $limit: 1 }]);
+
+        const updateMatch = updateOne.mock.calls[0][0] as any;
+
+        expect( updateMatch.$and[1].orgId ).toBeInstanceOf( ObjectId );
+        expect( updateMatch.$and[1].orgId.toString()).toBe( VALID_HEX );
+
+        const pipeline = aggregate.mock.calls[0][0] as any[];
+
+        expect( pipeline[0].$match.orgId ).toBeInstanceOf( ObjectId );
+        expect( pipeline[0].$match.orgId.toString()).toBe( VALID_HEX );
     });
 
     test( 'unknown policy throws on list', async() =>

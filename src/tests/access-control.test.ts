@@ -1,8 +1,18 @@
 import { describe, expect, test, vi } from 'vitest';
+import { ObjectId } from 'mongodb';
 import { AccessControl } from '../access-control.js';
 import { ModelAccessConfigError, ModelAccessDeniedError } from '../errors.js';
 
 const readCtx = { operation: 'read' as const, method: 'list' };
+const VALID_HEX = '507f1f77bcf86cd799439011';
+
+function foreignObjectId( hex: string = VALID_HEX )
+{
+    return {
+        _bsontype   : 'ObjectId',
+        toString    : () => hex
+    };
+}
 
 describe( 'AccessControl', () =>
 {
@@ -173,5 +183,31 @@ describe( 'AccessControl', () =>
 
         await expect( access.resolve( readCtx )).resolves.toBeUndefined();
         await expect( access.match({ _id: 'x' } as any, readCtx )).resolves.toEqual({ _id: 'x' });
+    });
+
+    test( 'resolves foreign ObjectId in access filter', async() =>
+    {
+        const foreign = foreignObjectId();
+        const access = new AccessControl(
+        {
+            model            : {},
+            filterOverridden : true,
+            invokeFilter     : async() => ({ orgId: foreign })
+        });
+
+        const filter = await access.resolve( readCtx );
+        const match = await access.match({ _id: 'x' } as any, readCtx );
+
+        expect( filter?.orgId ).toBeInstanceOf( ObjectId );
+        expect(( filter?.orgId as ObjectId ).toString()).toBe( VALID_HEX );
+        expect( match ).toEqual(
+        {
+            $and:
+            [
+                { _id: 'x' },
+                { orgId: expect.any( ObjectId ) }
+            ]
+        });
+        expect(( match as any ).$and[1].orgId.toString()).toBe( VALID_HEX );
     });
 });

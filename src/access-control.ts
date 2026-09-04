@@ -1,5 +1,6 @@
 import { Filter } from 'mongodb';
 import { ModelAccessConfigError, ModelAccessDeniedError } from './errors.js';
+import { resolveBSONObject } from './helpers/mongo.js';
 import
 {
     AccessFilterFn,
@@ -128,7 +129,12 @@ export class AccessControl<DBE>
             return { denied: true };
         }
 
-        return { denied: false, filter: result || undefined };
+        if( !result )
+        {
+            return { denied: false };
+        }
+
+        return { denied: false, filter: resolveBSONObject( result as Record<string, any> ) as Filter<DBE> };
     }
 
     async match( base: Filter<DBE>, ctx: AccessResolveContext ): Promise<Filter<DBE> | null>
