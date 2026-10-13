@@ -31,7 +31,7 @@ export * from './model.js';
 export * from './property-model.js';
 export * from './models.js';
 export * from './events.js';
-export { GET_PARENT, REGISTER_MODEL } from './symbols.js';
+export { GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
 export { PipelineBuilder } from './pipeline-builder.js';
 export { AccessControl } from './access-control.js';
 export { ConverterManager } from './converters.js';

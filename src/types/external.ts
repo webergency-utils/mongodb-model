@@ -1,4 +1,5 @@
-import { Document, Filter, FindOptions, ObjectId } from 'mongodb';
+import { Document, Filter, FindOptions, MongoClientOptions, ObjectId } from 'mongodb';
+import type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
 import
 {
     AbstractConverterOptions,
@@ -12,6 +13,14 @@ import
     SmartFilterMethod
 }
 from './internal.js';
+
+export type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
+export type OptimizerConfig = boolean | OptimizerOptions;
+
+export type ModelsOptions = MongoClientOptions &
+{
+    optimizer? : OptimizerConfig
+};
 
 export type ModelCreateOptions = { duplicateIgnore?: boolean, access?: string };
 export type ModelUpdateOptions = { documentBefore?: boolean, documentAfter?: boolean, access?: string };
@@ -207,6 +216,7 @@ export type ModelExtensions
     smartFilters?       : SmartFilters
     computedProperties? : ComputedProperties
     access?             : ModelAccessConfig<DBE>
+    optimizer?          : OptimizerConfig
 }
 
 export type PropertyModelExtensions
@@ -221,6 +231,7 @@ export type PropertyModelExtensions
     smartFilters?       : SmartFilters
     computedProperties? : ComputedProperties
     access?             : ModelAccessConfig<DBE>
+    optimizer?          : OptimizerConfig
 }
 
 export type MongoBSONTypes<T> = T extends ObjectId
