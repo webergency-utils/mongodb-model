@@ -148,24 +148,19 @@ describe( 'PropertyModel factory', () =>
         const collection = { collectionName: 'jobs', aggregate: vi.fn() } as any;
         const models = new TestModels({ optimizer: { strictErrors: true } });
 
-        // Register child PropertyModel BEFORE parent Model to verify dynamic resolution (AE2 / R6)
         const engagements = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
             models,
             collection,
             { path: 'engagements[]' }
         );
 
-        // Before root model is registered, engagements falls back to AbstractModels
         expect(( engagements as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: true });
 
-        // Register root Model with wholesale override
         const jobs = defineModel<JobDBE>( models, collection, { optimizer: { strictFieldOrder: true } });
 
-        // Now engagements dynamically inherits from root Model without merging strictErrors (AE1)
         expect(( jobs as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictFieldOrder: true });
         expect(( engagements as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictFieldOrder: true });
 
-        // Nested PropertyModel with optimizer: false disables optimization
         const applications = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
             models,
             collection,
@@ -174,7 +169,6 @@ describe( 'PropertyModel factory', () =>
 
         expect(( applications as any )[GET_OPTIMIZER_OPTIONS]()).toBeUndefined();
 
-        // Deeper PropertyModel with optimizer: true re-enables optimization with default {} (AE2)
         const HistoryClass = PropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
         {
             path        : 'engagements[].applications[].history[]',

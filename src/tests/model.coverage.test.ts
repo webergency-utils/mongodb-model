@@ -299,7 +299,6 @@ describe( 'AbstractModel coverage branches', () =>
         expect( await model.aggregate([{ $limit: 1 }], { filter: { a: 1 } })).toEqual([{ _id: '1', name: 'Ada', count: 2 }]);
         expect( optimizePipeline ).toHaveBeenCalledTimes( 5 );
 
-        // Write operations must NOT call optimizePipeline (R10 / AE3)
         vi.mocked( optimizePipeline ).mockClear();
 
         await model.create({ name: 'Ada' } as any, '1' );
@@ -309,7 +308,6 @@ describe( 'AbstractModel coverage branches', () =>
 
         expect( optimizePipeline ).not.toHaveBeenCalled();
 
-        // Disabled optimizer skips optimizePipeline on all read methods
         const disabledModel = makeModel(
             {
                 ...collection,

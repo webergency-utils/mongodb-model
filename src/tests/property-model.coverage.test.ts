@@ -535,14 +535,12 @@ describe( 'AbstractPropertyModel coverage branches', () =>
             }
         }
 
-        // Instantiate child PropertyModel before RootModel to verify dynamic ancestor lookup on read queries (AE2 / R6)
         const items = new ItemModel();
 
         new RootModel();
 
         vi.mocked( optimizePipeline ).mockClear();
 
-        // Direct read methods: get, getMany, find
         await items.get( 'item-1' );
         expect( optimizePipeline ).toHaveBeenCalledTimes( 1 );
         expect( optimizePipeline ).toHaveBeenLastCalledWith( expect.any( Array ), { strictFieldOrder: true });
@@ -553,14 +551,12 @@ describe( 'AbstractPropertyModel coverage branches', () =>
         await items.find({ filter: { label: 'A' } });
         expect( optimizePipeline ).toHaveBeenCalledTimes( 3 );
 
-        // Internal parentModel.get() inside PropertyModel.create is optimized (R10 / AE3)
         vi.mocked( optimizePipeline ).mockClear();
 
         await items.create( 'root-1', { orgId: 'o', label: 'B' } as any, 'item-2' );
         expect( optimizePipeline ).toHaveBeenCalledTimes( 1 );
         expect( optimizePipeline ).toHaveBeenLastCalledWith( expect.any( Array ), { strictFieldOrder: true });
 
-        // Internal this.get() inside PropertyModel.update with documentBefore & documentAfter is optimized (R10 / AE3)
         vi.mocked( optimizePipeline ).mockClear();
 
         const updated = await items.update( 'item-1', { label: 'C' }, { documentBefore: true, documentAfter: true });
@@ -569,7 +565,6 @@ describe( 'AbstractPropertyModel coverage branches', () =>
         expect( updated.documentAfter ).toBeDefined();
         expect( optimizePipeline ).toHaveBeenCalledTimes( 2 );
 
-        // Write operations without internal .get() do NOT call optimizePipeline
         vi.mocked( optimizePipeline ).mockClear();
 
         await items.update( 'item-1', { label: 'D' });
@@ -577,7 +572,6 @@ describe( 'AbstractPropertyModel coverage branches', () =>
 
         expect( optimizePipeline ).not.toHaveBeenCalled();
 
-        // Disabled optimizer on PropertyModel skips optimizePipeline on all read methods and internal .get() in update
         const disabledItems = new ItemModel( false );
 
         await disabledItems.get( 'item-1' );
