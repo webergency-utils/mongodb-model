@@ -102,4 +102,9 @@ dist
 
 # TernJS port file
 .tern-port
-package-lock.json
+
+# Local / legacy trees — not part of the published package
+old/
+usage/
+test/
+.DS_Store

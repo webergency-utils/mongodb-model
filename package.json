@@ -24,9 +24,17 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "coverage": "vitest run --coverage",
-    "build": "tsc && tsc -p tsconfig.esm.json && echo '{\"type\":\"module\"}' > dist/esm/package.json",
-    "version": "npm i && npm run build && npm publish --access public"
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "coverage": "vitest run --config vitest.coverage.config.ts --coverage",
+    "coverage:unit": "vitest run --coverage",
+    "fuzz": "jazzer fuzz_index.cjs",
+    "clean": "rm -rf ./dist/*",
+    "build": "npm run clean && tsc && tsc -p tsconfig.esm.json && echo '{\"type\":\"module\"}' > dist/esm/package.json",
+    "typecheck:example": "tsc -p example/tsconfig.json",
+    "version": "npm run build && npm publish --access public"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "repository": {
     "type": "git",
@@ -34,13 +42,14 @@
   },
   "dependencies": {
     "@liqd-js/flow": "^1.5.0",
-    "@webergency-utils/aggregator": "file:../aggregator",
-    "@webergency-utils/mongodb-query-optimizer": "file:../mongodb-query-optimizer",
-    "@webergency-utils/object-hash": "file:../object-hash",
+    "@webergency-utils/aggregator": "^0.0.4",
+    "@webergency-utils/mongodb-query-optimizer": "^0.0.5",
+    "@webergency-utils/object-hash": "^1.1.2",
     "mongodb": "^7.0.0",
     "snappy": "^7.3.3"
   },
   "devDependencies": {
+    "@jazzer.js/core": "^4.0.0",
     "@types/node": "^26.0.0",
     "@vitest/coverage-v8": "^4.1.9",
     "typescript": "^6.0.3",

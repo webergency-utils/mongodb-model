@@ -652,7 +652,9 @@ export abstract class AbstractPropertyModel
         }
 
         const resolvedList = resolveBSONObject( options );
-        let { sort = { id: 1 }, countLimit, ...countOptions } = resolvedList;
+        // Strip cursor/count from the count path — count is not page-scoped, and must not
+        // re-apply cursor against a different default sort than the list pipeline.
+        let { sort = { id: 1 }, countLimit, cursor: _cursor, count: _count, ...countRest } = resolvedList;
 
         if( !sort.id )
         {
@@ -660,12 +662,17 @@ export abstract class AbstractPropertyModel
         }
 
         let pipeline = await this.pipeline({ ...resolvedList, sort, projection }, conversion, 'list' );
-        let countPipeline = this.#pipelineBuilder.buildCountPipeline( await this.pipeline({ ...countOptions, projection }, undefined, 'list' ), countLimit );
+        let countPipeline = resolvedList.count
+            ? this.#pipelineBuilder.buildCountPipeline(
+                await this.pipeline({ ...countRest, sort, projection }, undefined, 'list' ),
+                countLimit
+            )
+            : undefined;
 
         if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
         {
             pipeline = optimizePipeline( pipeline );
-            countPipeline = optimizePipeline( countPipeline );
+            countPipeline && ( countPipeline = optimizePipeline( countPipeline ));
         }
 
         const start = Date.now();
@@ -682,7 +689,7 @@ export abstract class AbstractPropertyModel
 
                 return r;
             }),
-            resolvedList.count
+            countPipeline
                 ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
                 {
                     const duration = Date.now() - start;
@@ -690,7 +697,7 @@ export abstract class AbstractPropertyModel
                     LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
                     LOG_FILE( `TIME: ${duration} ms` );
                     LOG_FILE( countPipeline, true );
-                    this.#emitQuery( 'count', countPipeline, duration );
+                    this.#emitQuery( 'count', countPipeline!, duration );
 
                     return r[0]?.count ?? 0;
                 })

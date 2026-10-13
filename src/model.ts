@@ -472,7 +472,7 @@ export abstract class AbstractModel
         try
         {
         const { computedProperties: compProps } = this.converters[conversion];
-        let { filter = {}, sort = { _id: 1 }, cursor, limit, countLimit, ...rest } = resolveBSONObject( options );
+        let { filter = {}, sort = { _id: 1 }, cursor, limit, countLimit, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( options );
         const prev = cursor?.startsWith( 'prev:' );
 
         if( !sort._id )
@@ -503,7 +503,8 @@ export abstract class AbstractModel
 
         const params =
         {
-            filter, sort, smartFilter, cursor, limit, countLimit, ...rest,
+            ...rest,
+            filter, sort, smartFilter, cursor, limit, countLimit,
             accessFilter,
             pipeline: options.pipeline,
             computedProperties
@@ -591,7 +592,7 @@ export abstract class AbstractModel
         try
         {
         const { computedProperties: compProps } = this.converters[conversion];
-        let { filter = {}, sort = { _id: 1 }, cursor, limit, ...rest } = resolveBSONObject( options );
+        let { filter = {}, sort = { _id: 1 }, cursor, limit, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( options );
         const prev = cursor?.startsWith( 'prev:' );
 
         if( !sort._id )
@@ -620,7 +621,8 @@ export abstract class AbstractModel
 
         let pipeline = await this.#pipelineBuilder.pipeline(
         {
-            filter, sort, smartFilter, cursor, limit, ...rest,
+            ...rest,
+            filter, sort, smartFilter, cursor, limit,
             accessFilter,
             pipeline: options.pipeline,
             computedProperties

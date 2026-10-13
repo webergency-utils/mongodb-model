@@ -1,0 +1,28 @@
+{
+  "include": ["./**/*.ts", "./**/*.d.ts"],
+  "compilerOptions":
+  {
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths":
+    {
+      "@webergency-utils/mongodb-model": [ "../src/index.ts" ]
+    },
+    "rootDir": "..",
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "esnext",
+    "target": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["esnext"],
+    "types": ["node"],
+    "resolveJsonModule": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  }
+}
