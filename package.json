@@ -45,7 +45,7 @@
     "@webergency-utils/aggregator": "^0.0.4",
     "@webergency-utils/mongodb-query-optimizer": "^0.0.5",
     "@webergency-utils/object-hash": "^1.1.2",
-    "mongodb": "^7.0.0",
+    "mongodb": "^7.7.0",
     "snappy": "^7.3.3"
   },
   "devDependencies": {
