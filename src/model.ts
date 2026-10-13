@@ -33,7 +33,7 @@ import { AbstractModels } from './models.js';
 import { convertDocuments } from './operations.js';
 import { PipelineBuilder } from './pipeline-builder.js';
 import { ComputedPropertyResolver, SmartFilterResolver } from './resolvers.js';
-import { REGISTER_MODEL } from './symbols.js';
+import { GET_OPTIMIZER_OPTIONS, REGISTER_MODEL } from './symbols.js';
 import { getCursor } from './helpers/mongo.js';
 import
 {
@@ -54,7 +54,9 @@ import
     ModelStreamOptions,
     ModelUpdateOptions,
     ModelUpdateResponse,
-    MongoRootDocument
+    MongoRootDocument,
+    OptimizerConfig,
+    OptimizerOptions
 }
 from './types/external.js';
 import { ComputedPropertiesParam, SyncComputedPropertyMethod } from './types/internal.js';
@@ -77,6 +79,7 @@ export abstract class AbstractModel
     #computedProperties: ComputedPropertyResolver;
     #pipelineBuilder = new PipelineBuilder<DBE>();
     #events = new ModelEventEmitter();
+    #optimizer?: OptimizerConfig;
 
     public converters: Extensions['converters'];
     public smartFilters?: ExtractSmartFilters<Extensions>;
@@ -84,6 +87,7 @@ export abstract class AbstractModel
     protected constructor( models: AbstractModels, public collection: Collection<DBE>, params: Extensions )
     {
         this.#models = models;
+        this.#optimizer = params.optimizer;
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this.smartFilters = params.smartFilters;
         this.#converters = new ConverterManager( this, this.converters );
@@ -103,7 +107,7 @@ export abstract class AbstractModel
         {
             try
             {
-                const pipeline = await this.pipeline(
+                let pipeline = await this.pipeline(
                 {
                     filter      : { _id: { $in: ids.map( id => this.dbeID( id )) } } as Filter<DBE>,
                     projection  : this.converters[conversion].projection,
@@ -111,6 +115,8 @@ export abstract class AbstractModel
                 }, conversion, accessCtx?.method ?? 'get' );
 
                 flowGet( 'log' ) && DUMP( pipeline );
+
+                pipeline = this.#optimizePipeline( pipeline );
 
                 const start = Date.now();
                 const documents = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray();
@@ -140,6 +146,24 @@ export abstract class AbstractModel
                 throw new ModelError( 'MODEL_GET_ERROR', this, e?.toString?.() ?? String( e ), e );
             }
         });
+    }
+
+    [GET_OPTIMIZER_OPTIONS](): OptimizerOptions | undefined
+    {
+        if( this.#optimizer === undefined ){ return this.#models[GET_OPTIMIZER_OPTIONS]() }
+
+        if( this.#optimizer === false ){ return undefined }
+
+        if( this.#optimizer === true ){ return {} }
+
+        return this.#optimizer;
+    }
+
+    #optimizePipeline( pipeline: Document[] ): Document[]
+    {
+        const options = this[GET_OPTIMIZER_OPTIONS]();
+
+        return options !== undefined ? optimizePipeline( pipeline, options ) : pipeline;
     }
 
     public on<E extends ModelEventName>( event: E, handler: ModelEventHandler<E> ): () => void
@@ -519,11 +543,8 @@ export abstract class AbstractModel
         flowGet( 'log' ) && DUMP( pipeline );
         flowGet( 'log' ) && countPipeline && DUMP( countPipeline );
 
-        if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
-        {
-            pipeline = optimizePipeline( pipeline );
-            countPipeline && ( countPipeline = optimizePipeline( countPipeline ));
-        }
+        pipeline = this.#optimizePipeline( pipeline );
+        countPipeline && ( countPipeline = this.#optimizePipeline( countPipeline ));
 
         const start = Date.now();
         const [ entries, total ] = await Promise.all(
@@ -630,10 +651,7 @@ export abstract class AbstractModel
 
         flowGet( 'log' ) && DUMP( pipeline );
 
-        if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
-        {
-            pipeline = optimizePipeline( pipeline );
-        }
+        pipeline = this.#optimizePipeline( pipeline );
 
         const start = Date.now();
         const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
@@ -711,10 +729,7 @@ export abstract class AbstractModel
 
             flowGet( 'log' ) && DUMP( aggregationPipeline );
 
-            if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
-            {
-                aggregationPipeline = optimizePipeline( aggregationPipeline );
-            }
+            aggregationPipeline = this.#optimizePipeline( aggregationPipeline );
 
             const start = Date.now();
             const res = await this.collection.aggregate( aggregationPipeline, { collation: { locale: 'en' } }).toArray() as T[];
@@ -734,12 +749,7 @@ export abstract class AbstractModel
         options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
     ): Promise<number>
     {
-        let countPipeline = [ ...pipeline, { $count: 'count' }];
-
-        if(( flowGet( 'experimentalFlags' ) as any )?.['query-optimizer'] )
-        {
-            countPipeline = optimizePipeline( countPipeline );
-        }
+        const countPipeline = [ ...pipeline, { $count: 'count' }];
 
         return this.aggregate<{ count: number }>( countPipeline, options ).then( r => r[0]?.count ?? 0 );
     }

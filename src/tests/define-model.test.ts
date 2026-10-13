@@ -1,16 +1,17 @@
 import { describe, expect, test, vi } from 'vitest';
 import { defineModel, Model } from '../define-model.js';
 import { AbstractModels } from '../models.js';
-import type { MongoRootDocument } from '../types/external.js';
+import { GET_OPTIMIZER_OPTIONS } from '../symbols.js';
+import type { ModelsOptions, MongoRootDocument } from '../types/external.js';
 
 type SkillDBE = MongoRootDocument & { _id: string, name: string };
 type SkillDTO = { id: string, name: string };
 
 class TestModels extends AbstractModels
 {
-    constructor()
+    constructor( options?: ModelsOptions )
     {
-        super( 'mongodb://localhost/test-define-model' );
+        super( 'mongodb://localhost/test-define-model', options );
     }
 }
 
@@ -156,5 +157,23 @@ describe( 'Model factory', () =>
         const serialized = JSON.stringify( pipeline );
 
         expect( serialized ).toContain( '"name":"TypeScript"' );
+    });
+
+    test( 'inherits optimizer from AbstractModels when omitted and overrides wholesale when configured', () =>
+    {
+        const collection = { collectionName: 'skills', aggregate: vi.fn() } as any;
+        const models = new TestModels({ optimizer: { strictErrors: true } });
+
+        const inherited = defineModel<SkillDBE, SkillDTO>( models, collection );
+        const overridden = defineModel<SkillDBE, SkillDTO>( models, collection, { optimizer: { strictFieldOrder: true } });
+        const disabledClass = Model<SkillDBE, SkillDTO>({ optimizer: false });
+        const disabled = new disabledClass( models, collection );
+        const enabledClass = Model<SkillDBE, SkillDTO>({ optimizer: true });
+        const enabled = new enabledClass( new TestModels({ optimizer: false }), collection );
+
+        expect(( inherited as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: true });
+        expect(( overridden as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictFieldOrder: true });
+        expect(( disabled as any )[GET_OPTIMIZER_OPTIONS]()).toBeUndefined();
+        expect(( enabled as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({});
     });
 });

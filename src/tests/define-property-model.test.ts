@@ -1,8 +1,9 @@
 import { describe, expect, test, vi } from 'vitest';
+import { defineModel } from '../define-model.js';
 import { definePropertyModel, PropertyModel } from '../define-property-model.js';
 import { AbstractModels } from '../models.js';
-import { REGISTER_MODEL } from '../symbols.js';
-import type { MongoPropertyDocument, MongoRootDocument } from '../types/external.js';
+import { GET_OPTIMIZER_OPTIONS, REGISTER_MODEL } from '../symbols.js';
+import type { ModelsOptions, MongoPropertyDocument, MongoRootDocument } from '../types/external.js';
 
 type JobDBE = MongoRootDocument & { _id: string, title: string };
 type ApplicationDBE = MongoPropertyDocument & { id: string, status: string };
@@ -12,9 +13,9 @@ class TestModels extends AbstractModels
 {
     public registered: Array<{ collection: string, path?: string }> = [];
 
-    constructor()
+    constructor( options?: ModelsOptions )
     {
-        super( 'mongodb://localhost/test-define-property-model' );
+        super( 'mongodb://localhost/test-define-property-model', options );
     }
 
     [REGISTER_MODEL]( instance: unknown, collection: string, path?: string )
@@ -140,5 +141,47 @@ describe( 'PropertyModel factory', () =>
         const dto = await applications.converters.dto.converter({ id: 'app-1', status: 'submitted' } as ApplicationDBE );
 
         expect( dto ).toEqual({ id: 'cfg:app-1', status: 'submitted' });
+    });
+
+    test( 'resolves 4-level hierarchy inheritance, wholesale overrides, and reverse registration order dynamically', () =>
+    {
+        const collection = { collectionName: 'jobs', aggregate: vi.fn() } as any;
+        const models = new TestModels({ optimizer: { strictErrors: true } });
+
+        // Register child PropertyModel BEFORE parent Model to verify dynamic resolution (AE2 / R6)
+        const engagements = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
+            models,
+            collection,
+            { path: 'engagements[]' }
+        );
+
+        // Before root model is registered, engagements falls back to AbstractModels
+        expect(( engagements as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: true });
+
+        // Register root Model with wholesale override
+        const jobs = defineModel<JobDBE>( models, collection, { optimizer: { strictFieldOrder: true } });
+
+        // Now engagements dynamically inherits from root Model without merging strictErrors (AE1)
+        expect(( jobs as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictFieldOrder: true });
+        expect(( engagements as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictFieldOrder: true });
+
+        // Nested PropertyModel with optimizer: false disables optimization
+        const applications = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
+            models,
+            collection,
+            { path: 'engagements[].applications[]', optimizer: false }
+        );
+
+        expect(( applications as any )[GET_OPTIMIZER_OPTIONS]()).toBeUndefined();
+
+        // Deeper PropertyModel with optimizer: true re-enables optimization with default {} (AE2)
+        const HistoryClass = PropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
+        {
+            path        : 'engagements[].applications[].history[]',
+            optimizer   : true
+        });
+        const history = new HistoryClass( models, collection );
+
+        expect(( history as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({});
     });
 });
