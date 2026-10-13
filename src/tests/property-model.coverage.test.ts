@@ -1,11 +1,21 @@
 import { describe, expect, test, vi } from 'vitest';
+import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
 import { getCursor } from '../helpers/mongo.js';
-import { flowExecute } from '../flow.js';
 import { ModelError } from '../errors.js';
 import { AbstractModel } from '../model.js';
 import { AbstractModels } from '../models.js';
 import { AbstractPropertyModel } from '../property-model.js';
-import type { MongoPropertyDocument, MongoRootDocument } from '../types/external.js';
+import type { ModelsOptions, MongoPropertyDocument, MongoRootDocument } from '../types/external.js';
+
+vi.mock( '@webergency-utils/mongodb-query-optimizer', async( importOriginal ) =>
+{
+    const actual = await importOriginal<typeof import( '@webergency-utils/mongodb-query-optimizer' )>();
+
+    return {
+        ...actual,
+        optimizePipeline: vi.fn( actual.optimizePipeline )
+    };
+});
 
 type RootDBE = MongoRootDocument & { _id: string, profile?: ProfileDBE, items?: ItemDBE[], engagements?: Array<{ id: string, applications: AppDBE[] }> };
 type ItemDBE = MongoPropertyDocument & { id: string, orgId: string, label: string };
@@ -16,9 +26,9 @@ type RootDTO = { id: string };
 
 class TestModels extends AbstractModels
 {
-    constructor()
+    constructor( options?: ModelsOptions )
     {
-        super( 'mongodb://localhost/test-property-coverage' );
+        super( 'mongodb://localhost/test-property-coverage', options );
     }
 }
 
@@ -236,22 +246,21 @@ describe( 'AbstractPropertyModel coverage branches', () =>
             [Symbol.asyncIterator]  : gen
         }));
 
-        await flowExecute( async() =>
+        vi.mocked( optimizePipeline ).mockClear();
+
+        await model.aggregate([{ $limit: 1 }], { filter: { label: 'A' } });
+        await model.count([], { filter: { label: 'A' } });
+
+        const forward: ItemDTO[] = [];
+
+        for await( const item of model.stream({ sort: { label: 1 } }) )
         {
-            await model.aggregate([{ $limit: 1 }], { filter: { label: 'A' } });
-            await model.count([], { filter: { label: 'A' } });
+            forward.push( item );
+        }
 
-            const forward: ItemDTO[] = [];
-
-            for await( const item of model.stream({ sort: { label: 1 } }) )
-            {
-                forward.push( item );
-            }
-
-            expect( forward ).toHaveLength( 1 );
-            expect( forward[0].orgId ).toBe( 'o' );
-        },
-        { experimentalFlags: { 'query-optimizer': true } });
+        expect( forward ).toHaveLength( 1 );
+        expect( forward[0].orgId ).toBe( 'o' );
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 3 );
     });
 
     test( 'list with sort without bare id and projection split', async() =>
@@ -322,6 +331,8 @@ describe( 'AbstractPropertyModel coverage branches', () =>
         new RootModel();
         const model = new ItemModel( models, { collectionName: 'roots', aggregate });
 
+        vi.mocked( optimizePipeline ).mockClear();
+
         const result = await model.list({
             sort                : { label: 1 },
             count               : true,
@@ -331,15 +342,7 @@ describe( 'AbstractPropertyModel coverage branches', () =>
 
         expect( result.items[0].id ).toBe( '1' );
         expect( result.total ).toBe( 1 );
-
-        call = 0;
-        await flowExecute( async() =>
-        {
-            const optimized = await model.list({ sort: { label: 1 }, count: true });
-
-            expect( optimized.total ).toBe( 1 );
-        },
-        { experimentalFlags: { 'query-optimizer': true } });
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 2 );
     });
 
     test( 'list/stream rethrow non-access errors', async() =>
@@ -460,28 +463,132 @@ describe( 'AbstractPropertyModel coverage branches', () =>
                             projection  : { label: 1, '_root.title': 1, _root: { org: 1 } }
                         },
                         dbe : { converter: ( dbe: ItemDBE ) => dbe }
-                    }
+                    },
+                    optimizer: { strictFieldOrder: true }
                 });
             }
         }
 
         const model = new ItemModel( new TestModels(), { collectionName: 'roots', aggregate });
 
-        await flowExecute( async() =>
+        vi.mocked( optimizePipeline ).mockClear();
+
+        const listed = await model.list({ sort: { label: 1 }, count: false });
+
+        expect( listed.items[0].id ).toBe( '1' );
+
+        const streamed: string[] = [];
+
+        for await( const item of model.stream({ sort: { label: 1 } }) )
         {
-            const listed = await model.list({ sort: { label: 1 }, count: false });
+            streamed.push( item.id );
+        }
 
-            expect( listed.items[0].id ).toBe( '1' );
+        expect( streamed ).toEqual([ '1' ]);
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 2 );
+        expect( optimizePipeline ).toHaveBeenNthCalledWith( 1, expect.any( Array ), { strictFieldOrder: true });
+        expect( optimizePipeline ).toHaveBeenNthCalledWith( 2, expect.any( Array ), { strictFieldOrder: true });
+    });
 
-            const streamed: string[] = [];
+    test( 'optimizes get, getMany, find, and internal .get() calls in create and update while excluding writes and honoring disabled optimizer', async() =>
+    {
+        const docs = [{ _id: 'root-1', id: 'item-1', orgId: 'o', label: 'A', status: 'ok', count: 1 }];
+        const aggregate = vi.fn(() =>
+        ({
+            toArray                 : async() => docs,
+            [Symbol.asyncIterator]  : async function *(){ yield *docs }
+        }));
+        const updateOne = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const updateMany = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const collection = { collectionName: 'roots', aggregate, updateOne, updateMany };
+        const models = new TestModels({ optimizer: { strictErrors: true } });
 
-            for await( const item of model.stream({ sort: { label: 1 } }) )
+        class RootModel extends AbstractModel<RootDBE, RootDTO, any>
+        {
+            constructor()
             {
-                streamed.push( item.id );
+                super( models, collection as any,
+                {
+                    converters:
+                    {
+                        dto : { converter: ( dbe: RootDBE ) => ({ id: dbe._id }) },
+                        dbe : { converter: ( dbe: RootDBE ) => dbe }
+                    },
+                    optimizer: { strictFieldOrder: true }
+                });
             }
+        }
 
-            expect( streamed ).toEqual([ '1' ]);
-        },
-        { experimentalFlags: { 'query-optimizer': true } });
+        class ItemModel extends AbstractPropertyModel<RootDBE, ItemDBE, ItemDTO, any>
+        {
+            constructor( optimizer?: any )
+            {
+                super( models, collection as any, 'items[]',
+                {
+                    converters:
+                    {
+                        dto : { converter: ( dbe: ItemDBE ) => ({ id: dbe.id, orgId: dbe.orgId, label: dbe.label }) },
+                        dbe : { converter: ( dbe: ItemDBE ) => dbe }
+                    },
+                    optimizer
+                });
+            }
+        }
+
+        // Instantiate child PropertyModel before RootModel to verify dynamic ancestor lookup on read queries (AE2 / R6)
+        const items = new ItemModel();
+
+        new RootModel();
+
+        vi.mocked( optimizePipeline ).mockClear();
+
+        // Direct read methods: get, getMany, find
+        await items.get( 'item-1' );
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 1 );
+        expect( optimizePipeline ).toHaveBeenLastCalledWith( expect.any( Array ), { strictFieldOrder: true });
+
+        await items.getMany([ 'item-1' ]);
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 2 );
+
+        await items.find({ filter: { label: 'A' } });
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 3 );
+
+        // Internal parentModel.get() inside PropertyModel.create is optimized (R10 / AE3)
+        vi.mocked( optimizePipeline ).mockClear();
+
+        await items.create( 'root-1', { orgId: 'o', label: 'B' } as any, 'item-2' );
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 1 );
+        expect( optimizePipeline ).toHaveBeenLastCalledWith( expect.any( Array ), { strictFieldOrder: true });
+
+        // Internal this.get() inside PropertyModel.update with documentBefore & documentAfter is optimized (R10 / AE3)
+        vi.mocked( optimizePipeline ).mockClear();
+
+        const updated = await items.update( 'item-1', { label: 'C' }, { documentBefore: true, documentAfter: true });
+
+        expect( updated.documentBefore ).toBeDefined();
+        expect( updated.documentAfter ).toBeDefined();
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 2 );
+
+        // Write operations without internal .get() do NOT call optimizePipeline
+        vi.mocked( optimizePipeline ).mockClear();
+
+        await items.update( 'item-1', { label: 'D' });
+        await items.updateMany([ 'item-1' ], { label: 'E' });
+
+        expect( optimizePipeline ).not.toHaveBeenCalled();
+
+        // Disabled optimizer on PropertyModel skips optimizePipeline on all read methods and internal .get() in update
+        const disabledItems = new ItemModel( false );
+
+        await disabledItems.get( 'item-1' );
+        await disabledItems.getMany([ 'item-1' ]);
+        await disabledItems.find({ filter: { label: 'A' } });
+        await disabledItems.list({ count: true });
+        for await( const _ of disabledItems.stream({}) ){ /* drain */ }
+        await disabledItems.aggregate([{ $limit: 1 }]);
+        await disabledItems.count([]);
+        await disabledItems.update( 'item-1', { label: 'F' }, { documentBefore: true, documentAfter: true });
+
+        expect( optimizePipeline ).not.toHaveBeenCalled();
     });
 });

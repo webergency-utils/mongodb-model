@@ -1,22 +1,32 @@
 import { describe, expect, test, vi } from 'vitest';
-import { flowExecute } from '../flow.js';
+import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
 import { ModelAccessDeniedError, ModelError } from '../errors.js';
 import { AbstractModel } from '../model.js';
 import { AbstractModels } from '../models.js';
-import type { MongoRootDocument } from '../types/external.js';
+import type { ModelsOptions, MongoRootDocument, OptimizerConfig } from '../types/external.js';
+
+vi.mock( '@webergency-utils/mongodb-query-optimizer', async( importOriginal ) =>
+{
+    const actual = await importOriginal<typeof import( '@webergency-utils/mongodb-query-optimizer' )>();
+
+    return {
+        ...actual,
+        optimizePipeline: vi.fn( actual.optimizePipeline )
+    };
+});
 
 type UserDBE = MongoRootDocument & { _id: string, name: string };
 type UserDTO = { id: string, name: string };
 
 class TestModels extends AbstractModels
 {
-    constructor()
+    constructor( options?: ModelsOptions )
     {
-        super( 'mongodb://localhost/test-model-coverage' );
+        super( 'mongodb://localhost/test-model-coverage', options );
     }
 }
 
-function makeModel( collection: any, access?: any, extras?: { smartFilters?: any, computedProperties?: any, converters?: any })
+function makeModel( collection: any, access?: any, extras?: { smartFilters?: any, computedProperties?: any, converters?: any, optimizer?: OptimizerConfig, models?: AbstractModels })
 {
     class UserModel extends AbstractModel<UserDBE, UserDTO, any>
     {
@@ -34,12 +44,13 @@ function makeModel( collection: any, access?: any, extras?: { smartFilters?: any
                 },
                 access,
                 smartFilters        : extras?.smartFilters,
-                computedProperties  : extras?.computedProperties
+                computedProperties  : extras?.computedProperties,
+                optimizer           : extras?.optimizer
             });
         }
     }
 
-    return new UserModel( new TestModels(), collection );
+    return new UserModel( extras?.models ?? new TestModels(), collection );
 }
 
 describe( 'AbstractModel coverage branches', () =>
@@ -161,14 +172,15 @@ describe( 'AbstractModel coverage branches', () =>
             }
         );
 
-        await flowExecute( async() =>
-        {
-            const result = await model.list({ sort: { name: 1 }, count: true, countLimit: 5 });
+        vi.mocked( optimizePipeline ).mockClear();
 
-            expect( result.items ).toEqual([{ id: '1', name: 'Ada' }]);
-            expect( result.total ).toBe( 1 );
-        },
-        { experimentalFlags: { 'query-optimizer': true } });
+        const result = await model.list({ sort: { name: 1 }, count: true, countLimit: 5 });
+
+        expect( result.items ).toEqual([{ id: '1', name: 'Ada' }]);
+        expect( result.total ).toBe( 1 );
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 2 );
+        expect( optimizePipeline ).toHaveBeenNthCalledWith( 1, expect.any( Array ), {});
+        expect( optimizePipeline ).toHaveBeenNthCalledWith( 2, expect.any( Array ), {});
     });
 
     test( 'stream access deny and empty stream emits query', async() =>
@@ -227,22 +239,23 @@ describe( 'AbstractModel coverage branches', () =>
                 smartFilters:
                 {
                     byName: async( name: string ) => ({ filter: { name } })
-                }
+                },
+                optimizer: { strictFieldOrder: true }
             }
         );
 
+        vi.mocked( optimizePipeline ).mockClear();
+
         const items: UserDTO[] = [];
 
-        await flowExecute( async() =>
+        for await( const row of model.stream({ sort: { name: 1 }, smartFilter: { byName: 'Ada' } }) )
         {
-            for await( const row of model.stream({ sort: { name: 1 }, smartFilter: { byName: 'Ada' } }) )
-            {
-                items.push( row );
-            }
-        },
-        { experimentalFlags: { 'query-optimizer': true } });
+            items.push( row );
+        }
 
         expect( items ).toEqual([{ id: '1', name: 'Ada' }]);
+        expect( optimizePipeline ).toHaveBeenCalledOnce();
+        expect( optimizePipeline ).toHaveBeenCalledWith( expect.any( Array ), { strictFieldOrder: true });
     });
 
     test( 'stream rethrows non-access errors', async() =>
@@ -258,17 +271,67 @@ describe( 'AbstractModel coverage branches', () =>
         await expect( model.stream({}).next()).rejects.toThrow( 'stream-boom' );
     });
 
-    test( 'aggregate and count honor query-optimizer flag', async() =>
+    test( 'optimizes get, getMany, find, aggregate, and count once per query and skips write operations or disabled models', async() =>
     {
-        const aggregate = vi.fn(() => ({ toArray: async() => [{ count: 2 }] }));
-        const model = makeModel({ collectionName: 'users', aggregate });
+        const aggregate = vi.fn(() => ({ toArray: async() => [{ _id: '1', name: 'Ada', count: 2 }] }));
+        const insertOne = vi.fn( async() => ({ insertedId: '1' }));
+        const updateOne = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const updateMany = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const deleteOne = vi.fn( async() => ({ deletedCount: 1 }));
+        const collection = { collectionName: 'users', aggregate, insertOne, updateOne, updateMany, deleteOne };
+        const model = makeModel( collection, undefined, { optimizer: { strictErrors: true } });
 
-        await flowExecute( async() =>
-        {
-            expect( await model.count([{ $match: { a: 1 } }])).toBe( 2 );
-            expect( await model.aggregate([{ $limit: 1 }], { filter: { a: 1 } })).toEqual([{ count: 2 }]);
-        },
-        { experimentalFlags: { 'query-optimizer': true } });
+        vi.mocked( optimizePipeline ).mockClear();
+
+        expect( await model.get( '1' )).toEqual({ id: '1', name: 'Ada' });
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 1 );
+        expect( optimizePipeline ).toHaveBeenLastCalledWith( expect.any( Array ), { strictErrors: true });
+
+        expect( await model.getMany([ '1' ])).toEqual([{ id: '1', name: 'Ada' }]);
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 2 );
+
+        expect( await model.find({ filter: { name: 'Ada' } })).toEqual({ id: '1', name: 'Ada' });
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 3 );
+
+        expect( await model.count([{ $match: { a: 1 } }])).toBe( 2 );
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 4 );
+
+        expect( await model.aggregate([{ $limit: 1 }], { filter: { a: 1 } })).toEqual([{ _id: '1', name: 'Ada', count: 2 }]);
+        expect( optimizePipeline ).toHaveBeenCalledTimes( 5 );
+
+        // Write operations must NOT call optimizePipeline (R10 / AE3)
+        vi.mocked( optimizePipeline ).mockClear();
+
+        await model.create({ name: 'Ada' } as any, '1' );
+        await model.update( '1', { name: 'Grace' });
+        await model.updateMany([ '1' ], { name: 'Grace' });
+        await model.delete( '1' );
+
+        expect( optimizePipeline ).not.toHaveBeenCalled();
+
+        // Disabled optimizer skips optimizePipeline on all read methods
+        const disabledModel = makeModel(
+            {
+                ...collection,
+                aggregate: vi.fn(() =>
+                ({
+                    toArray                 : async() => [{ _id: '1', name: 'Ada', count: 1 }],
+                    [Symbol.asyncIterator]  : async function *(){ yield { _id: '1', name: 'Ada' } }
+                }))
+            },
+            undefined,
+            { optimizer: false }
+        );
+
+        await disabledModel.get( '1' );
+        await disabledModel.getMany([ '1' ]);
+        await disabledModel.find({});
+        await disabledModel.list({ count: true });
+        for await( const _ of disabledModel.stream({}) ){ /* drain */ }
+        await disabledModel.aggregate([{ $limit: 1 }]);
+        await disabledModel.count([]);
+
+        expect( optimizePipeline ).not.toHaveBeenCalled();
     });
 
     test( 'list rethrows non-access errors from access resolve', async() =>
