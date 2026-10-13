@@ -202,6 +202,7 @@ export type ConstructorExtensions<E extends PropertyModelExtensions<any, any, an
     {
         smartFilters?       : FirstType<ExtractSmartFilters<E>>
         computedProperties? : FirstType<ExtractComputedProperties<E>>
+        optimizer?          : OptimizerConfig
     }
 
 export type ModelExtensions

@@ -161,6 +161,20 @@ describe( 'PropertyModel factory', () =>
         expect(( jobs as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictFieldOrder: true });
         expect(( engagements as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictFieldOrder: true });
 
+        const engagementsOverride = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
+            models,
+            collection,
+            { path: 'engagements[]', optimizer: { strictErrors: false } }
+        );
+        const notes = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
+            models,
+            collection,
+            { path: 'engagements[].applications[].notes[]' }
+        );
+
+        expect(( engagementsOverride as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: false });
+        expect(( notes as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: false });
+
         const applications = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
             models,
             collection,
@@ -168,6 +182,15 @@ describe( 'PropertyModel factory', () =>
         );
 
         expect(( applications as any )[GET_OPTIMIZER_OPTIONS]()).toBeUndefined();
+        expect(( notes as any )[GET_OPTIMIZER_OPTIONS]()).toBeUndefined();
+
+        const stages = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
+            models,
+            collection,
+            { path: 'engagements[].stages[]' }
+        );
+
+        expect(( stages as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: false });
 
         const HistoryClass = PropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
         {
@@ -177,5 +200,14 @@ describe( 'PropertyModel factory', () =>
         const history = new HistoryClass( models, collection );
 
         expect(( history as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({});
+
+        const applicationsOverride = definePropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
+            models,
+            collection,
+            { path: 'engagements[].applications[]', optimizer: { strictErrors: true, strictFieldOrder: true } }
+        );
+
+        expect(( applicationsOverride as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: true, strictFieldOrder: true });
+        expect(( notes as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: true, strictFieldOrder: true });
     });
 });

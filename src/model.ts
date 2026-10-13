@@ -84,7 +84,7 @@ export abstract class AbstractModel
     public converters: Extensions['converters'];
     public smartFilters?: ExtractSmartFilters<Extensions>;
 
-    protected constructor( models: AbstractModels, public collection: Collection<DBE>, params: Extensions )
+    protected constructor( models: AbstractModels, public collection: Collection<DBE>, params: Extensions & { optimizer?: OptimizerConfig } )
     {
         this.#models = models;
         this.#optimizer = params.optimizer;
@@ -114,9 +114,9 @@ export abstract class AbstractModel
                     access      : accessCtx?.access
                 }, conversion, accessCtx?.method ?? 'get' );
 
-                flowGet( 'log' ) && DUMP( pipeline );
-
                 pipeline = this.#optimizePipeline( pipeline );
+
+                flowGet( 'log' ) && DUMP( pipeline );
 
                 const start = Date.now();
                 const documents = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray();
@@ -540,11 +540,11 @@ export abstract class AbstractModel
             options.count ? this.#pipelineBuilder.count( params ) : undefined
         ]);
 
-        flowGet( 'log' ) && DUMP( pipeline );
-        flowGet( 'log' ) && countPipeline && DUMP( countPipeline );
-
         pipeline = this.#optimizePipeline( pipeline );
         countPipeline && ( countPipeline = this.#optimizePipeline( countPipeline ));
+
+        flowGet( 'log' ) && DUMP( pipeline );
+        flowGet( 'log' ) && countPipeline && DUMP( countPipeline );
 
         const start = Date.now();
         const [ entries, total ] = await Promise.all(
@@ -649,9 +649,9 @@ export abstract class AbstractModel
             computedProperties
         });
 
-        flowGet( 'log' ) && DUMP( pipeline );
-
         pipeline = this.#optimizePipeline( pipeline );
+
+        flowGet( 'log' ) && DUMP( pipeline );
 
         const start = Date.now();
         const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
@@ -727,9 +727,9 @@ export abstract class AbstractModel
                     : resolveBSONObject( pipeline ) as Document[];
             }
 
-            flowGet( 'log' ) && DUMP( aggregationPipeline );
-
             aggregationPipeline = this.#optimizePipeline( aggregationPipeline );
+
+            flowGet( 'log' ) && DUMP( aggregationPipeline );
 
             const start = Date.now();
             const res = await this.collection.aggregate( aggregationPipeline, { collation: { locale: 'en' } }).toArray() as T[];
