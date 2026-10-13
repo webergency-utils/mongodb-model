@@ -46,7 +46,7 @@
     "@webergency-utils/mongodb-query-optimizer": "^0.0.5",
     "@webergency-utils/object-hash": "^1.1.2",
     "mongodb": "^7.0.0",
-    "snappy": "^7.3.3"
+    "snappy": "^7.4.3"
   },
   "devDependencies": {
     "@jazzer.js/core": "^4.0.0",
