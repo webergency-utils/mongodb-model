@@ -1,7 +1,8 @@
 import { describe, expect, test, vi } from 'vitest';
 import { AbstractModel } from '../model.js';
 import { AbstractModels } from '../models.js';
-import type { MongoRootDocument } from '../types/external.js';
+import { GET_OPTIMIZER_OPTIONS } from '../symbols.js';
+import type { ModelsOptions, MongoRootDocument } from '../types/external.js';
 
 type UserDBE = MongoRootDocument & { _id: string, name: string };
 type UserDTO = { id: string, name: string };
@@ -17,9 +18,9 @@ class TestModels extends AbstractModels
 
 class SharedClientModels extends AbstractModels
 {
-    constructor( connectionString: string )
+    constructor( connectionString: string, options?: ModelsOptions )
     {
-        super( connectionString );
+        super( connectionString, options );
     }
 
     getClient()
@@ -196,5 +197,33 @@ describe( 'AbstractModels.shutdown', () =>
 
         await next.shutdown();
         await shared.shutdown();
+    });
+});
+
+describe( 'AbstractModels.optimizer', () =>
+{
+    test( 'resolves default, boolean, and options object configurations via GET_OPTIMIZER_OPTIONS and strips optimizer from MongoClient options', async() =>
+    {
+        const baseUri = 'mongodb://localhost/optimizer-cfg-' + Date.now();
+        const defaultModels = new SharedClientModels( baseUri + '-default' );
+        const enabledModels = new SharedClientModels( baseUri + '-true', { optimizer: true, maxPoolSize: 25 });
+        const disabledModels = new SharedClientModels( baseUri + '-false', { optimizer: false });
+        const customModels = new SharedClientModels( baseUri + '-custom',
+        {
+            optimizer   : { strictFieldOrder: true, strictErrors: true },
+            maxPoolSize : 50
+        });
+
+        expect(( defaultModels as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({});
+        expect(( enabledModels as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({});
+        expect(( disabledModels as any )[GET_OPTIMIZER_OPTIONS]()).toBeUndefined();
+        expect(( customModels as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictFieldOrder: true, strictErrors: true });
+        expect(( customModels.getClient() as any ).options.maxPoolSize ).toBe( 50 );
+        expect( 'optimizer' in ( customModels.getClient() as any ).options ).toBe( false );
+
+        await defaultModels.shutdown();
+        await enabledModels.shutdown();
+        await disabledModels.shutdown();
+        await customModels.shutdown();
     });
 });

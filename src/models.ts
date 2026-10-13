@@ -1,9 +1,10 @@
-import { MongoClient, MongoClientOptions, WithTransactionCallback } from 'mongodb';
+import { MongoClient, WithTransactionCallback } from 'mongodb';
 import { ModelError } from './errors.js';
 import { flowExecute, flowGet, flowSet, flowStart } from './flow.js';
-import { GET_PARENT, REGISTER_MODEL } from './symbols.js';
+import { GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
 import type { AbstractModel } from './model.js';
 import type { AbstractPropertyModel } from './property-model.js';
+import type { ModelsOptions, OptimizerConfig, OptimizerOptions } from './types/external.js';
 
 const Clients = new Map<string, MongoClient>();
 const ClosedClients = new WeakSet<MongoClient>();
@@ -43,6 +44,7 @@ export class AbstractModels
     #closed = false;
     #shutdownPromise?: Promise<void>;
     #models = new Map<string, ModelInstance>();
+    #optimizer: OptimizerConfig = true;
 
     public readonly scope = Object.freeze(
     {
@@ -53,9 +55,12 @@ export class AbstractModels
         execute : flowExecute
     });
 
-    protected constructor( connectionString: string, options: MongoClientOptions = {})
+    protected constructor( connectionString: string, options: ModelsOptions = {})
     {
+        const { optimizer = true, ...mongoOptions } = options;
+
         this.#connectionString = connectionString;
+        this.#optimizer = optimizer;
 
         if( Clients.has( connectionString ) )
         {
@@ -69,7 +74,7 @@ export class AbstractModels
                 maxPoolSize     : 100,
                 maxIdleTimeMS   : 15000,
                 compressors     : [ 'snappy' ],
-                ...options
+                ...mongoOptions
             });
 
             Clients.set( connectionString, this.client );
@@ -181,6 +186,15 @@ export class AbstractModels
         }
 
         return undefined;
+    }
+
+    [GET_OPTIMIZER_OPTIONS](): OptimizerOptions | undefined
+    {
+        if( this.#optimizer === false ){ return undefined }
+
+        if( this.#optimizer === true ){ return {} }
+
+        return this.#optimizer;
     }
 
     public async transaction<T = void>( fn: WithTransactionCallback<T> ): Promise<T>
