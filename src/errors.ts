@@ -2,8 +2,16 @@ export class ModelError extends Error
 {
     public readonly code: string;
 
-    constructor( code: string, model: object, message: string, cause?: Error )
+    constructor( model: object, message: string, cause?: Error );
+    constructor( code: string, model: object, message: string, cause?: Error );
+    constructor( codeOrModel: string | object, modelOrMessage: object | string, messageOrCause?: string | Error, maybeCause?: Error )
     {
+        const hasCode = typeof codeOrModel === 'string';
+        const code = hasCode ? codeOrModel : 'MODEL_INTERNAL_ERROR';
+        const model = ( hasCode ? modelOrMessage : codeOrModel ) as object;
+        const message = ( hasCode ? messageOrCause : modelOrMessage ) as string;
+        const cause = ( hasCode ? maybeCause : messageOrCause ) as Error | undefined;
+
         super( `[${code}] ${model.constructor.name}: ${message}`, { cause });
 
         this.code = code;

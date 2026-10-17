@@ -45,9 +45,11 @@ describe( 'mongo helpers', () =>
         expect( optimizeMatch({ status: { $in: [ 'active' ] } })).toEqual({ status: { $eq: 'active' } });
     });
 
-    test( 'addPrefixToFilter prefixes keys', () =>
+    test( 'addPrefixToFilter prefixes keys and preserves foreign ObjectId values', () =>
     {
-        expect( addPrefixToFilter({ name: 'x' }, 'items' )).toEqual({ 'items.name': 'x' });
+        const foreign = foreignObjectIdByBsontype();
+
+        expect( addPrefixToFilter({ name: 'x', refId: foreign }, 'items' )).toEqual({ 'items.name': 'x', 'items.refId': foreign });
     });
 
     test( 'toUpdateOperations wraps plain object as $set', () =>

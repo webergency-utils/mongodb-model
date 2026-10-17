@@ -35,6 +35,10 @@ export type ListResult<T> =
     cursors : { next?: string, prev?: string }
 }
 
+export type WithTotal<T> = T extends Array<infer U>
+    ? Array<U> & ListResult<U>
+    : T & { total?: number, cursors?: { next?: string, prev?: string } };
+
 export type GetOptions<K extends string | number | symbol = 'dto'> =
 {
     as?     : K

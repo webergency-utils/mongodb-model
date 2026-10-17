@@ -62,7 +62,7 @@ function addPrefixToValue( filter: Filter | any, prefix: string, prefixKeys: boo
     }
     if( typeof filter === 'object' &&
     (
-        ( filter instanceof ObjectId ) ||
+        ( isLibraryObjectId( filter ) || isForeignObjectIdLike( filter ) ) ||
         ( filter instanceof Date )  ||
         ( filter instanceof RegExp ) // TODO is basic object alternative?
     ))

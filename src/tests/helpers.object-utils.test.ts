@@ -41,26 +41,39 @@ describe( 'deleteNullishProperties', () =>
         assert.deepEqual( res, { a: { c: 2 }, d: [ 3 ] });
     });
 
-    it( 'preserves Date and ObjectId', () =>
+    it( 'preserves Date and ObjectId (including foreign realm ObjectId-like)', () =>
     {
         const date = new Date( '2020-01-01T00:00:00.000Z' );
         const id = new ObjectId( '5f4d6f9e6f0a4d001f9a2a4d' );
-        const res = deleteNullishProperties({ date, id, x: null });
+        const foreignId =
+        {
+            _bsontype   : 'ObjectId',
+            id          : Buffer.from( '5f4d6f9e6f0a4d001f9a2a4d', 'hex' ),
+            toString    : () => '5f4d6f9e6f0a4d001f9a2a4d'
+        };
+        const res = deleteNullishProperties({ date, id, foreignId, x: null });
 
         assert.equal( res.date, date );
         assert.equal( res.id, id );
+        assert.equal( res.foreignId, foreignId );
         assert.equal( 'x' in res, false );
     });
 });
 
 describe( 'deleteUndefinedProperties', () =>
 {
-    it( 'removes undefined but keeps null', () =>
+    it( 'removes undefined, keeps null, and preserves foreign realm ObjectId-like', () =>
     {
-        assert.deepEqual(
-            deleteUndefinedProperties({ a: undefined, b: null, c: 1 }),
-            { b: null, c: 1 }
-        );
+        const foreignId =
+        {
+            _bsontype   : 'ObjectId',
+            id          : Buffer.from( '5f4d6f9e6f0a4d001f9a2a4d', 'hex' ),
+            toString    : () => '5f4d6f9e6f0a4d001f9a2a4d'
+        };
+        const res = deleteUndefinedProperties({ a: undefined, b: null, c: 1, foreignId });
+
+        assert.deepEqual( res, { b: null, c: 1, foreignId });
+        assert.equal( res.foreignId, foreignId );
     });
 });
 
@@ -97,20 +110,40 @@ describe( 'i18n / multiI18n', () =>
 
 describe( 'objectGet / objectSet / objectFlatten', () =>
 {
-    it( 'gets and sets nested paths', () =>
+    it( 'gets and sets nested paths and preserves foreign ObjectId in objectFlatten', () =>
     {
         const obj: Record<string, unknown> = {};
+        const foreignId =
+        {
+            _bsontype   : 'ObjectId',
+            id          : Buffer.from( '5f4d6f9e6f0a4d001f9a2a4d', 'hex' ),
+            toString    : () => '5f4d6f9e6f0a4d001f9a2a4d'
+        };
 
         objectSet( obj, [ 'a', 'b' ], 1 );
         assert.equal( objectGet( obj, [ 'a', 'b' ] ), 1 );
-        assert.deepEqual( objectFlatten({ a: { b: 1, c: [ 2 ] } }), { 'a.b': 1, 'a.c.0': 2 });
+        assert.deepEqual(
+            objectFlatten({ a: { b: 1, c: [ 2 ], id: foreignId } }),
+            { 'a.b': 1, 'a.c.0': 2, 'a.id': foreignId }
+        );
     });
 
-    it( 'objectHash and objectHashID', () =>
+    it( 'objectHash and objectHashID match for native and foreign ObjectId', () =>
     {
+        const nativeId = new ObjectId( '5f4d6f9e6f0a4d001f9a2a4d' );
+        const foreignId =
+        {
+            _bsontype   : 'ObjectId',
+            id          : Buffer.from( '5f4d6f9e6f0a4d001f9a2a4d', 'hex' ),
+            toString    : () => '5f4d6f9e6f0a4d001f9a2a4d'
+        };
         const hash = objectHash({ a: 1 }, { sort: true, alg: 'sha1' });
 
         assert.equal( typeof hash, 'string' );
         assert.equal( objectHashID({ a: 1 }, { sort: true, alg: 'sha1' }).toString().length, 24 );
+        assert.equal(
+            objectHash({ id: nativeId }, { alg: 'plain' }),
+            objectHash({ id: foreignId }, { alg: 'plain' })
+        );
     });
 });

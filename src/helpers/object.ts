@@ -2,6 +2,12 @@ import { ObjectId } from 'mongodb';
 import { objectStringify } from '@webergency-utils/object-hash';
 import { createHash } from 'node:crypto';
 import { flowGet } from '../flow.js';
+import { isForeignObjectIdLike, isLibraryObjectId } from './mongo.js';
+
+function isObjectId( value: unknown ): boolean
+{
+    return isLibraryObjectId( value ) || isForeignObjectIdLike( value );
+}
 
 export function i18n( i18n: { [key: string]: string } | string ): string
 {
@@ -50,7 +56,7 @@ export function deleteNullishProperties<T, R = T>( obj: T ): R
 {
     if( typeof obj !== 'object' ){ throw new Error( 'Unsupported type ' + typeof obj ) }
     else if( obj instanceof Date ){ return obj as R }
-    else if( obj instanceof ObjectId ){ return obj as R }
+    else if( isObjectId( obj ) ){ return obj as R }
     else if( obj instanceof RegExp ){ return obj as R }
     else if( obj === null || obj === undefined ){ return obj as unknown as R }
 
@@ -76,7 +82,7 @@ export function deleteUndefinedProperties<T, R = T>( obj: T ): R
 {
     if( typeof obj !== 'object' ){ throw new Error( 'Unsupported type ' + typeof obj ) }
     else if( obj instanceof Date ){ return obj as R }
-    else if( obj instanceof ObjectId ){ return obj as R }
+    else if( isObjectId( obj ) ){ return obj as R }
     else if( obj instanceof RegExp ){ return obj as R }
     else if( obj === null ){ return obj as unknown as R }
 
@@ -104,7 +110,7 @@ export function objectHash( obj: any, options: { sort?: boolean, alg?: 'plain' |
     {
         sortArrays                  : options.sort,
         ignoreUndefinedProperties   : true,
-        stringify                   : ( item: any ) => item instanceof ObjectId ? `ObjectId("${item.toString()}")` : undefined
+        stringify                   : ( item: any ) => isObjectId( item ) ? JSON.stringify( item.toString() ) : undefined
     });
 
     return options.alg !== 'plain' ? createHash( options.alg ?? 'sha1' ).update( value ).digest( 'hex' ) : value;
@@ -157,7 +163,7 @@ function objectFlattenRecursive( value: any, result: Record<string, unknown>, pr
 {
     if( typeof value !== 'object' ||
         (
-            ( value instanceof ObjectId ) ||
+            isObjectId( value ) ||
             ( value instanceof Date ) ||
             ( value instanceof RegExp ) ||
             ( value === null )

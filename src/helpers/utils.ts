@@ -1,7 +1,7 @@
-import { ObjectId } from 'mongodb';
 import { inspect } from 'node:util';
 import { flowGet } from '../flow.js';
 import { Log } from './log.js';
+import { isForeignObjectIdLike, isLibraryObjectId } from './mongo.js';
 
 export function map<T, E>( ids: T[], entries: E[], getID: ( e: E ) => T ): Array<E | null>
 {
@@ -12,7 +12,7 @@ export function map<T, E>( ids: T[], entries: E[], getID: ( e: E ) => T ): Array
 
 function idToIndexKey<T>( id: T )
 {
-    return id instanceof ObjectId ? id.toString() : id;
+    return ( isLibraryObjectId( id ) || isForeignObjectIdLike( id ) ) ? ( id as { toString: () => string } ).toString() : id;
 }
 
 export function LOG( ...args: unknown[] )
@@ -53,7 +53,12 @@ function stringify( value: any, indentation: string = '' ): string
     {
         if( value instanceof Date ){ return 'ISODate("' + value.toISOString() + '")' }
         if( value instanceof RegExp ){ return value.toString() }
-        if( value instanceof ObjectId ){ return 'ObjectId("' + value.toHexString() + '")' }
+        if( isLibraryObjectId( value ) || isForeignObjectIdLike( value ) )
+        {
+            const hex = typeof ( value as any ).toHexString === 'function' ? ( value as any ).toHexString() : String( value );
+
+            return 'ObjectId("' + hex + '")';
+        }
 
         const properties = Object.keys( value ).map(( key ) =>
         {

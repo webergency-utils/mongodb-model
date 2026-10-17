@@ -23,6 +23,19 @@ describe( 'errors', () =>
         expect( err.message ).toContain( 'boom' );
     });
 
+    test( 'ModelError supports legacy 2-arg and 3-arg (model, message, cause?) constructor', () =>
+    {
+        const cause = new Error( 'root-cause' );
+        const err2 = new ( ModelError as any )( new SampleModel(), 'legacy-msg' );
+        const err3 = new ( ModelError as any )( new SampleModel(), 'legacy-cause', cause );
+
+        expect( err2.code ).toBe( 'MODEL_INTERNAL_ERROR' );
+        expect( err2.message ).toContain( '[MODEL_INTERNAL_ERROR] SampleModel: legacy-msg' );
+        expect( err3.code ).toBe( 'MODEL_INTERNAL_ERROR' );
+        expect( err3.message ).toContain( '[MODEL_INTERNAL_ERROR] SampleModel: legacy-cause' );
+        expect( err3.cause ).toBe( cause );
+    });
+
     test( 'ModelError with cause uses cause constructor for stack', () =>
     {
         const cause = new TypeError( 'inner' );

@@ -21,12 +21,17 @@ describe( 'helpers/utils', () =>
         expect( hasPublicMethod( obj, 'missing' )).toBe( false );
     });
 
-    test( 'map indexes by id including ObjectId', () =>
+    test( 'map indexes by id including native and foreign ObjectId', () =>
     {
-        const id = new ObjectId();
+        const id = new ObjectId( '507f1f77bcf86cd799439011' );
+        const foreignLookupId =
+        {
+            _bsontype   : 'ObjectId',
+            toString    : () => '507f1f77bcf86cd799439011'
+        };
         const entries = [{ id, name: 'a' }, { id: '2', name: 'b' }];
 
-        expect( map([ id, '2', 'missing' ], entries, e => e.id )).toEqual(
+        expect( map([ foreignLookupId as any, '2', 'missing' ], entries, e => e.id )).toEqual(
         [
             entries[0],
             entries[1],
@@ -45,10 +50,15 @@ describe( 'helpers/utils', () =>
         expect( String( spy.mock.calls[0][1] )).toContain( 'a:' );
     });
 
-    test( 'DUMP covers stringify branches', () =>
+    test( 'DUMP covers stringify branches including foreign ObjectId', () =>
     {
         const spy = vi.spyOn( console, 'log' ).mockImplementation(() => undefined );
         const id = new ObjectId( '507f1f77bcf86cd799439011' );
+        const foreignId =
+        {
+            _bsontype   : 'ObjectId',
+            toString    : () => '507f1f77bcf86cd799439012'
+        };
         const date = new Date( '2020-01-01T00:00:00.000Z' );
 
         DUMP(
@@ -62,6 +72,7 @@ describe( 'helpers/utils', () =>
             date,
             re      : /abc/i,
             id,
+            foreignId,
             nested  : { k: 2 }
         });
 
@@ -72,6 +83,7 @@ describe( 'helpers/utils', () =>
         expect( out ).toContain( 'ISODate("2020-01-01T00:00:00.000Z")' );
         expect( out ).toContain( '/abc/i' );
         expect( out ).toContain( 'ObjectId("507f1f77bcf86cd799439011")' );
+        expect( out ).toContain( 'ObjectId("507f1f77bcf86cd799439012")' );
         expect( out ).toContain( '"k": 2' );
     });
 
