@@ -1,5 +1,6 @@
 import { Document, Filter, FindOptions, MongoClientOptions, ObjectId } from 'mongodb';
 import type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
+import type { ModelCacheConfig, ModelCacheInstance, ModelCacheOptions } from '../cache.js';
 import
 {
     AbstractConverterOptions,
@@ -15,6 +16,8 @@ import
 from './internal.js';
 
 export type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
+export type { ModelCacheConfig, ModelCacheInstance, ModelCacheOptions } from '../cache.js';
+export type CacheOptions = ModelCacheConfig;
 export type OptimizerConfig = boolean | OptimizerOptions;
 
 export type ModelsOptions = MongoClientOptions &
@@ -204,6 +207,7 @@ export type ConstructorExtensions<E extends PropertyModelExtensions<any, any, an
     Omit<E, 'smartFilters' | 'computedProperties'>
     &
     {
+        cache?              : ModelCacheConfig
         smartFilters?       : FirstType<ExtractSmartFilters<E>>
         computedProperties? : FirstType<ExtractComputedProperties<E>>
         optimizer?          : OptimizerConfig
@@ -217,6 +221,7 @@ export type ModelExtensions
 >
 =
 {
+    cache?              : ModelCacheConfig
     converters          : AbstractModelConverters<DBE>
     smartFilters?       : SmartFilters
     computedProperties? : ComputedProperties
@@ -232,6 +237,7 @@ export type PropertyModelExtensions
 >
 =
 {
+    cache?              : ModelCacheConfig
     converters          : AbstractModelConverters<DBE>
     smartFilters?       : SmartFilters
     computedProperties? : ComputedProperties

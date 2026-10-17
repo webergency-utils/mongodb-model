@@ -3,6 +3,7 @@ export * from 'mongodb';
 export * from './types/external.js';
 export * from './types/definition.js';
 export * from './errors.js';
+export * from './cache.js';
 export * from './helpers/object.js';
 export * from './model.js';
 export * from './property-model.js';
