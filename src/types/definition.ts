@@ -1,6 +1,17 @@
 import { Document, FindOptions } from 'mongodb';
-import { AbstractModelConverter, AbstractModelConverters, ModelAccessConfig, MongoPropertyDocument, MongoRootDocument, OptimizerConfig } from './external.js';
-import { ComputedPropertiesParam } from './internal.js';
+import
+{
+    AbstractModelConverter,
+    AbstractModelConverters,
+    ModelAccessConfig,
+    ModelCacheConfig,
+    MongoPropertyDocument,
+    MongoRootDocument,
+    ObservabilityConfig,
+    OptimizerConfig
+}
+from './external.js';
+import { AbstractModelFromConverter, ComputedPropertiesParam } from './internal.js';
 
 export type CompileConverterContext =
 {
@@ -63,7 +74,11 @@ export type ConverterRecipe<DBE extends Document> =
 
 export type ConverterRecipeMap<DBE extends Document> =
 {
-    [name: string] : ConverterRecipe<DBE>
+    from? : { [key: string]: AbstractModelFromConverter<DBE, any> } | ConverterRecipe<DBE>
+}
+&
+{
+    [name: string] : ConverterRecipe<DBE> | { [key: string]: AbstractModelFromConverter<DBE, any> } | undefined
 }
 
 export type RootModelDefinition
@@ -74,11 +89,13 @@ export type RootModelDefinition
 >
 =
 {
+    cache?               : ModelCacheConfig
     converters?          : ConverterRecipeMap<DBE>
     smartFilters?        : SmartFilters
     computedProperties?  : ComputedProperties
     access?              : ModelAccessConfig<DBE>
     optimizer?           : OptimizerConfig
+    observability?       : ObservabilityConfig
     dtoID?               : ( id: unknown ) => string
 }
 
@@ -91,11 +108,13 @@ export type PropertyModelDefinition
 =
 {
     path                 : string
+    cache?               : ModelCacheConfig
     converters?          : ConverterRecipeMap<DBE>
     smartFilters?        : SmartFilters
     computedProperties?  : ComputedProperties
     access?              : ModelAccessConfig<DBE>
     optimizer?           : OptimizerConfig
+    observability?       : ObservabilityConfig
     dtoID?               : ( id: unknown ) => string
 }
 

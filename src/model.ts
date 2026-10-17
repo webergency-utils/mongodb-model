@@ -12,7 +12,7 @@ from 'mongodb';
 import Aggregator from '@webergency-utils/aggregator';
 import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
 import { AccessControl } from './access-control.js';
-import { ModelCache, ModelCacheConfig, buildCacheKey } from './cache.js';
+import { ModelCache, ModelCacheConfig, buildCacheKey, extractTargetIdsFromFilter } from './cache.js';
 import { ConverterManager } from './converters.js';
 import { ModelAccessDeniedError, ModelError } from './errors.js';
 import
@@ -411,13 +411,151 @@ export abstract class AbstractModel
         }
     }
 
-    /**
-     * Virtual hook — convert inbound API data to DBE and create.
-     * Subclasses must override; default throws.
-     */
-    public async createFrom( _data: unknown, _id?: DTO['id'], _options?: ModelCreateOptions ): Promise<DTO['id']>
+    public async createFrom(
+        data: unknown,
+        fromKeyOrId?: string | DTO['id'] | ModelCreateOptions,
+        idOrOptions?: DTO['id'] | ModelCreateOptions,
+        options?: ModelCreateOptions
+    ): Promise<DTO['id']>
     {
-        throw new ModelError( 'MODEL_NOT_IMPLEMENTED', this, 'createFrom() is not implemented' );
+        return this.runOperation( async() =>
+        {
+            const isCreateOpts = ( v: unknown ): v is ModelCreateOptions =>
+                typeof v === 'object'
+                && v !== null
+                && !Array.isArray( v )
+                && !isLibraryObjectId( v )
+                && !isForeignObjectIdLike( v )
+                && ( 'duplicateIgnore' in v || 'access' in v );
+
+            const fromMap = this.converters.from;
+            let fromKey: string | undefined;
+            let explicitId: DTO['id'] | undefined;
+            let resolvedOptions: ModelCreateOptions | undefined;
+
+            if( isCreateOpts( fromKeyOrId ) )
+            {
+                resolvedOptions = fromKeyOrId;
+            }
+            else if( typeof fromKeyOrId === 'string' && fromMap && fromKeyOrId in fromMap )
+            {
+                fromKey = fromKeyOrId;
+
+                if( isCreateOpts( idOrOptions ) )
+                {
+                    resolvedOptions = idOrOptions;
+                }
+                else
+                {
+                    explicitId = idOrOptions as DTO['id'] | undefined;
+                    resolvedOptions = options;
+                }
+            }
+            else if(
+                typeof fromKeyOrId === 'string'
+                && (
+                    ( idOrOptions !== undefined && !isCreateOpts( idOrOptions ))
+                    || options !== undefined
+                    || !fromMap
+                    || ( !( 'default' in fromMap ) && ( Object.keys( fromMap ).length !== 1 || !ObjectId.isValid( fromKeyOrId )))
+                )
+            )
+            {
+                fromKey = fromKeyOrId;
+
+                if( isCreateOpts( idOrOptions ) )
+                {
+                    resolvedOptions = idOrOptions;
+                }
+                else
+                {
+                    explicitId = idOrOptions as DTO['id'] | undefined;
+                    resolvedOptions = options;
+                }
+            }
+            else
+            {
+                explicitId = fromKeyOrId as DTO['id'] | undefined;
+                resolvedOptions = isCreateOpts( idOrOptions ) ? idOrOptions : options;
+            }
+
+            const start = Date.now();
+            let dbe: Omit<DBE, '_id'> & { _id?: DBE['_id'] };
+
+            try
+            {
+                dbe = await this.#converters.convertFrom( data, fromKey );
+            }
+            catch( e )
+            {
+                this.#emitError( e, 'createFrom', Date.now() - start );
+
+                throw e;
+            }
+
+            const resolvedId = explicitId ?? ( dbe._id !== undefined ? this.dtoID( dbe._id ) as DTO['id'] : undefined );
+            const createdId = await this.create( dbe, resolvedId, resolvedOptions );
+
+            this.#emitMutation( 'createFrom', Date.now() - start, { insertedCount: 1, ids: [ createdId ] });
+
+            return createdId;
+        });
+    }
+
+    public async createMany(
+        items: Array<Omit<DBE, '_id'> & { _id?: DBE['_id'] }>,
+        idsOrOptions?: DTO['id'][] | ModelCreateOptions,
+        options?: ModelCreateOptions
+    ): Promise<DTO['id'][]>
+    {
+        return this.runOperation( async() =>
+        {
+            const explicitIds = Array.isArray( idsOrOptions ) ? idsOrOptions : undefined;
+            const resolvedOptions = Array.isArray( idsOrOptions ) ? options : idsOrOptions;
+
+            const access = await this.#access.resolveOrDeny({ operation: 'create', method: 'createMany', access: resolvedOptions?.access });
+
+            if( access.denied )
+            {
+                throw new ModelAccessDeniedError( this );
+            }
+
+            if( items.length === 0 )
+            {
+                this.#emitMutation( 'createMany', 0, { insertedCount: 0, ids: [] });
+
+                return [];
+            }
+
+            const ids: DTO['id'][] = [];
+            const docs: OptionalUnlessRequiredId<DBE>[] = [];
+
+            for( let i = 0; i < items.length; i++ )
+            {
+                const item = items[i];
+                const rawId = explicitIds?.[i] ?? ( item._id !== undefined ? this.dtoID( item._id ) : await this.id());
+                const dtoId = this.dtoID( rawId ) as DTO['id'];
+
+                ids.push( dtoId );
+                docs.push( resolveBSONObject({ ...item, _id: this.dbeID( dtoId ) }) as OptionalUnlessRequiredId<DBE> );
+            }
+
+            const start = Date.now();
+
+            try
+            {
+                await this.collection.insertMany( docs );
+                this.#emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
+
+                return ids;
+            }
+            catch( e: any )
+            {
+                this.#emitError( e, 'createMany', Date.now() - start );
+
+                throw e;
+            }
+        });
     }
 
     public async update( id: DTO['id'] | DBE['_id'], update: Partial<DBE> | UpdateFilter<DBE>, options?: ModelUpdateOptions ): Promise<ModelUpdateResponse<DBE>>
@@ -490,8 +628,41 @@ export abstract class AbstractModel
         }
     }
 
+    #normalizeFindMatch(
+        match: Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        optionsAccess?: string
+    ): { rawFilter: Filter<DBE>, smartFilter?: any, access?: string }
+    {
+        if(
+            match
+            && typeof match === 'object'
+            && !Array.isArray( match )
+            && !isLibraryObjectId( match )
+            && !isForeignObjectIdLike( match )
+            && (
+                'filter' in match
+                || 'smartFilter' in match
+                || ( 'access' in match && Object.keys( match ).every( k => k === 'filter' || k === 'smartFilter' || k === 'access' ))
+            )
+        )
+        {
+            const opts = match as ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>;
+
+            return {
+                rawFilter   : ( opts.filter ?? {} ) as Filter<DBE>,
+                smartFilter : opts.smartFilter,
+                access      : optionsAccess ?? opts.access
+            };
+        }
+
+        return {
+            rawFilter   : ( match ?? {} ) as Filter<DBE>,
+            access      : optionsAccess
+        };
+    }
+
     public async updateMany(
-        ids: DTO['id'][] | DBE['_id'][],
+        idsOrFilter: DTO['id'][] | DBE['_id'][] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
         update: Partial<DBE> | UpdateFilter<DBE>,
         options?: ModelUpdateOptions
     ): Promise<ModelUpdateResponse<DBE>>
@@ -500,25 +671,73 @@ export abstract class AbstractModel
 
         try
         {
-            const match = await this.#access.match(
-                resolveBSONObject({ _id: { $in: ids.map( id => this.dbeID( id )) } }) as Filter<DBE>,
-                { operation: 'update', method: 'updateMany', access: options?.access }
+            if( Array.isArray( idsOrFilter ) )
+            {
+                const match = await this.#access.match(
+                    resolveBSONObject({ _id: { $in: idsOrFilter.map( id => this.dbeID( id )) } }) as Filter<DBE>,
+                    { operation: 'update', method: 'updateMany', access: options?.access }
+                );
+
+                if( !match )
+                {
+                    return { matchedCount: 0, modifiedCount: 0 };
+                }
+
+                if( idsOrFilter.length === 0 )
+                {
+                    this.#emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: [] });
+
+                    return { matchedCount: 0, modifiedCount: 0 };
+                }
+
+                const start = Date.now();
+                const res = await this.collection.updateMany( match, toUpdateOperations( update ));
+
+                this.#invalidateCache( idsOrFilter );
+                this.#emitMutation( 'updateMany', Date.now() - start,
+                {
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount,
+                    ids             : idsOrFilter
+                });
+
+                return {
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount
+                };
+            }
+
+            const { rawFilter, smartFilter, access } = this.#normalizeFindMatch( idsOrFilter, options?.access );
+            const targetIds = extractTargetIdsFromFilter( idsOrFilter, '_id', id => String( this.dtoID( id )));
+            const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
+            const combinedFilter = resolvedSmart?.filter
+                ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
+                : rawFilter;
+
+            const finalMatch = await this.#access.match(
+                resolveBSONObject( combinedFilter ) as Filter<DBE>,
+                { operation: 'update', method: 'updateMany', access }
             );
 
-            if( !match )
+            if( !finalMatch )
             {
                 return { matchedCount: 0, modifiedCount: 0 };
             }
 
             const start = Date.now();
-            const res = await this.collection.updateMany( match, toUpdateOperations( update ));
+            const res = await this.collection.updateMany( finalMatch, toUpdateOperations( update ));
 
-            this.#invalidateCache( ids );
+            if( targetIds && targetIds.length > 0 )
+            {
+                this.#invalidateCache( targetIds );
+            }
+
             this.#emitMutation( 'updateMany', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
-                ids
+                ids             : targetIds ?? undefined,
+                filter          : finalMatch
             });
 
             return {
@@ -532,17 +751,90 @@ export abstract class AbstractModel
         }
     }
 
-    /**
-     * Virtual hook — update a single document by find options / match.
-     * Subclasses must override; default throws.
-     */
     public async updateOne(
-        _match: ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
-        _update: Partial<DBE> | UpdateFilter<DBE>,
-        _options?: ModelUpdateOptions
+        match: Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        update: Partial<DBE> | UpdateFilter<DBE>,
+        options?: ModelUpdateOptions
     ): Promise<ModelUpdateResponse<DBE>>
     {
-        throw new ModelError( 'MODEL_NOT_IMPLEMENTED', this, 'updateOne() is not implemented' );
+        return this.runOperation( async() =>
+        {
+            const { rawFilter, smartFilter, access } = this.#normalizeFindMatch( match, options?.access );
+            const targetIds = extractTargetIdsFromFilter( match, '_id', id => String( this.dtoID( id )));
+            const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
+            const combinedFilter = resolvedSmart?.filter
+                ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
+                : rawFilter;
+
+            const finalMatch = await this.#access.match(
+                resolveBSONObject( combinedFilter ) as Filter<DBE>,
+                { operation: 'update', method: 'updateOne', access }
+            );
+
+            if( !finalMatch )
+            {
+                return { matchedCount: 0, modifiedCount: 0 };
+            }
+
+            const start = Date.now();
+
+            if( options?.documentBefore || options?.documentAfter )
+            {
+                const result = await this.collection.findOneAndUpdate(
+                    finalMatch,
+                    toUpdateOperations( update ),
+                    {
+                        returnDocument  : options.documentAfter ? 'after' : 'before',
+                        collation       : { locale: 'en' }
+                    }
+                );
+
+                const document = ( result as DBE | null ) || undefined;
+                const matchedCount = document ? 1 : 0;
+                const modifiedCount = document ? 1 : 0;
+                const idsToEvict = targetIds ?? ( document?._id !== undefined ? [ String( this.dtoID( document._id )) ] : null );
+
+                if( idsToEvict && idsToEvict.length > 0 )
+                {
+                    this.#invalidateCache( idsToEvict );
+                }
+
+                this.#emitMutation( 'updateOne', Date.now() - start,
+                {
+                    matchedCount,
+                    modifiedCount,
+                    ids     : idsToEvict ?? undefined,
+                    filter  : finalMatch
+                });
+
+                return {
+                    matchedCount,
+                    modifiedCount,
+                    documentBefore  : options.documentBefore && !options.documentAfter ? document : undefined,
+                    documentAfter   : options.documentAfter ? document : undefined
+                };
+            }
+
+            const res = await this.collection.updateOne( finalMatch, toUpdateOperations( update ));
+
+            if( targetIds && targetIds.length > 0 )
+            {
+                this.#invalidateCache( targetIds );
+            }
+
+            this.#emitMutation( 'updateOne', Date.now() - start,
+            {
+                matchedCount    : res.matchedCount,
+                modifiedCount   : res.modifiedCount,
+                ids             : targetIds ?? undefined,
+                filter          : finalMatch
+            });
+
+            return {
+                matchedCount    : res.matchedCount,
+                modifiedCount   : res.modifiedCount
+            };
+        });
     }
 
     public async get<K extends keyof Extensions['converters'] = 'dto'>(
@@ -1227,6 +1519,75 @@ export abstract class AbstractModel
             });
 
             return res.deletedCount === 1;
+        });
+    }
+
+    public async deleteMany(
+        idsOrFilter: DTO['id'][] | DBE['_id'][] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        options?: ModelDeleteOptions
+    ): Promise<number>
+    {
+        return this.runOperation( async() =>
+        {
+            if( Array.isArray( idsOrFilter ) )
+            {
+                const match = await this.#access.match(
+                    resolveBSONObject({ _id: { $in: idsOrFilter.map( id => this.dbeID( id )) } }) as Filter<DBE>,
+                    { operation: 'delete', method: 'deleteMany', access: options?.access }
+                );
+
+                if( !match ){ return 0 }
+
+                if( idsOrFilter.length === 0 )
+                {
+                    this.#emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: [] });
+
+                    return 0;
+                }
+
+                const start = Date.now();
+                const res = await this.collection.deleteMany( match );
+
+                this.#invalidateCache( idsOrFilter );
+                this.#emitMutation( 'deleteMany', Date.now() - start,
+                {
+                    deletedCount    : res.deletedCount,
+                    ids             : idsOrFilter
+                });
+
+                return res.deletedCount;
+            }
+
+            const { rawFilter, smartFilter, access } = this.#normalizeFindMatch( idsOrFilter, options?.access );
+            const targetIds = extractTargetIdsFromFilter( idsOrFilter, '_id', id => String( this.dtoID( id )));
+            const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
+            const combinedFilter = resolvedSmart?.filter
+                ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
+                : rawFilter;
+
+            const finalMatch = await this.#access.match(
+                resolveBSONObject( combinedFilter ) as Filter<DBE>,
+                { operation: 'delete', method: 'deleteMany', access }
+            );
+
+            if( !finalMatch ){ return 0 }
+
+            const start = Date.now();
+            const res = await this.collection.deleteMany( finalMatch );
+
+            if( targetIds && targetIds.length > 0 )
+            {
+                this.#invalidateCache( targetIds );
+            }
+
+            this.#emitMutation( 'deleteMany', Date.now() - start,
+            {
+                deletedCount    : res.deletedCount,
+                ids             : targetIds ?? undefined,
+                filter          : finalMatch
+            });
+
+            return res.deletedCount;
         });
     }
 }

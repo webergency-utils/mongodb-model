@@ -92,12 +92,13 @@ describe( 'AbstractModel query gaps', () =>
         expect( await model.delete( '1' ) ).toBe( true );
     });
 
-    test( 'createFrom and updateOne throw not implemented', async() =>
+    test( 'createFrom without converter throws ModelError and updateOne updates matching document', async() =>
     {
-        const model = makeModel({ collectionName: 'docs', aggregate: vi.fn() });
+        const updateOne = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const model = makeModel({ collectionName: 'docs', updateOne, aggregate: vi.fn() });
 
         await expect( model.createFrom({}) ).rejects.toBeInstanceOf( ModelError );
-        await expect( model.updateOne({}, {}) ).rejects.toBeInstanceOf( ModelError );
+        await expect( model.updateOne({}, { status: 'closed' }) ).resolves.toEqual({ matchedCount: 1, modifiedCount: 1 });
     });
 
     test( 'stream prev path materializes and reverses', async() =>

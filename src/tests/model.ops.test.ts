@@ -46,15 +46,17 @@ function makeModel( collection: any, access?: any )
 
 describe( 'AbstractModel remaining ops', () =>
 {
-    test( 'createFrom and updateOne throw MODEL_NOT_IMPLEMENTED', async() =>
+    test( 'createFrom without from converter throws MODEL_CONFIG_ERROR and updateOne updates single doc', async() =>
     {
-        const model = makeModel({ collectionName: 'users', aggregate: vi.fn() });
+        const updateOne = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const model = makeModel({ collectionName: 'users', updateOne, aggregate: vi.fn() });
 
-        await expect( model.createFrom({})).rejects.toMatchObject({ code: 'MODEL_NOT_IMPLEMENTED' });
+        await expect( model.createFrom({})).rejects.toMatchObject({ code: 'MODEL_CONFIG_ERROR' });
         await expect( model.createFrom({})).rejects.toBeInstanceOf( ModelError );
-        await expect( model.updateOne({ filter: {} }, { name: 'x' })).rejects.toMatchObject(
+        await expect( model.updateOne({ filter: {} }, { name: 'x' })).resolves.toEqual(
         {
-            code: 'MODEL_NOT_IMPLEMENTED'
+            matchedCount    : 1,
+            modifiedCount   : 1
         });
     });
 

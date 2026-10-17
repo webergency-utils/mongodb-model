@@ -109,13 +109,13 @@ describe( 'example models root CRUD (real MongoDB)', () =>
         });
     });
 
-    test( 'createFrom throws MODEL_NOT_IMPLEMENTED', async() =>
+    test( 'createFrom without configured from converter throws MODEL_CONFIG_ERROR', async() =>
     {
         await withAuth( models, { role: 'admin' }, async() =>
         {
             await expect( models.jobs.createFrom({ title: 'x' }) ).rejects.toMatchObject(
             {
-                code: 'MODEL_NOT_IMPLEMENTED'
+                code: 'MODEL_CONFIG_ERROR'
             });
 
             await expect( models.organizations.createFrom({ name: 'x' }) ).rejects.toBeInstanceOf( ModelError );
@@ -220,13 +220,28 @@ describe( 'example models root CRUD (real MongoDB)', () =>
         });
     });
 
-    test( 'updateOne throws MODEL_NOT_IMPLEMENTED', async() =>
+    test( 'updateOne updates single matching document', async() =>
     {
         await withAuth( models, { role: 'admin' }, async() =>
         {
-            await expect(
-                models.jobs.updateOne({ filter: { title: 'x' } }, { status: 'closed' } as any )
-            ).rejects.toMatchObject({ code: 'MODEL_NOT_IMPLEMENTED' });
+            const now = Date.now();
+            const id = await models.jobs.create(
+            {
+                title           : 'CRUD UpdateOne Target',
+                status          : 'draft',
+                organizationID  : seed.acmeId,
+                tags            : [ 'update-one' ],
+                applications    : [],
+                events          : { created: now, updated: now }
+            } as any );
+
+            const res = await models.jobs.updateOne({ filter: { _id: new ObjectId( id ) } }, { status: 'closed' } as any );
+
+            expect( res ).toEqual({ matchedCount: 1, modifiedCount: 1 });
+
+            const job = await models.jobs.get( id, { as: 'basicDTO' });
+
+            expect( job?.status ).toBe( 'closed' );
         });
     });
 

@@ -76,12 +76,13 @@ export type ModelEventName = keyof ModelEventsMap;
 export type ModelEventHandler<E extends ModelEventName> = ( payload: ModelEventsMap[E] ) => void;
 
 export type ObservabilityLogger =
-{
-    debug?  : ( message: string, meta?: Record<string, unknown> ) => void
-    info?   : ( message: string, meta?: Record<string, unknown> ) => void
-    warn?   : ( message: string, meta?: Record<string, unknown> ) => void
-    error?  : ( message: string, meta?: Record<string, unknown> ) => void
-};
+    | {
+        debug?  : ( message: string, meta?: Record<string, unknown> ) => void
+        info?   : ( message: string, meta?: Record<string, unknown> ) => void
+        warn?   : ( message: string, meta?: Record<string, unknown> ) => void
+        error?  : ( message: string, meta?: Record<string, unknown> ) => void
+    }
+    | (( event: ModelEventsMap[ModelEventName] & { type: ModelEventName }) => void );
 
 export type ObservabilityOptions =
 {
@@ -202,33 +203,41 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
         return;
     }
 
+    const fnLogger = typeof options.logger === 'function' ? options.logger : undefined;
+    const objLogger = typeof options.logger === 'object' && options.logger !== null ? options.logger : undefined;
+
+    if( fnLogger )
+    {
+        safeCall( fnLogger, { ...enriched, type: event } as ModelEventsMap[ModelEventName] & { type: ModelEventName } );
+    }
+
     if( event === 'query' )
     {
         const queryEvent = enriched as ModelQueryEvent;
 
         safeCall( options.onQuery, queryEvent );
-        options.logger?.info?.( `MongoDB query ${queryEvent.collection}.${queryEvent.operation} (${queryEvent.duration}ms)`, queryEvent as unknown as Record<string, unknown> );
+        objLogger?.info?.( `MongoDB query ${queryEvent.collection}.${queryEvent.operation} (${queryEvent.duration}ms)`, queryEvent as unknown as Record<string, unknown> );
     }
     else if( event === 'mutation' )
     {
         const mutationEvent = enriched as ModelMutationEvent;
 
         safeCall( options.onMutation, mutationEvent );
-        options.logger?.info?.( `MongoDB mutation ${mutationEvent.collection}.${mutationEvent.operation} (${mutationEvent.duration}ms)`, mutationEvent as unknown as Record<string, unknown> );
+        objLogger?.info?.( `MongoDB mutation ${mutationEvent.collection}.${mutationEvent.operation} (${mutationEvent.duration}ms)`, mutationEvent as unknown as Record<string, unknown> );
     }
     else if( event === 'cache' )
     {
         const cacheEvent = enriched as ModelCacheEvent;
 
         safeCall( options.onCache, cacheEvent );
-        options.logger?.debug?.( `MongoDB cache ${cacheEvent.collection}.${cacheEvent.operation}`, cacheEvent as unknown as Record<string, unknown> );
+        objLogger?.debug?.( `MongoDB cache ${cacheEvent.collection}.${cacheEvent.operation}`, cacheEvent as unknown as Record<string, unknown> );
     }
     else if( event === 'error' )
     {
         const errorEvent = enriched as ModelErrorEvent;
 
         safeCall( options.onError, errorEvent );
-        options.logger?.error?.( `MongoDB error in ${errorEvent.collection}${errorEvent.operation ? '.' + errorEvent.operation : ''}: ${errorEvent.error.message}`, errorEvent as unknown as Record<string, unknown> );
+        objLogger?.error?.( `MongoDB error in ${errorEvent.collection}${errorEvent.operation ? '.' + errorEvent.operation : ''}: ${errorEvent.error.message}`, errorEvent as unknown as Record<string, unknown> );
     }
 
     if( ( event === 'query' || event === 'mutation' ) && options.slowQueryMs !== undefined )
@@ -246,7 +255,13 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
             localEmitter.emit( 'slowQuery', slowPayload );
             models[EMIT_OBSERVABILITY_EVENT]?.( 'slowQuery', slowPayload );
             safeCall( options.onSlowQuery, slowPayload );
-            options.logger?.warn?.( `Slow MongoDB ${event} ${timed.collection}.${timed.operation} (${timed.duration}ms >= ${options.slowQueryMs}ms)`, slowPayload as unknown as Record<string, unknown> );
+
+            if( fnLogger )
+            {
+                safeCall( fnLogger, { ...slowPayload, type: 'slowQuery' } as ModelEventsMap[ModelEventName] & { type: ModelEventName } );
+            }
+
+            objLogger?.warn?.( `Slow MongoDB ${event} ${timed.collection}.${timed.operation} (${timed.duration}ms >= ${options.slowQueryMs}ms)`, slowPayload as unknown as Record<string, unknown> );
         }
     }
 }

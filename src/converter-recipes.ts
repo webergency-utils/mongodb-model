@@ -362,17 +362,23 @@ export function compileConverters<DBE extends Document>(
     {
         const recipe = recipes[name]!;
 
+        if( name === 'from' && typeof recipe === 'object' && recipe !== null && !isRawRecipe( recipe as ConverterRecipe<DBE> ) && !isCustomRecipe( recipe as ConverterRecipe<DBE> ) && !isExtendsRecipe( recipe as ConverterRecipe<DBE> ) && !isRenameRecipe( recipe as ConverterRecipe<DBE> ) && !isPickRecipe( recipe as ConverterRecipe<DBE> ) && !isOmitRecipe( recipe as ConverterRecipe<DBE> ))
+        {
+            ( compiled as unknown as AbstractModelConverters<DBE> ).from = recipe as AbstractModelConverters<DBE>['from'];
+            continue;
+        }
+
         if( recipe === 'auto' && ( name === 'dto' || name === 'dbe' ))
         {
             compiled[name] = defaults[name as 'dto' | 'dbe'];
             continue;
         }
 
-        let body = compileRecipeBody( name, recipe, compiled, ctx );
+        let body = compileRecipeBody( name, recipe as ConverterRecipe<DBE>, compiled, ctx );
 
-        if( isObjectRecipe( recipe ))
+        if( isObjectRecipe( recipe as ConverterRecipe<DBE> ))
         {
-            body = attachMetadata( body, recipe );
+            body = attachMetadata( body, recipe as ConverterRecipeMetadata );
         }
 
         compiled[name] = body;

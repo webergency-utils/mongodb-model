@@ -12,11 +12,13 @@ function buildExtensions<DBE extends MongoRootDocument>(
 ): ModelExtensions<DBE, any, any>
 {
     return {
+        cache               : config.cache,
         converters          : compileConverters( config.converters, { dtoID }),
         smartFilters        : config.smartFilters,
         computedProperties  : config.computedProperties,
         access              : config.access,
-        optimizer           : config.optimizer
+        optimizer           : config.optimizer,
+        observability       : config.observability
     };
 }
 
