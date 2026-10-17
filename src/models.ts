@@ -1,7 +1,26 @@
 import { MongoClient, WithTransactionCallback } from 'mongodb';
 import { ModelError } from './errors.js';
+import
+{
+    ModelEventEmitter,
+    ModelEventHandler,
+    ModelEventName,
+    ModelEventsMap,
+    ObservabilityConfig,
+    ObservabilityOptions,
+    resolveObservabilityOptions
+}
+from './events.js';
 import { flowExecute, flowGet, flowSet, flowStart } from './flow.js';
-import { GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
+import
+{
+    EMIT_OBSERVABILITY_EVENT,
+    GET_OBSERVABILITY_OPTIONS,
+    GET_OPTIMIZER_OPTIONS,
+    GET_PARENT,
+    REGISTER_MODEL
+}
+from './symbols.js';
 import type { AbstractModel } from './model.js';
 import type { AbstractPropertyModel } from './property-model.js';
 import type { ModelsOptions, OptimizerConfig, OptimizerOptions } from './types/external.js';
@@ -45,6 +64,8 @@ export class AbstractModels
     #shutdownPromise?: Promise<void>;
     #models = new Map<string, ModelInstance>();
     #optimizer: OptimizerConfig = true;
+    #observability?: ObservabilityConfig;
+    #events = new ModelEventEmitter();
 
     public readonly scope = Object.freeze(
     {
@@ -57,10 +78,11 @@ export class AbstractModels
 
     protected constructor( connectionString: string, options: ModelsOptions = {})
     {
-        const { optimizer = true, ...mongoOptions } = options;
+        const { optimizer = true, observability, ...mongoOptions } = options;
 
         this.#connectionString = connectionString;
         this.#optimizer = optimizer;
+        this.#observability = observability;
 
         if( Clients.has( connectionString ) )
         {
@@ -79,6 +101,16 @@ export class AbstractModels
 
             Clients.set( connectionString, this.client );
         }
+    }
+
+    public on<E extends ModelEventName>( event: E, handler: ModelEventHandler<E> ): () => void
+    {
+        return this.#events.on( event, handler );
+    }
+
+    public off<E extends ModelEventName>( event: E, handler: ModelEventHandler<E> ): void
+    {
+        this.#events.off( event, handler );
     }
 
     public assertOpen(): void
@@ -195,6 +227,16 @@ export class AbstractModels
         if( this.#optimizer === true ){ return {} }
 
         return this.#optimizer;
+    }
+
+    [GET_OBSERVABILITY_OPTIONS](): ObservabilityOptions | undefined
+    {
+        return resolveObservabilityOptions( this.#observability );
+    }
+
+    [EMIT_OBSERVABILITY_EVENT]<E extends ModelEventName>( event: E, payload: ModelEventsMap[E] ): void
+    {
+        this.#events.emit( event, payload );
     }
 
     public async transaction<T = void>( fn: WithTransactionCallback<T> ): Promise<T>

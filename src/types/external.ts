@@ -1,6 +1,7 @@
 import { Document, Filter, FindOptions, MongoClientOptions, ObjectId } from 'mongodb';
 import type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
 import type { ModelCacheConfig, ModelCacheInstance, ModelCacheOptions } from '../cache.js';
+import type { ObservabilityConfig, ObservabilityLogger, ObservabilityOptions } from '../events.js';
 import
 {
     AbstractConverterOptions,
@@ -17,12 +18,14 @@ from './internal.js';
 
 export type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
 export type { ModelCacheConfig, ModelCacheInstance, ModelCacheOptions } from '../cache.js';
+export type { ObservabilityConfig, ObservabilityLogger, ObservabilityOptions } from '../events.js';
 export type CacheOptions = ModelCacheConfig;
 export type OptimizerConfig = boolean | OptimizerOptions;
 
 export type ModelsOptions = MongoClientOptions &
 {
-    optimizer? : OptimizerConfig
+    optimizer?      : OptimizerConfig
+    observability?  : ObservabilityConfig
 };
 
 export type ModelCreateOptions = { duplicateIgnore?: boolean, access?: string };
@@ -211,6 +214,7 @@ export type ConstructorExtensions<E extends PropertyModelExtensions<any, any, an
         smartFilters?       : FirstType<ExtractSmartFilters<E>>
         computedProperties? : FirstType<ExtractComputedProperties<E>>
         optimizer?          : OptimizerConfig
+        observability?      : ObservabilityConfig
     }
 
 export type ModelExtensions
@@ -227,6 +231,7 @@ export type ModelExtensions
     computedProperties? : ComputedProperties
     access?             : ModelAccessConfig<DBE>
     optimizer?          : OptimizerConfig
+    observability?      : ObservabilityConfig
 }
 
 export type PropertyModelExtensions
@@ -243,6 +248,7 @@ export type PropertyModelExtensions
     computedProperties? : ComputedProperties
     access?             : ModelAccessConfig<DBE>
     optimizer?          : OptimizerConfig
+    observability?      : ObservabilityConfig
 }
 
 export type MongoBSONTypes<T> = T extends ObjectId

@@ -9,7 +9,7 @@ export * from './model.js';
 export * from './property-model.js';
 export * from './models.js';
 export * from './events.js';
-export { GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
+export { EMIT_OBSERVABILITY_EVENT, GET_OBSERVABILITY_OPTIONS, GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
 export { PipelineBuilder } from './pipeline-builder.js';
 export { AccessControl } from './access-control.js';
 export { ConverterManager } from './converters.js';

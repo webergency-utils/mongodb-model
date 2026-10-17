@@ -15,7 +15,22 @@ import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
 import { AccessControl } from './access-control.js';
 import { ConverterManager } from './converters.js';
 import { ModelAccessDeniedError, ModelError } from './errors.js';
-import { ModelEventEmitter, ModelEventHandler, ModelEventName } from './events.js';
+import
+{
+    ModelCacheEvent,
+    ModelEventEmitter,
+    ModelEventHandler,
+    ModelEventName,
+    ModelMutationEvent,
+    ModelMutationOperation,
+    ModelQueryEvent,
+    ModelQueryOperation,
+    ObservabilityConfig,
+    ObservabilityOptions,
+    dispatchObservabilityEvent,
+    resolveObservabilityOptions
+}
+from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
@@ -48,7 +63,7 @@ import { AbstractModels } from './models.js';
 import { convertDocuments } from './operations.js';
 import { PipelineBuilder } from './pipeline-builder.js';
 import { ComputedPropertyResolver, SmartFilterResolver } from './resolvers.js';
-import { GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
+import { GET_OBSERVABILITY_OPTIONS, GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
 import
 {
     AbstractPropertyModelComputedProperties,
@@ -101,6 +116,7 @@ export abstract class AbstractPropertyModel
     #models: AbstractModels;
     #events = new ModelEventEmitter();
     #optimizer?: OptimizerConfig;
+    #observability?: ObservabilityConfig;
 
     public converters: Extensions['converters'];
     public smartFilters?: FirstType<ExtractSmartFilters<Extensions>>;
@@ -109,6 +125,7 @@ export abstract class AbstractPropertyModel
     {
         this.#models = models;
         this.#optimizer = params.optimizer;
+        this.#observability = params.observability;
         this.#paths = [ ...path.matchAll( /[^\[\]]+(\[\])?/g ) ].map( m => ({ path: m[0].replace( /^\./, '' ).replace( /\[\]$/, '' ), array: m[0].endsWith( '[]' ) }));
         this.#prefix = this.#paths.map( p => p.path ).join( '.' );
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
@@ -164,7 +181,11 @@ export abstract class AbstractPropertyModel
                 LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
                 LOG_FILE( `TIME: ${duration} ms` );
                 LOG_FILE( pipeline, true );
-                this.#emitQuery( 'get', pipeline, duration );
+                this.#emitQuery( 'get', pipeline, duration,
+                {
+                    resultCount : documents.length,
+                    conversion  : String( conversion )
+                });
 
                 return map(
                     ids.map( id => this.dtoID( id )),
@@ -204,6 +225,16 @@ export abstract class AbstractPropertyModel
         return this.#optimizer;
     }
 
+    [GET_OBSERVABILITY_OPTIONS](): ObservabilityOptions | undefined
+    {
+        const parent = this.#models[GET_PARENT]( this.collection.collectionName, this.#prefix );
+        const parentOptions = parent
+            ? parent[GET_OBSERVABILITY_OPTIONS]()
+            : this.#models[GET_OBSERVABILITY_OPTIONS]();
+
+        return resolveObservabilityOptions( this.#observability, parentOptions );
+    }
+
     #optimizePipeline( pipeline: Document[] ): Document[]
     {
         const options = this[GET_OPTIMIZER_OPTIONS]();
@@ -221,25 +252,84 @@ export abstract class AbstractPropertyModel
         this.#events.off( event, handler );
     }
 
-    #emitQuery( operation: 'get' | 'list' | 'stream' | 'aggregate' | 'count' | 'find', pipeline: Document[], duration: number )
+    #emitQuery(
+        operation: ModelQueryOperation,
+        pipeline: Document[],
+        duration: number,
+        extra?: Partial<Omit<ModelQueryEvent, 'collection' | 'operation' | 'pipeline' | 'duration'>>
+    )
     {
-        this.#events.emit( 'query',
-        {
-            collection  : `${this.collection.collectionName}.${this.#prefix}`,
-            pipeline,
-            duration,
-            operation
-        });
+        dispatchObservabilityEvent(
+            'query',
+            {
+                collection  : `${this.collection.collectionName}.${this.#prefix}`,
+                model       : this.constructor.name,
+                pipeline,
+                duration,
+                operation,
+                ...extra
+            },
+            this.#events,
+            this.#models,
+            this[GET_OBSERVABILITY_OPTIONS]()
+        );
     }
 
-    #emitError( error: unknown, operation?: string )
+    #emitMutation(
+        operation: ModelMutationOperation,
+        duration: number,
+        extra?: Partial<Omit<ModelMutationEvent, 'collection' | 'operation' | 'duration'>>
+    )
     {
-        this.#events.emit( 'error',
-        {
-            collection  : `${this.collection.collectionName}.${this.#prefix}`,
-            error       : error instanceof Error ? error : new Error( String( error )),
-            operation
-        });
+        dispatchObservabilityEvent(
+            'mutation',
+            {
+                collection  : `${this.collection.collectionName}.${this.#prefix}`,
+                model       : this.constructor.name,
+                operation,
+                duration,
+                ...extra
+            },
+            this.#events,
+            this.#models,
+            this[GET_OBSERVABILITY_OPTIONS]()
+        );
+    }
+
+    #emitCache(
+        operation: ModelCacheEvent['operation'],
+        extra?: Partial<Omit<ModelCacheEvent, 'collection' | 'operation'>>
+    )
+    {
+        dispatchObservabilityEvent(
+            'cache',
+            {
+                collection  : `${this.collection.collectionName}.${this.#prefix}`,
+                model       : this.constructor.name,
+                operation,
+                ...extra
+            },
+            this.#events,
+            this.#models,
+            this[GET_OBSERVABILITY_OPTIONS]()
+        );
+    }
+
+    #emitError( error: unknown, operation?: string, duration?: number )
+    {
+        dispatchObservabilityEvent(
+            'error',
+            {
+                collection  : `${this.collection.collectionName}.${this.#prefix}`,
+                model       : this.constructor.name,
+                error       : error instanceof Error ? error : new Error( String( error )),
+                operation,
+                duration
+            },
+            this.#events,
+            this.#models,
+            this[GET_OBSERVABILITY_OPTIONS]()
+        );
     }
 
     protected id(): DTO['id'] | Promise<DTO['id']>
@@ -408,6 +498,7 @@ export abstract class AbstractPropertyModel
 
         try
         {
+        void this.#emitCache;
         const access = await this.#access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
 
         if( access.denied )
@@ -426,12 +517,15 @@ export abstract class AbstractPropertyModel
 
         const { parentIDPath, updatePath, arrayFilters } = propertyModelUpdateParams( this.#paths, parentModel.dbeID( parentID ));
         const operation = this.#paths[this.#paths.length - 1].array ? '$push' : '$set';
+        const start = Date.now();
 
         await this.collection.updateOne(
             resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
             resolveBSONObject({ [operation]: { [updatePath]: { id: this.dbeID( _id ), ...dbe } } }),
             resolveBSONObject({ arrayFilters })
         );
+
+        this.#emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
 
         return _id;
         }
@@ -480,12 +574,21 @@ export abstract class AbstractPropertyModel
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
         const documentBefore = options?.documentBefore ? ( await this.get( id, { as: 'dbe' as any }) as DBE ) || undefined : undefined;
+        const start = Date.now();
         const res = await this.collection.updateOne(
             resolveBSONObject( match ) as Filter<RootDBE>,
             toUpdateOperations( operations ),
             resolveBSONObject( updateOptions )
         );
+        const duration = Date.now() - start;
         const documentAfter = options?.documentAfter ? ( await this.get( id, { as: 'dbe' as any }) as DBE ) || undefined : undefined;
+
+        this.#emitMutation( 'update', duration,
+        {
+            matchedCount    : res.matchedCount,
+            modifiedCount   : res.modifiedCount,
+            ids             : [ id ]
+        });
 
         flowGet( 'log' ) && LOG({ res });
 
@@ -535,11 +638,19 @@ export abstract class AbstractPropertyModel
 
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
+        const start = Date.now();
         const res = await this.collection.updateMany(
             resolveBSONObject( match ) as Filter<RootDBE>,
             toUpdateOperations( operations ),
             resolveBSONObject( updateOptions )
         );
+
+        this.#emitMutation( 'updateMany', Date.now() - start,
+        {
+            matchedCount    : res.matchedCount,
+            modifiedCount   : res.modifiedCount,
+            ids
+        });
 
         flowGet( 'log' ) && LOG({ res });
 
@@ -631,18 +742,28 @@ export abstract class AbstractPropertyModel
 
             pipeline = this.#optimizePipeline( pipeline );
 
-            flowGet( 'log' ) && ( console.log( this.constructor.name + '::find', options.filter ), DUMP( pipeline ));
+            flowGet( 'log' ) && DUMP( pipeline );
 
             const start = Date.now();
-            const dbe = ( await this.collection.aggregate( pipeline ).toArray())[0];
+            const dbe = ( await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray())[0];
+            const duration = Date.now() - start;
 
             LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-            LOG_FILE( `TIME: ${Date.now() - start} ms` );
+            LOG_FILE( `TIME: ${duration} ms` );
             LOG_FILE( pipeline, true );
 
             benchmark?.step( 'QUERY' );
 
+            const convStart = Date.now();
             const data = dbe ? await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> : null;
+            const converterDuration = Date.now() - convStart;
+
+            this.#emitQuery( 'find', pipeline, duration,
+            {
+                converterDuration,
+                resultCount : data ? 1 : 0,
+                conversion  : String( conversion )
+            });
 
             benchmark?.step( 'CONVERTER' );
 
@@ -699,16 +820,16 @@ export abstract class AbstractPropertyModel
         countPipeline && ( countPipeline = this.#optimizePipeline( countPipeline ));
 
         const start = Date.now();
+        let queryDuration = 0;
         const [ entries, total ] = await Promise.all(
         [
             this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
             {
-                const duration = Date.now() - start;
+                queryDuration = Date.now() - start;
 
                 LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-                LOG_FILE( `TIME: ${duration} ms` );
+                LOG_FILE( `TIME: ${queryDuration} ms` );
                 LOG_FILE( pipeline, true );
-                this.#emitQuery( 'list', pipeline, duration );
 
                 return r;
             }),
@@ -720,7 +841,7 @@ export abstract class AbstractPropertyModel
                     LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
                     LOG_FILE( `TIME: ${duration} ms` );
                     LOG_FILE( countPipeline, true );
-                    this.#emitQuery( 'count', countPipeline!, duration );
+                    this.#emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
 
                     return r[0]?.count ?? 0;
                 })
@@ -730,10 +851,19 @@ export abstract class AbstractPropertyModel
         benchmark?.step( 'QUERY' );
 
         const orderedEntries = prev ? [ ...entries ].reverse() : entries;
+        const convStart = Date.now();
         const items = await Promise.all( orderedEntries.map( async( dbe ) =>
         {
             return await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
         }));
+        const converterDuration = Date.now() - convStart;
+
+        this.#emitQuery( 'list', pipeline, queryDuration,
+        {
+            converterDuration,
+            resultCount : items.length,
+            conversion  : String( conversion )
+        });
 
         benchmark?.step( 'CONVERTER' );
 

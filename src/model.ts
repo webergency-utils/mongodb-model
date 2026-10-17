@@ -14,7 +14,22 @@ import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
 import { AccessControl } from './access-control.js';
 import { ConverterManager } from './converters.js';
 import { ModelAccessDeniedError, ModelError } from './errors.js';
-import { ModelEventEmitter, ModelEventHandler, ModelEventName } from './events.js';
+import
+{
+    ModelCacheEvent,
+    ModelEventEmitter,
+    ModelEventHandler,
+    ModelEventName,
+    ModelMutationEvent,
+    ModelMutationOperation,
+    ModelQueryEvent,
+    ModelQueryOperation,
+    ObservabilityConfig,
+    ObservabilityOptions,
+    dispatchObservabilityEvent,
+    resolveObservabilityOptions
+}
+from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
@@ -33,7 +48,7 @@ import { AbstractModels } from './models.js';
 import { convertDocuments } from './operations.js';
 import { PipelineBuilder } from './pipeline-builder.js';
 import { ComputedPropertyResolver, SmartFilterResolver } from './resolvers.js';
-import { GET_OPTIMIZER_OPTIONS, REGISTER_MODEL } from './symbols.js';
+import { GET_OBSERVABILITY_OPTIONS, GET_OPTIMIZER_OPTIONS, REGISTER_MODEL } from './symbols.js';
 import { getCursor } from './helpers/mongo.js';
 import
 {
@@ -80,14 +95,16 @@ export abstract class AbstractModel
     #pipelineBuilder = new PipelineBuilder<DBE>();
     #events = new ModelEventEmitter();
     #optimizer?: OptimizerConfig;
+    #observability?: ObservabilityConfig;
 
     public converters: Extensions['converters'];
     public smartFilters?: ExtractSmartFilters<Extensions>;
 
-    protected constructor( models: AbstractModels, public collection: Collection<DBE>, params: Extensions & { optimizer?: OptimizerConfig } )
+    protected constructor( models: AbstractModels, public collection: Collection<DBE>, params: Extensions & { optimizer?: OptimizerConfig, observability?: ObservabilityConfig } )
     {
         this.#models = models;
         this.#optimizer = params.optimizer;
+        this.#observability = params.observability;
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this.smartFilters = params.smartFilters;
         this.#converters = new ConverterManager( this, this.converters );
@@ -126,7 +143,11 @@ export abstract class AbstractModel
                 LOG_FILE( `TIME: ${duration} ms` );
                 LOG_FILE( pipeline, true );
 
-                this.#emitQuery( 'get', pipeline, duration );
+                this.#emitQuery( 'get', pipeline, duration,
+                {
+                    resultCount : documents.length,
+                    conversion  : String( conversion )
+                });
 
                 return map(
                     ids.map( id => this.dtoID( id )),
@@ -159,6 +180,11 @@ export abstract class AbstractModel
         return this.#optimizer;
     }
 
+    [GET_OBSERVABILITY_OPTIONS](): ObservabilityOptions | undefined
+    {
+        return resolveObservabilityOptions( this.#observability, this.#models[GET_OBSERVABILITY_OPTIONS]() );
+    }
+
     #optimizePipeline( pipeline: Document[] ): Document[]
     {
         const options = this[GET_OPTIMIZER_OPTIONS]();
@@ -176,25 +202,84 @@ export abstract class AbstractModel
         this.#events.off( event, handler );
     }
 
-    #emitQuery( operation: 'get' | 'list' | 'stream' | 'aggregate' | 'count' | 'find', pipeline: Document[], duration: number )
+    #emitQuery(
+        operation: ModelQueryOperation,
+        pipeline: Document[],
+        duration: number,
+        extra?: Partial<Omit<ModelQueryEvent, 'collection' | 'operation' | 'pipeline' | 'duration'>>
+    )
     {
-        this.#events.emit( 'query',
-        {
-            collection  : this.collection.collectionName,
-            pipeline,
-            duration,
-            operation
-        });
+        dispatchObservabilityEvent(
+            'query',
+            {
+                collection  : this.collection.collectionName,
+                model       : this.constructor.name,
+                pipeline,
+                duration,
+                operation,
+                ...extra
+            },
+            this.#events,
+            this.#models,
+            this[GET_OBSERVABILITY_OPTIONS]()
+        );
     }
 
-    #emitError( error: unknown, operation?: string )
+    #emitMutation(
+        operation: ModelMutationOperation,
+        duration: number,
+        extra?: Partial<Omit<ModelMutationEvent, 'collection' | 'operation' | 'duration'>>
+    )
     {
-        this.#events.emit( 'error',
-        {
-            collection  : this.collection.collectionName,
-            error       : error instanceof Error ? error : new Error( String( error )),
-            operation
-        });
+        dispatchObservabilityEvent(
+            'mutation',
+            {
+                collection  : this.collection.collectionName,
+                model       : this.constructor.name,
+                operation,
+                duration,
+                ...extra
+            },
+            this.#events,
+            this.#models,
+            this[GET_OBSERVABILITY_OPTIONS]()
+        );
+    }
+
+    #emitCache(
+        operation: ModelCacheEvent['operation'],
+        extra?: Partial<Omit<ModelCacheEvent, 'collection' | 'operation'>>
+    )
+    {
+        dispatchObservabilityEvent(
+            'cache',
+            {
+                collection  : this.collection.collectionName,
+                model       : this.constructor.name,
+                operation,
+                ...extra
+            },
+            this.#events,
+            this.#models,
+            this[GET_OBSERVABILITY_OPTIONS]()
+        );
+    }
+
+    #emitError( error: unknown, operation?: string, duration?: number )
+    {
+        dispatchObservabilityEvent(
+            'error',
+            {
+                collection  : this.collection.collectionName,
+                model       : this.constructor.name,
+                error       : error instanceof Error ? error : new Error( String( error )),
+                operation,
+                duration
+            },
+            this.#events,
+            this.#models,
+            this[GET_OBSERVABILITY_OPTIONS]()
+        );
     }
 
     protected id(): DTO['id'] | Promise<DTO['id']>
@@ -274,17 +359,24 @@ export abstract class AbstractModel
             }
 
             const _id: DTO['id'] = id ?? await this.id();
+            const start = Date.now();
 
             try
             {
                 await this.collection.insertOne( resolveBSONObject({ ...dbe, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE> );
+                this.#emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
             }
             catch( e: any )
             {
                 if( options?.duplicateIgnore === true && e.code === 11000 )
                 {
-                    return this.dtoID( await this.collection.findOne( e.keyValue, { projection: { _id: 1 }, collation: { locale: 'en' } }).then( r => r?._id ));
+                    const existingId = this.dtoID( await this.collection.findOne( e.keyValue, { projection: { _id: 1 }, collation: { locale: 'en' } }).then( r => r?._id ));
+                    this.#emitMutation( 'create', Date.now() - start, { insertedCount: 0, ids: [ existingId ] });
+
+                    return existingId;
                 }
+
+                this.#emitError( e, 'create', Date.now() - start );
 
                 throw e;
             }
@@ -303,6 +395,7 @@ export abstract class AbstractModel
      */
     public async createFrom( _data: unknown, _id?: DTO['id'], _options?: ModelCreateOptions ): Promise<DTO['id']>
     {
+        void this.#emitCache;
         throw new ModelError( 'MODEL_NOT_IMPLEMENTED', this, 'createFrom() is not implemented' );
     }
 
@@ -322,6 +415,8 @@ export abstract class AbstractModel
                 return { matchedCount: 0, modifiedCount: 0 };
             }
 
+            const start = Date.now();
+
             if( options?.documentBefore || options?.documentAfter )
             {
                 const result = await this.collection.findOneAndUpdate(
@@ -334,16 +429,32 @@ export abstract class AbstractModel
                 );
 
                 const document = ( result as DBE | null ) || undefined;
+                const matchedCount = document ? 1 : 0;
+                const modifiedCount = document ? 1 : 0;
+
+                this.#emitMutation( 'update', Date.now() - start,
+                {
+                    matchedCount,
+                    modifiedCount,
+                    ids: [ id ]
+                });
 
                 return {
-                    matchedCount    : document ? 1 : 0,
-                    modifiedCount   : document ? 1 : 0,
+                    matchedCount,
+                    modifiedCount,
                     documentBefore  : options.documentBefore && !options.documentAfter ? document : undefined,
                     documentAfter   : options.documentAfter ? document : undefined
                 };
             }
 
             const res = await this.collection.updateOne( match, toUpdateOperations( update ));
+
+            this.#emitMutation( 'update', Date.now() - start,
+            {
+                matchedCount    : res.matchedCount,
+                modifiedCount   : res.modifiedCount,
+                ids             : [ id ]
+            });
 
             return {
                 matchedCount    : res.matchedCount,
@@ -376,7 +487,15 @@ export abstract class AbstractModel
                 return { matchedCount: 0, modifiedCount: 0 };
             }
 
+            const start = Date.now();
             const res = await this.collection.updateMany( match, toUpdateOperations( update ));
+
+            this.#emitMutation( 'updateMany', Date.now() - start,
+            {
+                matchedCount    : res.matchedCount,
+                modifiedCount   : res.modifiedCount,
+                ids
+            });
 
             return {
                 matchedCount    : res.matchedCount,
@@ -547,16 +666,16 @@ export abstract class AbstractModel
         flowGet( 'log' ) && countPipeline && DUMP( countPipeline );
 
         const start = Date.now();
+        let queryDuration = 0;
         const [ entries, total ] = await Promise.all(
         [
             this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
             {
-                const duration = Date.now() - start;
+                queryDuration = Date.now() - start;
 
                 LOG_FILE( `Collection: ${this.collection.collectionName}` );
-                LOG_FILE( `TIME: ${duration} ms` );
+                LOG_FILE( `TIME: ${queryDuration} ms` );
                 LOG_FILE( pipeline, true );
-                this.#emitQuery( 'list', pipeline, duration );
 
                 return r;
             }),
@@ -567,7 +686,7 @@ export abstract class AbstractModel
                 LOG_FILE( `Collection: ${this.collection.collectionName}` );
                 LOG_FILE( `TIME: ${duration} ms` );
                 LOG_FILE( countPipeline, true );
-                this.#emitQuery( 'count', countPipeline!, duration );
+                this.#emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
 
                 return r[0]?.count ?? 0;
             }) : undefined
@@ -577,10 +696,19 @@ export abstract class AbstractModel
 
         let orderedEntries = prev ? [ ...entries ].reverse() : entries;
 
+        const convStart = Date.now();
         const items = await Promise.all( orderedEntries.map( async( dbe ) =>
         {
             return await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
         }));
+        const converterDuration = Date.now() - convStart;
+
+        this.#emitQuery( 'list', pipeline, queryDuration,
+        {
+            converterDuration,
+            resultCount : items.length,
+            conversion  : String( conversion )
+        });
 
         benchmark?.step( 'CONVERTER' );
 
@@ -664,7 +792,7 @@ export abstract class AbstractModel
             LOG_FILE( `Collection: ${this.collection.collectionName}` );
             LOG_FILE( `TIME: ${duration} ms` );
             LOG_FILE( pipeline, true );
-            this.#emitQuery( 'stream', pipeline, duration );
+            this.#emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
 
             for( const dbe of entries.reverse() )
             {
@@ -686,7 +814,7 @@ export abstract class AbstractModel
                 LOG_FILE( `Collection: ${this.collection.collectionName}` );
                 LOG_FILE( `TIME: ${duration} ms` );
                 LOG_FILE( pipeline, true );
-                this.#emitQuery( 'stream', pipeline, duration );
+                this.#emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
             }
 
             yield await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
@@ -694,7 +822,7 @@ export abstract class AbstractModel
 
         if( !emitted )
         {
-            this.#emitQuery( 'stream', pipeline, Date.now() - start );
+            this.#emitQuery( 'stream', pipeline, Date.now() - start, { conversion: String( conversion ) });
         }
         }
         finally
@@ -738,7 +866,7 @@ export abstract class AbstractModel
             LOG_FILE( `Collection: ${this.collection.collectionName}` );
             LOG_FILE( `TIME: ${duration} ms` );
             LOG_FILE( aggregationPipeline, true );
-            this.#emitQuery( 'aggregate', aggregationPipeline, duration );
+            this.#emitQuery( 'aggregate', aggregationPipeline, duration, { resultCount: res.length });
 
             return res;
         });
@@ -777,7 +905,16 @@ export abstract class AbstractModel
 
             if( !match ){ return false }
 
-            return ( await this.collection.deleteOne( match )).deletedCount === 1;
+            const start = Date.now();
+            const res = await this.collection.deleteOne( match );
+
+            this.#emitMutation( 'delete', Date.now() - start,
+            {
+                deletedCount    : res.deletedCount,
+                ids             : [ id ]
+            });
+
+            return res.deletedCount === 1;
         });
     }
 }
