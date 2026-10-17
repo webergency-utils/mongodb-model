@@ -148,7 +148,10 @@ describe( 'AbstractModel coverage branches', () =>
             }
         );
 
-        expect( await denyModel.list({ count: true })).toEqual({ items: [], total: 0, cursors: {} });
+        const deniedList = await denyModel.list({ count: true });
+
+        expect( Array.isArray( deniedList ) ).toBe( true );
+        expect({ items: [ ...deniedList.items ], total: deniedList.total, cursors: deniedList.cursors }).toEqual({ items: [], total: 0, cursors: {} });
 
         let call = 0;
         const aggregate = vi.fn(() =>

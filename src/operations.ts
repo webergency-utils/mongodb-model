@@ -1,7 +1,23 @@
 import { Document } from 'mongodb';
 import { getCursor } from './helpers/mongo.js';
 import { ConverterManager } from './converters.js';
-import { ListResult } from './types/external.js';
+import { ListResult, WithTotal } from './types/external.js';
+
+export function attachListMetadata<T>(
+    items: T[],
+    total: number | undefined,
+    cursors: { prev?: string, next?: string }
+): WithTotal<T[]>
+{
+    Object.defineProperties( items,
+    {
+        items   : { value: items, enumerable: false, writable: false, configurable: true },
+        total   : { value: total, enumerable: false, writable: false, configurable: true },
+        cursors : { value: cursors, enumerable: false, writable: false, configurable: true }
+    });
+
+    return items as WithTotal<T[]>;
+}
 
 export function buildListResult<T extends Document>(
     items: T[],

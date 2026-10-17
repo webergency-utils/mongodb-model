@@ -62,47 +62,51 @@ export type ModelSmartFilter<T> = { [K in PublicMethodNames<T>]?: FirstParameter
 
 export type PropertyModelFilter<RootDBE extends Document, DBE extends Document> = Filter<DBE> & { _root?: Filter<RootDBE> };
 
-export type ModelListOptions<DBE extends Document, Filters = never> = FindOptions &
+export type ModelListOptions<DBE extends Document, Filters = never, Properties = any> = FindOptions &
 {
-    filter?      : Filter<DBE>
-    smartFilter? : ModelSmartFilter<Filters>
-    cursor?      : string
-    pipeline?    : Document[]
-    count?       : boolean
-    sample?      : number
-    countLimit?  : number
-    access?      : string
+    filter?             : Filter<DBE>
+    smartFilter?        : ModelSmartFilter<Filters>
+    computedProperties? : ComputedPropertiesParam<Properties>
+    cursor?             : string
+    pipeline?           : Document[]
+    count?              : boolean
+    sample?             : number
+    countLimit?         : number
+    access?             : string
 };
 
-export type ModelStreamOptions<DBE extends Document, Filters = never> =
-    Omit<ModelListOptions<DBE, Filters>, 'count' | 'countLimit'>;
+export type ModelStreamOptions<DBE extends Document, Filters = never, Properties = any> =
+    Omit<ModelListOptions<DBE, Filters, Properties>, 'count' | 'countLimit'>;
 
 export type PropertyModelListOptions
 <
     RootDBE extends Document,
     DBE extends Document,
-    Filters extends AbstractModelSmartFilters<any> = never
+    Filters extends AbstractModelSmartFilters<any> = never,
+    Properties = any
 >
 = Omit<FindOptions, 'projection'> &
 {
-    filter?      : PropertyModelFilter<RootDBE, DBE>
-    smartFilter? : ModelSmartFilter<FirstType<Filters>>
-    cursor?      : string
-    projection?  : FindOptions['projection'] & { _root?: FindOptions['projection'] }
-    pipeline?    : Document[]
-    count?       : boolean
-    sample?      : number
-    countLimit?  : number
-    access?      : string
+    filter?             : PropertyModelFilter<RootDBE, DBE>
+    smartFilter?        : ModelSmartFilter<FirstType<Filters>>
+    computedProperties? : ComputedPropertiesParam<Properties>
+    cursor?             : string
+    projection?         : FindOptions['projection'] & { _root?: FindOptions['projection'] }
+    pipeline?           : Document[]
+    count?              : boolean
+    sample?             : number
+    countLimit?         : number
+    access?             : string
 };
 
 export type PropertyModelStreamOptions
 <
     RootDBE extends Document,
     DBE extends Document,
-    Filters extends AbstractModelSmartFilters<any> = never
+    Filters extends AbstractModelSmartFilters<any> = never,
+    Properties = any
 >
-= Omit<PropertyModelListOptions<RootDBE, DBE, Filters>, 'count' | 'countLimit'>;
+= Omit<PropertyModelListOptions<RootDBE, DBE, Filters, Properties>, 'count' | 'countLimit'>;
 
 export type ModelFindOptions<DBE extends Document, Filters = never> =
 {
@@ -137,6 +141,9 @@ export type ModelAggregateOptions
     computedProperties? : ComputedPropertiesParam<Properties>
     projection?         : FindOptions['projection']
     sort?               : FindOptions['sort']
+    limit?              : number
+    skip?               : number
+    pipeline?           : Document[]
     access?             : string
 };
 
@@ -154,6 +161,9 @@ export type PropertyModelAggregateOptions
     computedProperties? : ComputedPropertiesParam<SecondType<Properties>>
     projection?         : FindOptions['projection']
     sort?               : FindOptions['sort']
+    limit?              : number
+    skip?               : number
+    pipeline?           : Document[]
     access?             : string
 };
 

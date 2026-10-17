@@ -118,7 +118,8 @@ describe( 'AbstractPropertyModel gaps', () =>
 
         const result = await model.list({});
 
-        expect( result ).toEqual({ items: [], total: undefined, cursors: {} });
+        expect( Array.isArray( result ) ).toBe( true );
+        expect({ items: [ ...result.items ], total: result.total, cursors: result.cursors }).toEqual({ items: [], total: undefined, cursors: {} });
     });
 
     test( 'create pushes into parent array', async() =>

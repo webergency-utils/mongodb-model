@@ -180,7 +180,8 @@ describe( 'AbstractPropertyModel remaining ops', () =>
 
         const result = await model.list({ count: true });
 
-        expect( result ).toEqual({ items: [], total: 0, cursors: {} });
+        expect( Array.isArray( result ) ).toBe( true );
+        expect({ items: [ ...result.items ], total: result.total, cursors: result.cursors }).toEqual({ items: [], total: 0, cursors: {} });
         expect( aggregate ).not.toHaveBeenCalled();
     });
 
