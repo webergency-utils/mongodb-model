@@ -135,6 +135,11 @@ export class ComputedPropertyResolver
 
     async resolve( properties?: ComputedPropertiesParam<any> ): Promise<Awaited<ReturnType<SyncComputedPropertyMethod>> | { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> }>
     {
+        if( typeof properties === 'function' )
+        {
+            properties = properties();
+        }
+
         if( this.#prefix !== undefined )
         {
             return this.#resolveProperty( properties );
@@ -146,6 +151,11 @@ export class ComputedPropertyResolver
     async #resolveRoot( properties?: ComputedPropertiesParam<any> ): Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>
     {
         const result: ReturnType<ComputedPropertyMethod> = { fields: {}, pipeline: [] };
+
+        if( typeof properties === 'function' )
+        {
+            properties = properties();
+        }
 
         if( Array.isArray( properties ) )
         {
@@ -176,6 +186,11 @@ export class ComputedPropertyResolver
         let fields: Document = {};
         const extraProperties: any = {};
         const prefix = this.#prefix!;
+
+        if( typeof properties === 'function' )
+        {
+            properties = properties();
+        }
 
         if( Array.isArray( properties ) )
         {

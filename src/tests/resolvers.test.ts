@@ -256,4 +256,31 @@ describe( 'ComputedPropertyResolver', () =>
         expect( result.items!.fields ).toEqual({ 'items.label': {} });
         expect( result[''] ).toBeUndefined();
     });
+
+    test( 'root and property modes evaluate function-form computedProperties', async() =>
+    {
+        const rootComputed =
+        {
+            fullName: async() => ({
+                fields  : { fullName: { $concat: [ '$first', ' ', '$last' ] } },
+                pipeline: []
+            })
+        };
+        const propComputed =
+        {
+            label: async() => ({
+                fields  : { upper: { $toUpper: '$label' } },
+                pipeline: []
+            })
+        };
+
+        const rootResolver = new ComputedPropertyResolver( new DummyModel(), rootComputed );
+        const propResolver = new ComputedPropertyResolver( new DummyModel(), propComputed, { prefix: 'items' });
+
+        const rootResult = await rootResolver.resolve((() => [ 'fullName' ]) as any );
+        const propResult = await propResolver.resolve((() => ({ label: null })) as any );
+
+        expect( rootResult.fields ).toEqual({ fullName: { $concat: [ '$first', ' ', '$last' ] } });
+        expect( propResult.items!.fields ).toEqual({ 'items.upper': { $toUpper: '$items.label' } });
+    });
 });

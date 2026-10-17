@@ -87,4 +87,38 @@ describe( 'AbstractPropertyModel named access', () =>
 
         expect( serialized ).toContain( 'orgId' );
     });
+
+    test( 'denied read access in PropertyModel.pipeline and find injects impossible id and _id match', async() =>
+    {
+        const aggregate = vi.fn(() => ({ toArray: async() => [] }));
+
+        class ItemModel extends AbstractPropertyModel<RootDBE, ItemDBE, ItemDTO, any>
+        {
+            constructor( models: AbstractModels, collection: any )
+            {
+                super( models, collection, 'items[]',
+                {
+                    converters:
+                    {
+                        dto : { converter: ( dbe: ItemDBE ) => ({ id: dbe.id, orgId: dbe.orgId, label: dbe.label }) },
+                        dbe : { converter: ( dbe: ItemDBE ) => dbe }
+                    },
+                    access:
+                    {
+                        filters  : { deny: async() => false },
+                        defaults : { read: 'deny' }
+                    }
+                });
+            }
+        }
+
+        const models = new TestModels();
+        const model = new ItemModel( models, { collectionName: 'roots', aggregate });
+
+        const builtPipeline = await model.pipeline({ filter: { label: 'x' } }, 'dto', 'find' );
+        const serialized = JSON.stringify( builtPipeline );
+
+        expect( serialized ).toContain( '"items.id":{"$exists":false}' );
+        expect( serialized ).toContain( '"_id":{"$exists":false}' );
+    });
 });

@@ -46,7 +46,6 @@ export class PipelineBuilder<DBE extends MongoRootDocument = MongoRootDocument>
             ...( computedPipeline?.length && computedPipeline || [] )
         ]));
         const addedFieldsSmartFilterAll = new Set( collectAddedFields( options.smartFilter?.pipeline || [] ));
-        const addedFieldsPipeline = collectAddedFields( options.pipeline || [] );
 
         const addedFieldsSmartFilter = [ ...addedFieldsSmartFilterAll ].filter( x => !addedFieldsComputedProperties.has( x ));
 
@@ -59,7 +58,6 @@ export class PipelineBuilder<DBE extends MongoRootDocument = MongoRootDocument>
             ...( addedFieldsSmartFilter.length ? [{ $unset: addedFieldsSmartFilter }] : [] ),
             ...( options.projection ? [{ $project: { ...options.projection, ...computedFields }}] : [] ),
             ...( options.pipeline || [] ),
-            ...( addedFieldsPipeline.length ? [{ $unset: addedFieldsPipeline }] : [] ),
             ...( options.cursor ? [{ $match: generateCursorCondition( options.cursor, options.sort || {} )}] : [] ),
             ...( options.sort ? [{ $sort: prev ? reverseSort( options.sort ) : options.sort }] : [] ),
             ...( options.skip ? [{ $skip: options.skip }] : [] ),

@@ -104,4 +104,24 @@ describe( 'PipelineBuilder', () =>
         expect( pipeline ).toContainEqual({ $sample: { size: 3 } });
         expect( pipeline ).toContainEqual({ $sort: { _id: -1 } });
     });
+
+    test( 'pipeline allows arbitrary stages in options.pipeline and preserves caller $addFields', async() =>
+    {
+        const builder = new PipelineBuilder();
+        const pipeline = await builder.pipeline(
+        {
+            filter  : { status: 'active' },
+            pipeline:
+            [
+                { $addFields: { callerField: '$score' } },
+                { $sort: { callerField: -1 } },
+                { $limit: 5 }
+            ]
+        });
+
+        expect( pipeline ).toContainEqual({ $addFields: { callerField: '$score' } });
+        expect( pipeline ).toContainEqual({ $sort: { callerField: -1 } });
+        expect( pipeline ).toContainEqual({ $limit: 5 });
+        expect( pipeline ).not.toContainEqual({ $unset: [ 'callerField' ] });
+    });
 });

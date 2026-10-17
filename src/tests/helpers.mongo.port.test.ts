@@ -24,6 +24,7 @@ import
     objectSet,
     optimizeMatch,
     projectionToProject,
+    propertyModelTargetUpdateParams,
     propertyModelUpdateParams,
     resolveBSONObject,
     resolveBSONValue,
@@ -1941,5 +1942,42 @@ describe('propertyModelUpdateParams', () => {
             updatePath: 'a.b.c',
             arrayFilters: []
         })
+    })
+
+    it('should process a[].b[].c[] with explicit ancestorIds', () => {
+        const paths = [
+            { path: 'a', array: true },
+            { path: 'b', array: true },
+            { path: 'c', array: true },
+        ]
+        const params = propertyModelUpdateParams(paths, 'b1', ['a1', 'b1']);
+        assert.deepStrictEqual(params, {
+            parentIDPath: 'a.b.id',
+            updatePath: 'a.$[path0].b.$[path1].c',
+            arrayFilters: [{ 'path0.id': 'a1' }, { 'path1.id': 'b1' }]
+        })
+    })
+
+    it('should build target update params for array, object, and mixed paths', () => {
+        assert.deepStrictEqual(
+            propertyModelTargetUpdateParams([{ path: 'a', array: false }, { path: 'b', array: false }], 'id1'),
+            { updatePrefix: 'a.b' }
+        );
+        assert.deepStrictEqual(
+            propertyModelTargetUpdateParams([{ path: 'a', array: false }, { path: 'b', array: true }], 'id1'),
+            { updatePrefix: 'a.b.$[entry]', arrayFilters: [{ 'entry.id': 'id1' }] }
+        );
+        assert.deepStrictEqual(
+            propertyModelTargetUpdateParams([{ path: 'a', array: true }, { path: 'b', array: true }], 'id1'),
+            { updatePrefix: 'a.$[].b.$[entry]', arrayFilters: [{ 'entry.id': 'id1' }] }
+        );
+        assert.deepStrictEqual(
+            propertyModelTargetUpdateParams([{ path: 'a', array: true }, { path: 'b', array: true }, { path: 'c', array: false }], 'id1'),
+            { updatePrefix: 'a.$[].b.$[entry].c', arrayFilters: [{ 'entry.c.id': 'id1' }] }
+        );
+        assert.deepStrictEqual(
+            propertyModelTargetUpdateParams([{ path: 'a', array: true }, { path: 'b', array: false }, { path: 'c', array: false }], 'id1'),
+            { updatePrefix: 'a.$[entry].b.c', arrayFilters: [{ 'entry.b.c.id': 'id1' }] }
+        );
     })
 })

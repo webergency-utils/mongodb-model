@@ -701,30 +701,106 @@ export function optimizeMatch( obj: MongoFilter<any> ): MongoFilter<any> | undef
  * @param parentID
  // * @param operation - create or update - determines if filtering should be done on parentID or _id
  */
-export function propertyModelUpdateParams( paths: { path: string, array: boolean }[], parentID: any, /*operation: 'create' | 'update'*/ )
+export function propertyModelUpdateParams( paths: { path: string, array: boolean }[], parentID: any, ancestorIds?: any[] )
 {
-    let parentPath: string | undefined = paths.slice( 0, paths.length - 1 ).map( p => p.path ).join('.');
+    let parentPath: string | undefined = paths.slice( 0, paths.length - 1 ).map( p => p.path ).join( '.' );
     parentPath = parentPath !== '' ? parentPath + '.' : undefined;
     const parentIDPath = parentPath ? parentPath + 'id' : '_id';
 
     const currModelSubPath = paths[paths.length - 1];
 
-    let updatePath = paths.slice(0, paths.length - 1 ).map( (p, i) => p.path + ( p.array ? `.$[path${i}]` : '' ) ).join('.');
+    let updatePath = paths.slice( 0, paths.length - 1 ).map(( p, i ) => p.path + ( p.array ? `.$[path${i}]` : '' )).join( '.' );
     updatePath = updatePath !== '' ? `${updatePath}.${currModelSubPath.path}` : currModelSubPath.path;
 
     const arrayFilters: Document[] = [];
-    for ( let i = 0; i < paths.length - 1; i++ )
+    let ancestorIdx = 0;
+
+    for( let i = 0; i < paths.length - 1; i++ )
     {
         const path = paths[i];
-        if ( path.array )
+
+        if( path.array )
         {
-            let pathRest = paths.slice(i + 1, paths.length - 1).map( p => p.path ).join('.');
-            pathRest = pathRest !== '' ? pathRest + '.' : '';
-            arrayFilters.push({ [`path${i}.${pathRest}id`]: parentID });
+            if( ancestorIds && ancestorIdx < ancestorIds.length )
+            {
+                let nextArrayOrEnd = i + 1;
+
+                while( nextArrayOrEnd < paths.length - 1 && !paths[nextArrayOrEnd].array )
+                {
+                    nextArrayOrEnd++;
+                }
+
+                let segmentRest = paths.slice( i + 1, nextArrayOrEnd ).map( p => p.path ).join( '.' );
+                segmentRest = segmentRest !== '' ? segmentRest + '.' : '';
+                arrayFilters.push({ [`path${i}.${segmentRest}id`]: ancestorIds[ancestorIdx] });
+                ancestorIdx++;
+            }
+            else
+            {
+                let pathRest = paths.slice( i + 1, paths.length - 1 ).map( p => p.path ).join( '.' );
+                pathRest = pathRest !== '' ? pathRest + '.' : '';
+                arrayFilters.push({ [`path${i}.${pathRest}id`]: parentID });
+            }
         }
     }
 
     return { parentIDPath, updatePath, arrayFilters };
+}
+
+export function propertyModelTargetUpdateParams( paths: { path: string, array: boolean }[], targetIdCondition: any ): { updatePrefix: string, arrayFilters?: Document[] }
+{
+    const leaf = paths[paths.length - 1];
+
+    if( leaf.array )
+    {
+        const ancestorPrefix = paths.slice( 0, -1 ).map( p => p.path + ( p.array ? '.$[]' : '' )).join( '.' );
+        const updatePrefix = ( ancestorPrefix ? ancestorPrefix + '.' : '' ) + leaf.path + '.$[entry]';
+
+        return {
+            updatePrefix,
+            arrayFilters: [{ 'entry.id': targetIdCondition }]
+        };
+    }
+
+    let lastArrayIdx = -1;
+
+    for( let i = paths.length - 1; i >= 0; i-- )
+    {
+        if( paths[i].array )
+        {
+            lastArrayIdx = i;
+            break;
+        }
+    }
+
+    if( lastArrayIdx === -1 )
+    {
+        return {
+            updatePrefix: paths.map( p => p.path ).join( '.' )
+        };
+    }
+
+    const prefixParts = paths.map(( p, idx ) =>
+    {
+        if( idx < lastArrayIdx )
+        {
+            return p.path + ( p.array ? '.$[]' : '' );
+        }
+
+        if( idx === lastArrayIdx )
+        {
+            return p.path + '.$[entry]';
+        }
+
+        return p.path;
+    });
+
+    const tailPath = paths.slice( lastArrayIdx + 1 ).map( p => p.path ).join( '.' );
+
+    return {
+        updatePrefix: prefixParts.join( '.' ),
+        arrayFilters: [{ [`entry.${tailPath}.id`]: targetIdCondition }]
+    };
 }
 
 export function mergeComputedProperties( ...objects: { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>>}[] ): { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>>}

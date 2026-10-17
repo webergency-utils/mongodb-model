@@ -915,7 +915,7 @@ export abstract class AbstractPropertyModel
     {
         const sort = list.sort ?? { id: -1 };
         const access = await this.#access.resolveOrDeny({ operation: 'read', method, access: list.access });
-        const accessFilter = access.denied ? { _id: { $exists: false } } : access.filter;
+        const accessFilter = access.denied ? { '_root._id': { $exists: false }, id: { $exists: false } } : access.filter;
         const cursorFilter = list.cursor ? generateCursorCondition( list.cursor, sort ) : undefined;
         const stageFilter = optimizeMatch( resolveBSONObject(
         {
