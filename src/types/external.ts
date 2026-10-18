@@ -1,7 +1,7 @@
 import { Document, Filter, FindOptions, MongoClientOptions, ObjectId } from 'mongodb';
 import type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
-import type { ModelCacheConfig, ModelCacheInstance, ModelCacheOptions } from '../cache.js';
-import type { ObservabilityConfig, ObservabilityLogger, ObservabilityOptions } from '../events.js';
+import type { ModelCacheConfig } from '../cache.js';
+import type { ObservabilityConfig } from '../events.js';
 import
 {
     AbstractConverterOptions,
@@ -62,11 +62,11 @@ export type ModelSmartFilter<T> = { [K in PublicMethodNames<T>]?: FirstParameter
 
 export type PropertyModelFilter<RootDBE extends Document, DBE extends Document> = Filter<DBE> & { _root?: Filter<RootDBE> };
 
-export type ModelListOptions<DBE extends Document, Filters = never, Properties = any> = FindOptions &
+export type ModelListOptions<DBE extends Document, Filters = never, Properties = never> = FindOptions &
 {
     filter?             : Filter<DBE>
     smartFilter?        : ModelSmartFilter<Filters>
-    computedProperties? : ComputedPropertiesParam<Properties>
+    computedProperties? : ComputedPropertiesParam<Properties extends AbstractModelProperties<any> ? Properties : any>
     cursor?             : string
     pipeline?           : Document[]
     count?              : boolean
@@ -75,7 +75,7 @@ export type ModelListOptions<DBE extends Document, Filters = never, Properties =
     access?             : string
 };
 
-export type ModelStreamOptions<DBE extends Document, Filters = never, Properties = any> =
+export type ModelStreamOptions<DBE extends Document, Filters = never, Properties = never> =
     Omit<ModelListOptions<DBE, Filters, Properties>, 'count' | 'countLimit'>;
 
 export type PropertyModelListOptions
@@ -83,13 +83,13 @@ export type PropertyModelListOptions
     RootDBE extends Document,
     DBE extends Document,
     Filters extends AbstractModelSmartFilters<any> = never,
-    Properties = any
+    Properties = never
 >
 = Omit<FindOptions, 'projection'> &
 {
     filter?             : PropertyModelFilter<RootDBE, DBE>
     smartFilter?        : ModelSmartFilter<FirstType<Filters>>
-    computedProperties? : ComputedPropertiesParam<Properties>
+    computedProperties? : ComputedPropertiesParam<SecondType<Properties> extends AbstractModelProperties<any> ? SecondType<Properties> : any>
     cursor?             : string
     projection?         : FindOptions['projection'] & { _root?: FindOptions['projection'] }
     pipeline?           : Document[]
@@ -104,7 +104,7 @@ export type PropertyModelStreamOptions
     RootDBE extends Document,
     DBE extends Document,
     Filters extends AbstractModelSmartFilters<any> = never,
-    Properties = any
+    Properties = never
 >
 = Omit<PropertyModelListOptions<RootDBE, DBE, Filters, Properties>, 'count' | 'countLimit'>;
 

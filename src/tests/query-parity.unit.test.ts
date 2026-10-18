@@ -496,5 +496,20 @@ describe( 'Unit U5: Query Surface Parity & Cache Integration', () =>
         }, {});
 
         expect( userAggregate ).toHaveBeenCalledTimes( 3 );
+
+        // PropertyModel.getMany with cache: true (partial hit + miss + filter: true + all cached hit)
+        const cachedPropFixture = createParityFixture({ cache: true });
+        await cachedPropFixture.items.get( cachedPropFixture.itemId1.toString() );
+        expect( cachedPropFixture.itemAggregate ).toHaveBeenCalledTimes( 1 );
+
+        const propMany = await cachedPropFixture.items.getMany([ cachedPropFixture.itemId1.toString(), cachedPropFixture.itemId2.toString() ], { filter: true });
+        expect( propMany ).toHaveLength( 2 );
+        expect( cachedPropFixture.itemAggregate ).toHaveBeenCalledTimes( 2 );
+
+        // Second getMany when all items are cached does not hit MongoDB
+        const propManyAllCached = await cachedPropFixture.items.getMany([ cachedPropFixture.itemId1.toString(), cachedPropFixture.itemId2.toString() ]);
+        expect( propManyAllCached ).toHaveLength( 2 );
+        expect( cachedPropFixture.itemAggregate ).toHaveBeenCalledTimes( 2 );
     });
 });
+

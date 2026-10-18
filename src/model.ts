@@ -47,11 +47,22 @@ import
 }
 from './helpers/index.js';
 import { AbstractModels } from './models.js';
-import { attachListMetadata, convertDocuments } from './operations.js';
+import
+{
+    attachCursorToItem,
+    attachListMetadata,
+    convertDocuments,
+    normalizeExistsOptions,
+    normalizeFindMatch,
+    normalizeGetManyOptions,
+    normalizeGetOptions,
+    resolveCreateFromArgs
+}
+from './operations.js';
 import { PipelineBuilder } from './pipeline-builder.js';
 import { ComputedPropertyResolver, SmartFilterResolver } from './resolvers.js';
 import { GET_OBSERVABILITY_OPTIONS, GET_OPTIMIZER_OPTIONS, REGISTER_MODEL } from './symbols.js';
-import { getCursor, isForeignObjectIdLike, isLibraryObjectId } from './helpers/mongo.js';
+import { getCursor } from './helpers/mongo.js';
 import
 {
     AbstractModelProperties,
@@ -111,7 +122,7 @@ export abstract class AbstractModel
         this.#observability = params.observability;
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this.smartFilters = params.smartFilters;
-        this.#converters = new ConverterManager( this, this.converters );
+        this.#converters = new ConverterManager( this, this.converters, ( err, op ) => this.#emitError( err, op ));
         this.#access = new AccessControl(
         {
             model            : this,
@@ -420,64 +431,12 @@ export abstract class AbstractModel
     {
         return this.runOperation( async() =>
         {
-            const isCreateOpts = ( v: unknown ): v is ModelCreateOptions =>
-                typeof v === 'object'
-                && v !== null
-                && !Array.isArray( v )
-                && !isLibraryObjectId( v )
-                && !isForeignObjectIdLike( v )
-                && ( 'duplicateIgnore' in v || 'access' in v );
-
-            const fromMap = this.converters.from;
-            let fromKey: string | undefined;
-            let explicitId: DTO['id'] | undefined;
-            let resolvedOptions: ModelCreateOptions | undefined;
-
-            if( isCreateOpts( fromKeyOrId ) )
-            {
-                resolvedOptions = fromKeyOrId;
-            }
-            else if( typeof fromKeyOrId === 'string' && fromMap && fromKeyOrId in fromMap )
-            {
-                fromKey = fromKeyOrId;
-
-                if( isCreateOpts( idOrOptions ) )
-                {
-                    resolvedOptions = idOrOptions;
-                }
-                else
-                {
-                    explicitId = idOrOptions as DTO['id'] | undefined;
-                    resolvedOptions = options;
-                }
-            }
-            else if(
-                typeof fromKeyOrId === 'string'
-                && (
-                    ( idOrOptions !== undefined && !isCreateOpts( idOrOptions ))
-                    || options !== undefined
-                    || !fromMap
-                    || ( !( 'default' in fromMap ) && ( Object.keys( fromMap ).length !== 1 || !ObjectId.isValid( fromKeyOrId )))
-                )
-            )
-            {
-                fromKey = fromKeyOrId;
-
-                if( isCreateOpts( idOrOptions ) )
-                {
-                    resolvedOptions = idOrOptions;
-                }
-                else
-                {
-                    explicitId = idOrOptions as DTO['id'] | undefined;
-                    resolvedOptions = options;
-                }
-            }
-            else
-            {
-                explicitId = fromKeyOrId as DTO['id'] | undefined;
-                resolvedOptions = isCreateOpts( idOrOptions ) ? idOrOptions : options;
-            }
+            const { fromKey, explicitId, resolvedOptions } = resolveCreateFromArgs<DTO['id']>(
+                this.converters.from as Record<string, unknown> | undefined,
+                fromKeyOrId,
+                idOrOptions,
+                options
+            );
 
             const start = Date.now();
             let dbe: Omit<DBE, '_id'> & { _id?: DBE['_id'] };
@@ -628,37 +587,26 @@ export abstract class AbstractModel
         }
     }
 
-    #normalizeFindMatch(
-        match: Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+    async #resolveFilterMatch(
+        matchInput: Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        operation: 'update' | 'delete',
+        method: string,
         optionsAccess?: string
-    ): { rawFilter: Filter<DBE>, smartFilter?: any, access?: string }
+    ): Promise<{ finalMatch: Filter<DBE> | null, targetIds: string[] | null }>
     {
-        if(
-            match
-            && typeof match === 'object'
-            && !Array.isArray( match )
-            && !isLibraryObjectId( match )
-            && !isForeignObjectIdLike( match )
-            && (
-                'filter' in match
-                || 'smartFilter' in match
-                || ( 'access' in match && Object.keys( match ).every( k => k === 'filter' || k === 'smartFilter' || k === 'access' ))
-            )
-        )
-        {
-            const opts = match as ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>;
+        const { filter: rawFilter, smartFilter, access } = normalizeFindMatch<Filter<DBE>, any>( matchInput, optionsAccess );
+        const targetIds = extractTargetIdsFromFilter( matchInput, '_id', id => String( this.dtoID( id )));
+        const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
+        const combinedFilter = resolvedSmart?.filter
+            ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
+            : rawFilter;
 
-            return {
-                rawFilter   : ( opts.filter ?? {} ) as Filter<DBE>,
-                smartFilter : opts.smartFilter,
-                access      : optionsAccess ?? opts.access
-            };
-        }
+        const finalMatch = await this.#access.match(
+            resolveBSONObject( combinedFilter ) as Filter<DBE>,
+            { operation, method, access }
+        );
 
-        return {
-            rawFilter   : ( match ?? {} ) as Filter<DBE>,
-            access      : optionsAccess
-        };
+        return { finalMatch, targetIds };
     }
 
     public async updateMany(
@@ -707,17 +655,7 @@ export abstract class AbstractModel
                 };
             }
 
-            const { rawFilter, smartFilter, access } = this.#normalizeFindMatch( idsOrFilter, options?.access );
-            const targetIds = extractTargetIdsFromFilter( idsOrFilter, '_id', id => String( this.dtoID( id )));
-            const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
-            const combinedFilter = resolvedSmart?.filter
-                ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
-                : rawFilter;
-
-            const finalMatch = await this.#access.match(
-                resolveBSONObject( combinedFilter ) as Filter<DBE>,
-                { operation: 'update', method: 'updateMany', access }
-            );
+            const { finalMatch, targetIds } = await this.#resolveFilterMatch( idsOrFilter, 'update', 'updateMany', options?.access );
 
             if( !finalMatch )
             {
@@ -759,17 +697,7 @@ export abstract class AbstractModel
     {
         return this.runOperation( async() =>
         {
-            const { rawFilter, smartFilter, access } = this.#normalizeFindMatch( match, options?.access );
-            const targetIds = extractTargetIdsFromFilter( match, '_id', id => String( this.dtoID( id )));
-            const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
-            const combinedFilter = resolvedSmart?.filter
-                ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
-                : rawFilter;
-
-            const finalMatch = await this.#access.match(
-                resolveBSONObject( combinedFilter ) as Filter<DBE>,
-                { operation: 'update', method: 'updateOne', access }
-            );
+            const { finalMatch, targetIds } = await this.#resolveFilterMatch( match, 'update', 'updateOne', options?.access );
 
             if( !finalMatch )
             {
@@ -867,23 +795,14 @@ export abstract class AbstractModel
     {
         if( Array.isArray( idOrIds ) )
         {
-            const manyOptions: GetManyOptions<K> =
-                optionsOrConversion !== undefined && ( typeof optionsOrConversion !== 'object' || optionsOrConversion === null )
-                    ? { as: optionsOrConversion as K, filter: filtered }
-                    : { ...( optionsOrConversion as GetManyOptions<K> | undefined ), ...( filtered !== undefined ? { filter: filtered } : {} ) };
-
-            return this.getMany( idOrIds, manyOptions );
+            return this.getMany( idOrIds, normalizeGetManyOptions<K>( optionsOrConversion as GetManyOptions<K> | K, filtered ));
         }
 
         const release = this.trackOperation();
 
         try
         {
-            const options: GetOptions<K> =
-                optionsOrConversion !== undefined && ( typeof optionsOrConversion !== 'object' || optionsOrConversion === null )
-                    ? { as: optionsOrConversion as K }
-                    : ( optionsOrConversion ?? {} );
-
+            const options = normalizeGetOptions<K>( optionsOrConversion as GetOptions<K> | K );
             const conversion = ( options.as ?? 'dto' ) as K;
             const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'get', access: options.access });
 
@@ -956,11 +875,7 @@ export abstract class AbstractModel
 
         try
         {
-            const options: GetManyOptions<K> =
-                optionsOrConversion !== undefined && ( typeof optionsOrConversion !== 'object' || optionsOrConversion === null )
-                    ? { as: optionsOrConversion as K, filter: filtered }
-                    : { ...( optionsOrConversion as GetManyOptions<K> | undefined ), ...( filtered !== undefined ? { filter: filtered } : {} ) };
-
+            const options = normalizeGetManyOptions<K>( optionsOrConversion, filtered );
             const conversion = ( options.as ?? 'dto' ) as K;
             const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'getMany', access: options.access });
 
@@ -1097,7 +1012,7 @@ export abstract class AbstractModel
             benchmark?.step( 'CONVERTER' );
 
             return data;
-        });
+        }) as Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
     }
 
     public async list<K extends keyof Extensions['converters']>(
@@ -1204,18 +1119,7 @@ export abstract class AbstractModel
             {
                 const dto = await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
 
-                if( dto && typeof dto === 'object' )
-                {
-                    Object.defineProperty( dto, '$cursor',
-                    {
-                        value        : getCursor( dbe, sort ),
-                        enumerable   : false,
-                        writable     : true,
-                        configurable : true
-                    });
-                }
-
-                return dto;
+                return attachCursorToItem( dto, dbe, sort );
             }));
             const converterDuration = Date.now() - convStart;
 
@@ -1423,42 +1327,12 @@ export abstract class AbstractModel
     {
         return this.runOperation( async() =>
         {
-            let findOptions: ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>;
-
-            if( idOrFilter === undefined || idOrFilter === null )
-            {
-                findOptions = { filter: {} as Filter<DBE>, access: options?.access };
-            }
-            else if(
-                typeof idOrFilter === 'string'
-                || typeof idOrFilter === 'number'
-                || isLibraryObjectId( idOrFilter )
-                || isForeignObjectIdLike( idOrFilter )
-            )
-            {
-                findOptions =
-                {
-                    filter : { _id: this.dbeID( idOrFilter as DTO['id'] ) } as Filter<DBE>,
-                    access : options?.access
-                };
-            }
-            else if(
-                typeof idOrFilter === 'object'
-                && (
-                    'filter' in idOrFilter
-                    || 'smartFilter' in idOrFilter
-                    || ( 'access' in idOrFilter && Object.keys( idOrFilter ).every( k => k === 'filter' || k === 'smartFilter' || k === 'access' ))
-                )
-            )
-            {
-                const opts = idOrFilter as ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>;
-
-                findOptions = { ...opts, access: options?.access ?? opts.access };
-            }
-            else
-            {
-                findOptions = { filter: idOrFilter as Filter<DBE>, access: options?.access };
-            }
+            const findOptions = normalizeExistsOptions<Filter<DBE>, any>(
+                idOrFilter,
+                '_id',
+                id => this.dbeID( id ),
+                options?.access
+            );
 
             const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'exists', access: findOptions.access });
 
@@ -1558,17 +1432,7 @@ export abstract class AbstractModel
                 return res.deletedCount;
             }
 
-            const { rawFilter, smartFilter, access } = this.#normalizeFindMatch( idsOrFilter, options?.access );
-            const targetIds = extractTargetIdsFromFilter( idsOrFilter, '_id', id => String( this.dtoID( id )));
-            const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
-            const combinedFilter = resolvedSmart?.filter
-                ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
-                : rawFilter;
-
-            const finalMatch = await this.#access.match(
-                resolveBSONObject( combinedFilter ) as Filter<DBE>,
-                { operation: 'delete', method: 'deleteMany', access }
-            );
+            const { finalMatch, targetIds } = await this.#resolveFilterMatch( idsOrFilter, 'delete', 'deleteMany', options?.access );
 
             if( !finalMatch ){ return 0 }
 

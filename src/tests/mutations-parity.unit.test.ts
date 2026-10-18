@@ -673,4 +673,92 @@ describe( 'Unit U6: Symmetric Root & Property Mutations, Cache Invalidation & Bu
         expect( propAggregate ).toHaveBeenCalledOnce();
         expect( events ).toContain( 'prop:cache:hit' );
     });
+
+    test( 'updateOne documentBefore/documentAfter, not-found, empty arrays, and denied access on Root & Property models', async() =>
+    {
+        const id1 = new ObjectId();
+        const findOneAndUpdate = vi.fn( async() => ({ _id: id1, name: 'After', status: 'active' }));
+        const updateOne = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const updateMany = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const deleteMany = vi.fn( async() => ({ deletedCount: 1 }));
+        const aggregate = vi.fn(() => ({ toArray: async() => [] }));
+        const collection = { collectionName: 'users', findOneAndUpdate, updateOne, updateMany, deleteMany, aggregate };
+
+        class RootWithAccess extends AbstractModel<UserDBE, UserDTO, any>
+        {
+            constructor()
+            {
+                super( new TestModels(), collection as any,
+                {
+                    cache : true,
+                    access:
+                    {
+                        filters  : { allow: () => ({}), deny: () => false },
+                        defaults : { update: 'allow', delete: 'allow' }
+                    },
+                    converters:
+                    {
+                        dto : { converter: dbe => ({ id: this.dtoID( dbe._id ), name: dbe.name, status: dbe.status }) },
+                        dbe : { converter: dbe => dbe }
+                    }
+                });
+            }
+        }
+
+        class PropWithAccess extends AbstractPropertyModel<UserDBE, StageItemDBE, StageItemDTO, any>
+        {
+            constructor()
+            {
+                super( new TestModels(), collection as any, 'stages[].items[]',
+                {
+                    cache : true,
+                    access:
+                    {
+                        filters  : { allow: () => ({}), deny: () => false },
+                        defaults : { update: 'allow', delete: 'allow' }
+                    },
+                    converters:
+                    {
+                        dto : { converter: dbe => ({ id: this.dtoID( dbe.id ), label: dbe.label, status: dbe.status }) },
+                        dbe : { converter: dbe => dbe }
+                    }
+                });
+            }
+        }
+
+        const root = new RootWithAccess();
+        const prop = new PropWithAccess();
+
+        // Root updateOne with documentAfter & documentBefore
+        const resAfter = await root.updateOne({ status: 'draft' }, { name: 'After' }, { documentAfter: true });
+        expect( resAfter.matchedCount ).toBe( 1 );
+        expect( resAfter.documentAfter?.name ).toBe( 'After' );
+
+        const resBefore = await root.updateOne({ status: 'draft' }, { name: 'After' }, { documentBefore: true });
+        expect( resBefore.documentBefore?.name ).toBe( 'After' );
+
+        // Root updateOne / updateMany / deleteMany denied and empty array
+        expect( await root.updateOne({ status: 'draft' }, { name: 'X' }, { access: 'deny' })).toEqual({ matchedCount: 0, modifiedCount: 0 });
+        expect( await root.updateMany([], { name: 'X' })).toEqual({ matchedCount: 0, modifiedCount: 0 });
+        expect( await root.updateMany([ id1 ], { name: 'X' }, { access: 'deny' })).toEqual({ matchedCount: 0, modifiedCount: 0 });
+        expect( await root.updateMany({ status: 'draft' }, { name: 'X' }, { access: 'deny' })).toEqual({ matchedCount: 0, modifiedCount: 0 });
+        expect( await root.deleteMany([])).toBe( 0 );
+        expect( await root.deleteMany([ id1 ])).toBe( 1 );
+        expect( await root.deleteMany([ id1 ], { access: 'deny' })).toBe( 0 );
+        expect( await root.deleteMany({ status: 'draft' }, { access: 'deny' })).toBe( 0 );
+
+        // Property updateOne direct single ID, not-found filter, and denied access
+        expect( await prop.updateOne({ id: id1 }, { status: 'done' })).toEqual({ matchedCount: 1, modifiedCount: 1 });
+        expect( await prop.updateOne({ status: 'missing' }, { status: 'done' })).toEqual({ matchedCount: 0, modifiedCount: 0 });
+        expect( await prop.updateOne({ status: 'draft' }, { status: 'done' }, { access: 'deny' })).toEqual({ matchedCount: 0, modifiedCount: 0 });
+
+        // Property updateMany & deleteMany empty array, ID array, not-found filter, and denied access
+        expect( await prop.updateMany([], { status: 'done' })).toEqual({ matchedRootCount: 0, modifiedRootCount: 0 });
+        expect( await prop.updateMany([ id1 ], { status: 'done' }, { access: 'deny' })).toEqual({ matchedRootCount: 0, modifiedRootCount: 0 });
+        expect( await prop.deleteMany([])).toBe( 0 );
+        expect( await prop.deleteMany([ id1 ])).toBe( 1 );
+        expect( await prop.deleteMany([ id1 ], { access: 'deny' })).toBe( 0 );
+        expect( await prop.deleteMany({ status: 'missing' })).toBe( 0 );
+    });
 });
+

@@ -7,11 +7,13 @@ export class ConverterManager<DBE extends Document>
 {
     #model: object;
     #converters: AbstractModelConverters<DBE>;
+    #onError?: ( error: unknown, operation?: string ) => void;
 
-    constructor( model: object, converters: AbstractModelConverters<DBE> )
+    constructor( model: object, converters: AbstractModelConverters<DBE>, onError?: ( error: unknown, operation?: string ) => void )
     {
         this.#model = model;
         this.#converters = converters;
+        this.#onError = onError;
     }
 
     get converters()
@@ -26,7 +28,16 @@ export class ConverterManager<DBE extends Document>
 
     async convert( dbe: DBE, conversion: string | number | symbol )
     {
-        return convert( this.#model, this.#converters[conversion as keyof AbstractModelConverters<DBE>].converter, dbe, conversion );
+        try
+        {
+            return await convert( this.#model, this.#converters[conversion as keyof AbstractModelConverters<DBE>].converter, dbe, conversion );
+        }
+        catch( e )
+        {
+            this.#onError?.( e, `convert:${String( conversion )}` );
+
+            throw e;
+        }
     }
 
     async convertMany( documents: Array<DBE | null>, conversion: string | number | symbol )

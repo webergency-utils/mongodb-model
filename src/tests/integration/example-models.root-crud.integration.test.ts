@@ -347,4 +347,41 @@ describe( 'example models root CRUD (real MongoDB)', () =>
             ).rejects.toMatchObject({ code: 'MODEL_ACCESS_DENIED' });
         });
     });
+
+    test( 'createMany, exists, and deleteMany work on root models', async() =>
+    {
+        await withAuth( models, { role: 'admin' }, async() =>
+        {
+            const now = Date.now();
+            const ids = await models.jobs.createMany(
+            [
+                {
+                    title           : 'Batch Job 1',
+                    status          : 'draft',
+                    organizationID  : seed.acmeId,
+                    tags            : [ 'batch' ],
+                    applications    : [],
+                    events          : { created: now, updated: now }
+                } as any,
+                {
+                    title           : 'Batch Job 2',
+                    status          : 'draft',
+                    organizationID  : seed.acmeId,
+                    tags            : [ 'batch' ],
+                    applications    : [],
+                    events          : { created: now, updated: now }
+                } as any
+            ]);
+
+            expect( ids ).toHaveLength( 2 );
+            expect( await models.jobs.exists( ids[0] ) ).toBe( true );
+            expect( await models.jobs.exists({ tags: 'batch' } as any ) ).toBe( true );
+
+            const deletedCount = await models.jobs.deleteMany( ids );
+
+            expect( deletedCount ).toBe( 2 );
+            expect( await models.jobs.exists( ids[0] ) ).toBe( false );
+            expect( await models.jobs.exists( ids[1] ) ).toBe( false );
+        });
+    });
 });

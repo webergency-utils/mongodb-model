@@ -313,4 +313,40 @@ describe( 'example models property ApplicationModel (real MongoDB)', () =>
             expect( ops.length ).toBe( mid );
         });
     });
+
+    test( 'createMany, updateOne, exists, delete, and deleteMany work on property models', async() =>
+    {
+        await withAuth( models, { role: 'admin' }, async() =>
+        {
+            const now = Date.now();
+            const createdIds = await models.applications.createMany(
+                seed.platformJobId.toString(),
+                [
+                    { candidateName: 'Batch App 1', status: 'new', created: now } as any,
+                    { candidateName: 'Batch App 2', status: 'new', created: now + 1 } as any
+                ]
+            );
+
+            expect( createdIds ).toHaveLength( 2 );
+            expect( await models.applications.exists( createdIds[0] ) ).toBe( true );
+
+            const updRes = await models.applications.updateOne(
+                { id: createdIds[0] } as any,
+                { status: 'review' } as any
+            );
+
+            expect( updRes.matchedCount ).toBe( 1 );
+            expect( updRes.modifiedCount ).toBe( 1 );
+
+            const deletedFirst = await models.applications.delete( createdIds[0] );
+
+            expect( deletedFirst ).toBe( true );
+            expect( await models.applications.exists( createdIds[0] ) ).toBe( false );
+
+            const deletedRemaining = await models.applications.deleteMany([ createdIds[1] ]);
+
+            expect( deletedRemaining ).toBe( 1 );
+            expect( await models.applications.exists( createdIds[1] ) ).toBe( false );
+        });
+    });
 });

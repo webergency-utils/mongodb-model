@@ -61,9 +61,22 @@ import
     toUpdateOperations
 }
 from './helpers/index.js';
-import { isForeignObjectIdLike, isLibraryObjectId, propertyModelTargetUpdateParams } from './helpers/mongo.js';
+import { propertyModelTargetUpdateParams } from './helpers/mongo.js';
 import { AbstractModels } from './models.js';
-import { attachListMetadata, convertDocuments } from './operations.js';
+import
+{
+    attachCursorToItem,
+    attachListMetadata,
+    attachPropertyUpdateMetadata,
+    buildPropertyDeleteOperation,
+    convertDocuments,
+    normalizeExistsOptions,
+    normalizeFindMatch,
+    normalizeGetManyOptions,
+    normalizeGetOptions,
+    resolveCreateFromArgs
+}
+from './operations.js';
 import { PipelineBuilder } from './pipeline-builder.js';
 import { ComputedPropertyResolver, SmartFilterResolver } from './resolvers.js';
 import { GET_OBSERVABILITY_OPTIONS, GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
@@ -92,7 +105,6 @@ import
     PropertyModelListOptions,
     PropertyModelStreamOptions,
     PropertyModelUpdateResponse,
-    SecondType,
     WithTotal
 }
 from './types/external.js';
@@ -136,7 +148,7 @@ export abstract class AbstractPropertyModel
         this.#prefix = this.#paths.map( p => p.path ).join( '.' );
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this.smartFilters = params.smartFilters;
-        this.#converters = new ConverterManager( this, this.converters );
+        this.#converters = new ConverterManager( this, this.converters, ( err, op ) => this.#emitError( err, op ));
         this.#access = new AccessControl(
         {
             model            : this,
@@ -393,7 +405,7 @@ export abstract class AbstractPropertyModel
     }
 
     protected async pipeline<K extends keyof Extensions['converters']>(
-        options: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> & { computedProperties?: ComputedPropertiesParam<SecondType<ExtractComputedProperties<Extensions>>> } = {},
+        options: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>> = {},
         conversion?: K,
         method: string = 'list'
     ): Promise<Document[]>
@@ -565,71 +577,19 @@ export abstract class AbstractPropertyModel
     {
         return this.runOperation( async() =>
         {
-            const isCreateOpts = ( v: unknown ): v is ModelCreateOptions =>
-                typeof v === 'object'
-                && v !== null
-                && !Array.isArray( v )
-                && !isLibraryObjectId( v )
-                && !isForeignObjectIdLike( v )
-                && ( 'duplicateIgnore' in v || 'access' in v );
-
-            const fromMap = this.converters.from;
-            let fromKey: string | undefined;
-            let explicitId: DTO['id'] | undefined;
-            let resolvedOptions: ModelCreateOptions | undefined;
-
-            if( isCreateOpts( fromKeyOrId ) )
-            {
-                resolvedOptions = fromKeyOrId;
-            }
-            else if( typeof fromKeyOrId === 'string' && fromMap && fromKeyOrId in fromMap )
-            {
-                fromKey = fromKeyOrId;
-
-                if( isCreateOpts( idOrOptions ) )
-                {
-                    resolvedOptions = idOrOptions;
-                }
-                else
-                {
-                    explicitId = idOrOptions as DTO['id'] | undefined;
-                    resolvedOptions = options;
-                }
-            }
-            else if(
-                typeof fromKeyOrId === 'string'
-                && (
-                    ( idOrOptions !== undefined && !isCreateOpts( idOrOptions ))
-                    || options !== undefined
-                    || !fromMap
-                    || ( !( 'default' in fromMap ) && ( Object.keys( fromMap ).length !== 1 || !ObjectId.isValid( fromKeyOrId )))
-                )
-            )
-            {
-                fromKey = fromKeyOrId;
-
-                if( isCreateOpts( idOrOptions ) )
-                {
-                    resolvedOptions = idOrOptions;
-                }
-                else
-                {
-                    explicitId = idOrOptions as DTO['id'] | undefined;
-                    resolvedOptions = options;
-                }
-            }
-            else
-            {
-                explicitId = fromKeyOrId as DTO['id'] | undefined;
-                resolvedOptions = isCreateOpts( idOrOptions ) ? idOrOptions : options;
-            }
+            const { fromKey, explicitId, resolvedOptions } = resolveCreateFromArgs<DTO['id']>(
+                this.converters.from as Record<string, unknown> | undefined,
+                fromKeyOrId,
+                idOrOptions,
+                options
+            );
 
             const start = Date.now();
             let dbe: Omit<DBE, 'id'> & { id?: DBE['id'] };
 
             try
             {
-                dbe = await this.#converters.convertFrom( data, fromKey ) as Omit<DBE, 'id'> & { id?: DBE['id'] };
+                dbe = await this.#converters.convertFrom( data, fromKey ) as unknown as Omit<DBE, 'id'> & { id?: DBE['id'] };
             }
             catch( e )
             {
@@ -776,39 +736,6 @@ export abstract class AbstractPropertyModel
         }
     }
 
-    #normalizePropertyFindMatch(
-        match: PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
-        optionsAccess?: string
-    ): PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>
-    {
-        if(
-            match
-            && typeof match === 'object'
-            && !Array.isArray( match )
-            && !isLibraryObjectId( match )
-            && !isForeignObjectIdLike( match )
-            && (
-                'filter' in match
-                || 'smartFilter' in match
-                || ( 'access' in match && Object.keys( match ).every( k => k === 'filter' || k === 'smartFilter' || k === 'access' ))
-            )
-        )
-        {
-            const opts = match as PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>;
-
-            return {
-                filter      : ( opts.filter ?? {} ) as PropertyModelFilter<RootDBE, DBE>,
-                smartFilter : opts.smartFilter,
-                access      : optionsAccess ?? opts.access
-            };
-        }
-
-        return {
-            filter : ( match ?? {} ) as PropertyModelFilter<RootDBE, DBE>,
-            access : optionsAccess
-        };
-    }
-
     async #findMatchingSubdocIds(
         findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
         accessFilter?: Filter<any>,
@@ -837,6 +764,29 @@ export abstract class AbstractPropertyModel
         return docs.map( d => d.id ).filter( id => id !== undefined );
     }
 
+    async #resolveBatchTargetIds(
+        idsOrFilter: DBE['id'][] | DTO['id'][] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
+        findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> | undefined,
+        accessFilter?: Filter<any>
+    ): Promise<{ targetIds: Array<DBE['id'] | DTO['id']>, cacheIdsToInvalidate: Array<DBE['id'] | DTO['id']> | null }>
+    {
+        if( Array.isArray( idsOrFilter ) )
+        {
+            return { targetIds: idsOrFilter, cacheIdsToInvalidate: idsOrFilter };
+        }
+
+        const extracted = extractTargetIdsFromFilter( idsOrFilter, 'id', id => String( this.dtoID( id )));
+        const filterKeys = Object.keys( findOptions!.filter ?? {});
+        const isOnlyIdFilter = Boolean( extracted && !findOptions!.smartFilter && filterKeys.every( k => k === 'id' ));
+
+        return {
+            cacheIdsToInvalidate    : extracted,
+            targetIds               : isOnlyIdFilter
+                ? extracted!
+                : await this.#findMatchingSubdocIds( findOptions!, accessFilter )
+        };
+    }
+
     public async updateOne(
         match: PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
         update: Partial<DBE> | UpdateFilter<DBE>,
@@ -845,20 +795,12 @@ export abstract class AbstractPropertyModel
     {
         return this.runOperation( async() =>
         {
-            const findOptions = this.#normalizePropertyFindMatch( match, options?.access );
+            const findOptions = normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( match, options?.access );
             const access = await this.#access.resolveOrDeny({ operation: 'update', method: 'updateOne', access: findOptions.access });
 
             if( access.denied )
             {
-                const empty = { matchedCount: 0, modifiedCount: 0 } as PropertyModelUpdateResponse<DBE> & { matchedCount: number, modifiedCount: number };
-
-                Object.defineProperties( empty,
-                {
-                    matchedRootCount    : { value: 0, enumerable: false, writable: true, configurable: true },
-                    modifiedRootCount   : { value: 0, enumerable: false, writable: true, configurable: true }
-                });
-
-                return empty;
+                return attachPropertyUpdateMetadata<DBE>({ matchedCount: 0, modifiedCount: 0 });
             }
 
             const targetIds = extractTargetIdsFromFilter( match, 'id', id => String( this.dtoID( id )));
@@ -888,15 +830,7 @@ export abstract class AbstractPropertyModel
 
                 this.#emitMutation( 'updateOne', 0, { matchedCount: 0, modifiedCount: 0, ids: targetIds ?? undefined });
 
-                const empty = { matchedCount: 0, modifiedCount: 0 } as PropertyModelUpdateResponse<DBE> & { matchedCount: number, modifiedCount: number };
-
-                Object.defineProperties( empty,
-                {
-                    matchedRootCount    : { value: 0, enumerable: false, writable: true, configurable: true },
-                    modifiedRootCount   : { value: 0, enumerable: false, writable: true, configurable: true }
-                });
-
-                return empty;
+                return attachPropertyUpdateMetadata<DBE>({ matchedCount: 0, modifiedCount: 0 });
             }
 
             const res = await this.update( targetId, update, { ...options, access: findOptions.access });
@@ -906,22 +840,13 @@ export abstract class AbstractPropertyModel
                 this.#invalidateCache( targetIds );
             }
 
-            const out: any =
+            return attachPropertyUpdateMetadata<DBE>(
             {
                 matchedCount    : res.matchedRootCount,
-                modifiedCount   : res.modifiedRootCount
-            };
-
-            if( res.documentBefore !== undefined ){ out.documentBefore = res.documentBefore }
-            if( res.documentAfter !== undefined ){ out.documentAfter = res.documentAfter }
-
-            Object.defineProperties( out,
-            {
-                matchedRootCount    : { value: res.matchedRootCount, enumerable: false, writable: true, configurable: true },
-                modifiedRootCount   : { value: res.modifiedRootCount, enumerable: false, writable: true, configurable: true }
+                modifiedCount   : res.modifiedRootCount,
+                documentBefore  : res.documentBefore,
+                documentAfter   : res.documentAfter
             });
-
-            return out;
         });
     }
 
@@ -937,7 +862,7 @@ export abstract class AbstractPropertyModel
         {
             const path = this.#paths.map( p => p.path ).join( '.' ) + '.id';
             const isIdArray = Array.isArray( idsOrFilter );
-            const findOptions = !isIdArray ? this.#normalizePropertyFindMatch( idsOrFilter, options?.access ) : undefined;
+            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options?.access ) : undefined;
             const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
 
             const access = await this.#access.resolveOrDeny({ operation: 'update', method: 'updateMany', access: effectiveAccess });
@@ -947,25 +872,7 @@ export abstract class AbstractPropertyModel
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
 
-            let targetIdsToUpdate: Array<DBE['id'] | DTO['id']>;
-            let cacheIdsToInvalidate: Array<DBE['id'] | DTO['id']> | null;
-
-            if( isIdArray )
-            {
-                targetIdsToUpdate = idsOrFilter;
-                cacheIdsToInvalidate = idsOrFilter;
-            }
-            else
-            {
-                const extracted = extractTargetIdsFromFilter( idsOrFilter, 'id', id => String( this.dtoID( id )));
-                const filterKeys = Object.keys( findOptions!.filter ?? {});
-                const isOnlyIdFilter = Boolean( extracted && !findOptions!.smartFilter && filterKeys.every( k => k === 'id' ));
-
-                cacheIdsToInvalidate = extracted;
-                targetIdsToUpdate = isOnlyIdFilter
-                    ? extracted!
-                    : await this.#findMatchingSubdocIds( findOptions!, access.filter );
-            }
+            const { targetIds: targetIdsToUpdate, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds( idsOrFilter, findOptions, access.filter );
 
             if( targetIdsToUpdate.length === 0 )
             {
@@ -1049,23 +956,14 @@ export abstract class AbstractPropertyModel
     {
         if( Array.isArray( idOrIds ) )
         {
-            const manyOptions: GetManyOptions<K> =
-                optionsOrConversion !== undefined && ( typeof optionsOrConversion !== 'object' || optionsOrConversion === null )
-                    ? { as: optionsOrConversion as K, filter: filtered }
-                    : { ...( optionsOrConversion as GetManyOptions<K> | undefined ), ...( filtered !== undefined ? { filter: filtered } : {} ) };
-
-            return this.getMany( idOrIds, manyOptions );
+            return this.getMany( idOrIds, normalizeGetManyOptions<K>( optionsOrConversion as GetManyOptions<K> | K, filtered ));
         }
 
         const release = this.trackOperation();
 
         try
         {
-            const options: GetOptions<K> =
-                optionsOrConversion !== undefined && ( typeof optionsOrConversion !== 'object' || optionsOrConversion === null )
-                    ? { as: optionsOrConversion as K }
-                    : ( optionsOrConversion ?? {} );
-
+            const options = normalizeGetOptions<K>( optionsOrConversion as GetOptions<K> | K );
             const conversion = ( options.as ?? 'dto' ) as K;
             const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'get', access: options.access });
 
@@ -1138,11 +1036,7 @@ export abstract class AbstractPropertyModel
 
         try
         {
-            const options: GetManyOptions<K> =
-                optionsOrConversion !== undefined && ( typeof optionsOrConversion !== 'object' || optionsOrConversion === null )
-                    ? { as: optionsOrConversion as K, filter: filtered }
-                    : { ...( optionsOrConversion as GetManyOptions<K> | undefined ), ...( filtered !== undefined ? { filter: filtered } : {} ) };
-
+            const options = normalizeGetManyOptions<K>( optionsOrConversion, filtered );
             const conversion = ( options.as ?? 'dto' ) as K;
             const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'getMany', access: options.access });
 
@@ -1355,18 +1249,7 @@ export abstract class AbstractPropertyModel
         {
             const dto = await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
 
-            if( dto && typeof dto === 'object' )
-            {
-                Object.defineProperty( dto, '$cursor',
-                {
-                    value        : getCursor( dbe, sort ),
-                    enumerable   : false,
-                    writable     : true,
-                    configurable : true
-                });
-            }
-
-            return dto;
+            return attachCursorToItem( dto, dbe, sort );
         }));
         const converterDuration = Date.now() - convStart;
 
@@ -1559,42 +1442,12 @@ export abstract class AbstractPropertyModel
     {
         return this.runOperation( async() =>
         {
-            let findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>;
-
-            if( idOrFilter === undefined || idOrFilter === null )
-            {
-                findOptions = { filter: {} as PropertyModelFilter<RootDBE, DBE>, access: options?.access };
-            }
-            else if(
-                typeof idOrFilter === 'string'
-                || typeof idOrFilter === 'number'
-                || isLibraryObjectId( idOrFilter )
-                || isForeignObjectIdLike( idOrFilter )
-            )
-            {
-                findOptions =
-                {
-                    filter : { id: this.dbeID( idOrFilter as DTO['id'] ) } as PropertyModelFilter<RootDBE, DBE>,
-                    access : options?.access
-                };
-            }
-            else if(
-                typeof idOrFilter === 'object'
-                && (
-                    'filter' in idOrFilter
-                    || 'smartFilter' in idOrFilter
-                    || ( 'access' in idOrFilter && Object.keys( idOrFilter ).every( k => k === 'filter' || k === 'smartFilter' || k === 'access' ))
-                )
-            )
-            {
-                const opts = idOrFilter as PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>;
-
-                findOptions = { ...opts, access: options?.access ?? opts.access };
-            }
-            else
-            {
-                findOptions = { filter: idOrFilter as PropertyModelFilter<RootDBE, DBE>, access: options?.access };
-            }
+            const findOptions = normalizeExistsOptions<PropertyModelFilter<RootDBE, DBE>>(
+                idOrFilter,
+                'id',
+                id => this.dbeID( id ),
+                options?.access
+            );
 
             const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'exists', access: findOptions.access });
 
@@ -1650,28 +1503,7 @@ export abstract class AbstractPropertyModel
                 ? { $and: [{ [path]: dbeId }, addPrefixToFilter( access.filter as any, this.#prefix ) ] } as any
                 : { [path]: dbeId } as Filter<RootDBE>;
 
-            const leaf = this.#paths[this.#paths.length - 1];
-            let operations: UpdateFilter<RootDBE>;
-            let updateOptions: UpdateOptions = {};
-
-            if( leaf.array )
-            {
-                const ancestorPrefix = this.#paths.slice( 0, -1 ).map( p => p.path + ( p.array ? '.$[]' : '' )).join( '.' );
-                const pullPath = ( ancestorPrefix ? ancestorPrefix + '.' : '' ) + leaf.path;
-
-                operations = { $pull: { [pullPath]: { id: dbeId } } } as unknown as UpdateFilter<RootDBE>;
-            }
-            else
-            {
-                const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, dbeId );
-
-                operations = { $unset: { [updatePrefix]: '' } } as unknown as UpdateFilter<RootDBE>;
-
-                if( arrayFilters )
-                {
-                    updateOptions = { arrayFilters };
-                }
-            }
+            const { operations, updateOptions } = buildPropertyDeleteOperation<RootDBE>( this.#paths, dbeId );
 
             const start = Date.now();
             const res = await this.collection.updateOne(
@@ -1701,7 +1533,7 @@ export abstract class AbstractPropertyModel
         return this.runOperation( async() =>
         {
             const isIdArray = Array.isArray( idsOrFilter );
-            const findOptions = !isIdArray ? this.#normalizePropertyFindMatch( idsOrFilter, options?.access ) : undefined;
+            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options?.access ) : undefined;
             const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
 
             const access = await this.#access.resolveOrDeny({ operation: 'delete', method: 'deleteMany', access: effectiveAccess });
@@ -1711,25 +1543,7 @@ export abstract class AbstractPropertyModel
                 return 0;
             }
 
-            let targetIdsToDelete: Array<DBE['id'] | DTO['id']>;
-            let cacheIdsToInvalidate: Array<DBE['id'] | DTO['id']> | null;
-
-            if( isIdArray )
-            {
-                targetIdsToDelete = idsOrFilter;
-                cacheIdsToInvalidate = idsOrFilter;
-            }
-            else
-            {
-                const extracted = extractTargetIdsFromFilter( idsOrFilter, 'id', id => String( this.dtoID( id )));
-                const filterKeys = Object.keys( findOptions!.filter ?? {});
-                const isOnlyIdFilter = Boolean( extracted && !findOptions!.smartFilter && filterKeys.every( k => k === 'id' ));
-
-                cacheIdsToInvalidate = extracted;
-                targetIdsToDelete = isOnlyIdFilter
-                    ? extracted!
-                    : await this.#findMatchingSubdocIds( findOptions!, access.filter );
-            }
+            const { targetIds: targetIdsToDelete, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds( idsOrFilter, findOptions, access.filter );
 
             if( targetIdsToDelete.length === 0 )
             {
@@ -1749,28 +1563,7 @@ export abstract class AbstractPropertyModel
                 ? { $and: [{ [path]: { $in: dbeIds } }, addPrefixToFilter( access.filter as any, this.#prefix ) ] } as any
                 : { [path]: { $in: dbeIds } } as Filter<RootDBE>;
 
-            const leaf = this.#paths[this.#paths.length - 1];
-            let operations: UpdateFilter<RootDBE>;
-            let updateOptions: UpdateOptions = {};
-
-            if( leaf.array )
-            {
-                const ancestorPrefix = this.#paths.slice( 0, -1 ).map( p => p.path + ( p.array ? '.$[]' : '' )).join( '.' );
-                const pullPath = ( ancestorPrefix ? ancestorPrefix + '.' : '' ) + leaf.path;
-
-                operations = { $pull: { [pullPath]: { id: { $in: dbeIds } } } } as unknown as UpdateFilter<RootDBE>;
-            }
-            else
-            {
-                const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, { $in: dbeIds });
-
-                operations = { $unset: { [updatePrefix]: '' } } as unknown as UpdateFilter<RootDBE>;
-
-                if( arrayFilters )
-                {
-                    updateOptions = { arrayFilters };
-                }
-            }
+            const { operations, updateOptions } = buildPropertyDeleteOperation<RootDBE>( this.#paths, { $in: dbeIds });
 
             const start = Date.now();
             const res = await this.collection.updateMany(
@@ -1796,7 +1589,7 @@ export abstract class AbstractPropertyModel
         });
     }
 
-    async #filterStages( list: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>, method: string = 'list' )
+    async #filterStages( list: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>, method: string = 'list' )
     {
         const sort = list.sort ?? { id: -1 };
         const access = await this.#access.resolveOrDeny({ operation: 'read', method, access: list.access });
