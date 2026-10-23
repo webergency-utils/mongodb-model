@@ -1,5 +1,5 @@
 import { AbstractModels } from '@webergency-utils/mongodb-model';
-import type { MongoClientOptions } from '@webergency-utils/mongodb-model';
+import type { ModelsOptions } from '@webergency-utils/mongodb-model';
 import { OrganizationModel } from './models/organization/index.js';
 import { JobModel } from './models/job/index.js';
 import { ApplicationModel } from './models/application/index.js';
@@ -13,7 +13,7 @@ export class ExampleModels extends AbstractModels
     public jobs             : JobModel;
     public applications     : ApplicationModel;
 
-    constructor( connectionString: string, dbName: string = 'example', options?: MongoClientOptions )
+    constructor( connectionString: string, dbName: string = 'example', options?: ModelsOptions )
     {
         super( connectionString, options );
 

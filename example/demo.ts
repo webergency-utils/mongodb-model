@@ -4,19 +4,43 @@
  *   MONGODB_URI=mongodb://127.0.0.1:27017 npx tsx --tsconfig example/tsconfig.json example/demo.ts
  *
  * Demonstrates: converters, smartFilters, computedProperties, named access, property model,
- * cursor pagination (`list` → `cursors`), and `stream` (async generator).
+ * cursor pagination (`list` → `cursors`), `stream` (async generator), mutation-only observability
+ * with 3-tier `context` + `traceID`, `ModelCache`, and functional `defineModel` / `definePropertyModel`.
  *
  * Access policies read `auth` from Flow scope — use `models.scope.execute(fn, { auth })`.
  */
 
-import { ObjectId } from '@webergency-utils/mongodb-model';
+import { ObjectId, defineModel, definePropertyModel } from '@webergency-utils/mongodb-model';
 import { ExampleModels } from './index.js';
-import type { ExampleAuth } from './types.js';
+import type { ExampleAuth, JobApplicationDBE, JobApplicationDTO, JobDBE, JobDTO } from './types.js';
 
 async function main()
 {
     const uri = process.env.MONGODB_URI ?? 'mongodb://127.0.0.1:27017';
-    const models = new ExampleModels( uri, 'mongodb_model_example' );
+    const models = new ExampleModels( uri, 'mongodb_model_example',
+    {
+        observability:
+        {
+            operations  : [ 'mutation' ],
+            slowQueryMs : 100,
+            context     : [ 'auth' ]
+        }
+    });
+
+    models.on( 'mutation', ( event ) =>
+    {
+        console.log( '[mutation]', event.collection, event.operation, {
+            ids     : event.ids,
+            parentID: event.parentID,
+            traceID : event.traceID,
+            context : event.context
+        });
+    });
+
+    models.on( 'slowQuery', ( event ) =>
+    {
+        console.warn( '[slowQuery]', event.collection, event.operation, `${event.duration}ms`, 'query' in event ? event.query : undefined );
+    });
 
     const orgId = new ObjectId();
     const now = Date.now();
@@ -168,7 +192,60 @@ async function main()
         }, 'listItemDTO' );
 
         console.log( 'organizations', orgs.items );
-    }, { auth: { role: 'employer', orgId: orgId.toString() } satisfies ExampleAuth });
+
+        // Mutations emit `mutation` events with merged 3-tier context (observability.context + scope.context + per-call context)
+        await models.applications.create(
+            jobId.toString(),
+            { candidateName: 'Alan Turing', status: 'new', created: Date.now() },
+            'app-3',
+            { context: { source: 'career-portal' } }
+        );
+
+        await models.jobs.update(
+            jobId.toString(),
+            { title: 'Principal Staff Engineer' },
+            { documentBefore: true, documentAfter: true, context: { reason: 'title-refresh' } }
+        );
+    }, {
+        auth    : { role: 'employer', orgId: orgId.toString() } satisfies ExampleAuth,
+        traceID : 'req-demo-1',
+        context : { route: 'POST /jobs/:id/applications' }
+    });
+
+    // Functional defineModel / definePropertyModel with built-in ModelCache
+    const quickJobs = defineModel<JobDBE, JobDTO>( models, models.jobs.collection,
+    {
+        cache       : { ttl: 60_000, maxSize: 100 },
+        converters  :
+        {
+            dto :
+            {
+                custom: ( dbe: JobDBE ): JobDTO => (
+                {
+                    id                  : String( dbe._id ),
+                    title               : dbe.title,
+                    status              : dbe.status,
+                    organizationID      : String( dbe.organizationID ),
+                    tags                : dbe.tags,
+                    applicationCount    : dbe.applications.length,
+                    events              : dbe.events
+                })
+            }
+        }
+    });
+    const quickApps = definePropertyModel<JobDBE, JobApplicationDBE, JobApplicationDTO>( models, models.jobs.collection,
+    {
+        path        : 'applications[]',
+        cache       : { ttl: 60_000, maxSize: 100 },
+        converters  :
+        {
+            dto : { custom: ( dbe: JobApplicationDBE ): JobApplicationDTO => ({ id: String( dbe.id ), candidateName: dbe.candidateName, status: dbe.status, created: dbe.created }) }
+        }
+    });
+
+    const cachedJob = await quickJobs.get( jobId );
+    const cachedApp = await quickApps.get( 'app-3' );
+    console.log( 'cached functional models', { cachedJob, cachedApp });
 
     await models.shutdown({ timeout: 5000 });
 }

@@ -9,6 +9,9 @@ Self-contained sample domain (organizations → jobs → embedded applications) 
 - Property models (`applications[]` on jobs)
 - Cursor pagination (`list` → `cursors.next` / `cursors.prev`)
 - Streaming (`stream` async generator; root + property models)
+- Mutation-only observability (`operations: ['mutation']`) with 3-tier `context` + `traceID` + `slowQueryMs`
+- Built-in `ModelCache` (`cache: { ttl, maxSize }`) and automatic collection invalidation
+- Functional `defineModel` / `definePropertyModel` definitions alongside class-based models
 - `AbstractModels` registry + `scope` auth + `shutdown`
 
 ## Layout
@@ -93,6 +96,39 @@ for await( const job of models.jobs.stream({ smartFilter: { byOrganization: orgI
 {
     // process one converted job at a time
 }
+```
+
+**Mutation-only observability with 3-tier `context` & `slowQueryMs`:**
+
+```ts
+const models = new ExampleModels( uri, 'app',
+{
+    observability:
+    {
+        operations  : [ 'mutation' ],
+        slowQueryMs : 100,
+        context     : [ 'auth' ],
+        onMutation  : ( event ) => console.log( event.operation, event.ids, event.context, event.traceID )
+    }
+});
+
+await models.scope.execute( async() =>
+{
+    await models.jobs.update( jobId, { title: 'Principal Engineer' }, { context: { reason: 'promotion' } });
+}, { auth: { role: 'employer', orgId }, traceID: 'req-42', context: { route: 'PATCH /jobs/:id' } });
+```
+
+**Functional `defineModel` / `definePropertyModel` with `ModelCache`:**
+
+```ts
+const quickJobs = defineModel<JobDBE, JobDTO>( models, db.collection( 'jobs' ),
+{
+    cache       : { ttl: 60_000, maxSize: 100 },
+    converters  :
+    {
+        dto : { custom: ( dbe ) => ({ id: String( dbe._id ), title: dbe.title, status: dbe.status, organizationID: String( dbe.organizationID ), tags: dbe.tags }) }
+    }
+});
 ```
 
 Import paths use the package name `@webergency-utils/mongodb-model` (mapped to `../src` via `example/tsconfig.json`) so the example matches consumer imports. Run typecheck with:
