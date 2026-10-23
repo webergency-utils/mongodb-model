@@ -13,8 +13,10 @@ export type ModelMutationOperation =
     | 'updateOne'
     | 'updateMany'
     | 'upsert'
+    | 'findOneAndUpdate'
     | 'delete'
     | 'deleteMany'
+    | 'findOneAndDelete'
     | 'restore'
     | 'restoreMany'
     | 'hardDelete'
@@ -170,8 +172,10 @@ const ALL_MUTATION_OPS: ModelMutationOperation[] =
     'updateOne',
     'updateMany',
     'upsert',
+    'findOneAndUpdate',
     'delete',
     'deleteMany',
+    'findOneAndDelete',
     'restore',
     'restoreMany',
     'hardDelete',
@@ -179,8 +183,8 @@ const ALL_MUTATION_OPS: ModelMutationOperation[] =
     'bulkWrite'
 ];
 const CREATE_OPS: ModelMutationOperation[] = [ 'create', 'createFrom', 'createMany', 'upsert', 'bulkWrite' ];
-const UPDATE_OPS: ModelMutationOperation[] = [ 'update', 'updateOne', 'updateMany', 'upsert', 'restore', 'restoreMany', 'bulkWrite' ];
-const DELETE_OPS: ModelMutationOperation[] = [ 'delete', 'deleteMany', 'hardDelete', 'hardDeleteMany', 'bulkWrite' ];
+const UPDATE_OPS: ModelMutationOperation[] = [ 'update', 'updateOne', 'updateMany', 'upsert', 'findOneAndUpdate', 'restore', 'restoreMany', 'bulkWrite' ];
+const DELETE_OPS: ModelMutationOperation[] = [ 'delete', 'deleteMany', 'findOneAndDelete', 'hardDelete', 'hardDeleteMany', 'bulkWrite' ];
 const QUERY_OP_SET = new Set<string>( ALL_QUERY_OPS );
 const MUTATION_OP_SET = new Set<string>( ALL_MUTATION_OPS );
 

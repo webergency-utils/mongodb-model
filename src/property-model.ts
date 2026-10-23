@@ -9,7 +9,7 @@ import
 from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { extractTargetIdsFromFilter } from './cache.js';
-import { ModelAccessDeniedError, ModelError } from './errors.js';
+import { ModelAccessDeniedError, ModelError, ModelVersionConflictError } from './errors.js';
 import { ModelMutationOperation } from './events.js';
 import { flowGet } from './flow.js';
 import
@@ -22,6 +22,8 @@ import
     getSubPaths,
     getUsedFields,
     isExclusionProjection,
+    isForeignObjectIdLike,
+    isLibraryObjectId,
     isSet,
     mergeComputedProperties,
     optimizeMatch,
@@ -59,6 +61,8 @@ import
     ModelBulkWriteResult,
     ModelCreateOptions,
     ModelDeleteOptions,
+    ModelFindOneAndDeleteOptions,
+    ModelFindOneAndUpdateOptions,
     ModelUpdateOptions,
     ModelUpsertOptions,
     MongoPropertyDocument,
@@ -129,6 +133,8 @@ extends AbstractBaseModel<
             indexes                     : params.indexes,
             timestamps                  : params.timestamps,
             softDelete                  : params.softDelete,
+            versioning                  : params.versioning,
+            relations                   : params.relations,
             hooks                       : params.hooks,
             idField                     : 'id',
             prefix,
@@ -628,19 +634,22 @@ extends AbstractBaseModel<
         options: ModelUpdateOptions | undefined,
         access: { denied: boolean, filter?: Filter<any> },
         accessVerified: boolean,
-        method: 'update' | 'updateOne' | 'upsert' | 'restore',
+        method: 'update' | 'updateOne' | 'upsert' | 'restore' | 'findOneAndUpdate',
         callerFilter?: { filter?: Document, smartFilter?: Record<string, unknown> },
         includeDeleted: boolean = false
     ): Promise<PropertyModelUpdateResponse<DBE>>
     {
         const path = `${this.#prefix}.id`;
         const dbeId = this.dbeID( id );
+        const expectedVersion = options?.expectedVersion;
+        const versionField = this._versioning?.field ?? 'version';
 
-        if( !accessVerified && this.#hasEffectiveSubdocAccessFilter( access.filter, includeDeleted ) )
+        if( expectedVersion !== undefined || ( !accessVerified && this.#hasEffectiveSubdocAccessFilter( access.filter, includeDeleted )) )
         {
+            const versionConstraint = expectedVersion !== undefined ? { [versionField]: expectedVersion } : {};
             const matchedIds = await this.#findMatchingSubdocIds(
                 {
-                    filter          : { id: dbeId, ...( callerFilter?.filter ?? {} ) } as any,
+                    filter          : { id: dbeId, ...versionConstraint, ...( callerFilter?.filter ?? {} ) } as any,
                     access          : options?.access,
                     context         : options?.context,
                     traceID         : options?.traceID,
@@ -655,6 +664,22 @@ extends AbstractBaseModel<
             if( matchedIds.length === 0 )
             {
                 this._invalidateCache([ id ], false );
+
+                if( expectedVersion !== undefined )
+                {
+                    const conflictErr = new ModelVersionConflictError( this, id, expectedVersion );
+
+                    this._emitError( conflictErr, method, 0,
+                    {
+                        filter      : callerFilter?.filter ?? { [path]: dbeId },
+                        smartFilter : callerFilter?.smartFilter,
+                        context     : options?.context,
+                        traceID     : options?.traceID
+                    });
+
+                    throw conflictErr;
+                }
+
                 this._emitMutation( method, 0,
                 {
                     matchedCount    : 0,
@@ -690,14 +715,14 @@ extends AbstractBaseModel<
 
         const validatedUpdate = method === 'restore'
             ? hookedUpdate
-            : await this._validateWrite(
+            : this._applyUpdateVersioning( await this._validateWrite(
                 hookedUpdate,
                 { operation: 'update', method, id, filter: callerFilter?.filter },
                 start,
                 options,
                 callerFilter?.filter ?? { [path]: dbeId },
                 callerFilter?.smartFilter
-            );
+            ));
 
         const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, dbeId );
         const operations = addPrefixToUpdate<RootDBE, DBE>( validatedUpdate, updatePrefix );
@@ -709,7 +734,7 @@ extends AbstractBaseModel<
 
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
-        const documentBefore = options?.documentBefore ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options ) : undefined;
+        const documentBefore = options?.documentBefore ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options, includeDeleted ) : undefined;
         let res: { matchedCount: number, modifiedCount: number };
 
         try
@@ -737,7 +762,7 @@ extends AbstractBaseModel<
 
         this._invalidateCache([ id ], res.matchedCount > 0 );
 
-        const documentAfter = options?.documentAfter ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options ) : undefined;
+        const documentAfter = options?.documentAfter ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options, includeDeleted ) : undefined;
 
         await this._runAfterHook( 'afterUpdate',
         {
@@ -775,8 +800,9 @@ extends AbstractBaseModel<
         id: DBE['id'] | DTO['id'],
         dbeId: DBE['id'],
         access: { denied: boolean, filter?: Filter<any> },
-        method: 'update' | 'updateOne' | 'upsert' | 'restore',
-        options?: ModelUpdateOptions
+        method: 'update' | 'updateOne' | 'upsert' | 'restore' | 'findOneAndUpdate' | 'findOneAndDelete',
+        options?: ModelUpdateOptions,
+        includeDeleted: boolean = false
     ): Promise<DBE | undefined>
     {
         const { projection } = this.converters.dbe;
@@ -785,7 +811,9 @@ extends AbstractBaseModel<
             filter              : { id: dbeId } as any,
             projection,
             access              : options?.access,
-            [RESOLVED_ACCESS]   : access
+            includeDeleted,
+            [RESOLVED_ACCESS]   : access,
+            [INCLUDE_DELETED]   : includeDeleted
         } as any, 'dbe' as any, 'get' );
 
         pipeline = this._optimizePipeline( pipeline );
@@ -837,7 +865,8 @@ extends AbstractBaseModel<
         findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
         accessFilter?: Filter<any>,
         limit?: number,
-        parentOperation: ModelMutationOperation = 'updateMany'
+        parentOperation: ModelMutationOperation = 'updateMany',
+        sort?: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>['sort']
     ): Promise<Array<DBE['id']>>
     {
         const combinedFilter: PropertyModelFilter<RootDBE, DBE> = accessFilter
@@ -851,6 +880,7 @@ extends AbstractBaseModel<
             filter              : combinedFilter,
             smartFilter         : findOptions.smartFilter as any,
             projection          : { id: 1 },
+            ...( sort ? { sort } : {} ),
             limit,
             access              : findOptions.access,
             includeDeleted      : findOptions.includeDeleted,
@@ -1233,12 +1263,8 @@ extends AbstractBaseModel<
         return this.runOperation( async() =>
         {
             const path = `${this.#prefix}.id`;
-            const isIdArray = Array.isArray( idsOrFilter );
-            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options ) : undefined;
-            const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
-            const effectiveContext = isIdArray ? options?.context : findOptions?.context;
-            const effectiveTraceID = isIdArray ? options?.traceID : findOptions?.traceID;
-            const effectiveSession = isIdArray ? options?.session : findOptions?.session;
+            const findOptions = !Array.isArray( idsOrFilter ) ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options ) : undefined;
+            const { access: effectiveAccess, context: effectiveContext, traceID: effectiveTraceID, session: effectiveSession } = findOptions ?? options ?? {};
 
             const access = await this._access.resolveOrDeny({ operation: 'update', method: 'updateMany', access: effectiveAccess });
 
@@ -1247,12 +1273,18 @@ extends AbstractBaseModel<
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
 
+            const versionField = this._versioning?.field ?? 'version';
+            const versionExtraFilter = options?.expectedVersion !== undefined
+                ? { [versionField]: options.expectedVersion }
+                : undefined;
+
             const { dbeIds, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds(
                 idsOrFilter,
                 findOptions,
                 access.filter,
                 'updateMany',
-                options
+                options,
+                versionExtraFilter
             );
 
             if( dbeIds.length === 0 )
@@ -1260,6 +1292,21 @@ extends AbstractBaseModel<
                 if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
                 {
                     this._invalidateCache( cacheIdsToInvalidate, false );
+                }
+
+                if( options?.expectedVersion !== undefined )
+                {
+                    const conflictErr = new ModelVersionConflictError( this, cacheIdsToInvalidate?.[0], options.expectedVersion );
+
+                    this._emitError( conflictErr, 'updateMany', 0,
+                    {
+                        filter      : findOptions?.filter,
+                        smartFilter : findOptions?.smartFilter as Record<string, unknown>,
+                        context     : effectiveContext,
+                        traceID     : effectiveTraceID
+                    });
+
+                    throw conflictErr;
                 }
 
                 this._emitMutation( 'updateMany', 0,
@@ -1292,14 +1339,14 @@ extends AbstractBaseModel<
                 session
             }, pendingAfterCommit );
 
-            const validatedUpdate = await this._validateWrite(
+            const validatedUpdate = this._applyUpdateVersioning( await this._validateWrite(
                 hookedUpdate,
                 { operation: 'update', method: 'updateMany', ids: cacheIdsToInvalidate ?? dbeIds, filter: findOptions?.filter },
                 start,
                 { ...options, context: effectiveContext, traceID: effectiveTraceID },
                 findOptions?.filter,
                 findOptions?.smartFilter as Record<string, unknown>
-            );
+            ));
 
             const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, { $in: dbeIds });
             const operations = addPrefixToUpdate<RootDBE, DBE>( validatedUpdate, updatePrefix );
@@ -1370,6 +1417,211 @@ extends AbstractBaseModel<
         });
     }
 
+    public async findOneAndUpdate<K extends keyof Extensions['converters'] = 'dto'>(
+        idOrFilter: DTO['id'] | DBE['id'] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
+        update: Partial<DBE> | UpdateFilter<DBE>,
+        options?: ( ModelFindOneAndUpdateOptions<K> & { parentID?: any } ) | K
+    ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
+    {
+        return this.runOperation( async(): Promise<any> =>
+        {
+            const opts: ModelFindOneAndUpdateOptions<K> & { parentID?: any } = options !== undefined && ( typeof options !== 'object' || options === null )
+                ? { as: options as K }
+                : ( options ?? {} );
+            const conversion = ( opts.as ?? 'dto' ) as K;
+            const returnDocument = opts.returnDocument ?? 'after';
+            const isPrimitiveId = typeof idOrFilter === 'string'
+                || typeof idOrFilter === 'number'
+                || isLibraryObjectId( idOrFilter )
+                || isForeignObjectIdLike( idOrFilter );
+
+            const findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> = isPrimitiveId
+                ? {
+                    filter          : { id: this.dbeID( idOrFilter as any ) } as any,
+                    access          : opts.access,
+                    context         : opts.context,
+                    traceID         : opts.traceID,
+                    session         : opts.session,
+                    includeDeleted  : opts.includeDeleted
+                }
+                : normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idOrFilter as any, opts );
+
+            const access = await this._access.resolveOrDeny({ operation: 'update', method: 'findOneAndUpdate', access: findOptions.access });
+
+            if( access.denied ){ return null }
+
+            const matchedIds = await this.#findMatchingSubdocIds(
+                findOptions,
+                access.filter,
+                1,
+                'findOneAndUpdate',
+                opts.sort as any
+            );
+
+            if( matchedIds.length === 0 )
+            {
+                if( opts.expectedVersion !== undefined )
+                {
+                    const conflictErr = new ModelVersionConflictError( this, isPrimitiveId ? idOrFilter : undefined, opts.expectedVersion );
+
+                    this._emitError( conflictErr, 'findOneAndUpdate', 0,
+                    {
+                        filter      : findOptions.filter,
+                        smartFilter : findOptions.smartFilter as Record<string, unknown>,
+                        context     : findOptions.context,
+                        traceID     : findOptions.traceID
+                    });
+
+                    throw conflictErr;
+                }
+
+                if( !opts.upsert ){ return null }
+
+                const parentID = opts.parentID ?? ( findOptions.filter as any )?.['_root._id'];
+                const upserted = await this.upsert(
+                    parentID,
+                    findOptions,
+                    update,
+                    {
+                        access          : findOptions.access,
+                        context         : findOptions.context,
+                        traceID         : findOptions.traceID,
+                        session         : findOptions.session,
+                        documentAfter   : returnDocument === 'after'
+                    }
+                );
+
+                if( returnDocument === 'before' || !upserted.documentAfter )
+                {
+                    return null;
+                }
+
+                const convertedUpsert = await this._converters.convert( upserted.documentAfter, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+
+                if( convertedUpsert && opts.populate )
+                {
+                    await this._hydrateRelations([ convertedUpsert ], opts.populate, { ...findOptions, includeDeleted: opts.includeDeleted });
+                }
+
+                return convertedUpsert;
+            }
+
+            const targetId = matchedIds[0];
+            const res = await this.#updateById(
+                targetId,
+                update,
+                {
+                    ...opts,
+                    access          : findOptions.access,
+                    context         : findOptions.context,
+                    traceID         : findOptions.traceID,
+                    session         : findOptions.session,
+                    documentBefore  : returnDocument === 'before',
+                    documentAfter   : returnDocument === 'after'
+                },
+                access,
+                true,
+                'findOneAndUpdate',
+                { filter: findOptions.filter, smartFilter: findOptions.smartFilter as Record<string, unknown> | undefined },
+                Boolean( opts.includeDeleted )
+            );
+
+            const rawDoc = returnDocument === 'before' ? res.documentBefore : res.documentAfter;
+
+            if( !rawDoc ){ return null }
+
+            const converted = await this._converters.convert( rawDoc, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+
+            if( converted && opts.populate )
+            {
+                await this._hydrateRelations([ converted ], opts.populate, { ...findOptions, includeDeleted: opts.includeDeleted });
+            }
+
+            return converted;
+        });
+    }
+
+    public async findOneAndDelete<K extends keyof Extensions['converters'] = 'dto'>(
+        idOrFilter: DTO['id'] | DBE['id'] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
+        options?: ModelFindOneAndDeleteOptions<K> | K
+    ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
+    {
+        return this.runOperation( async(): Promise<any> =>
+        {
+            const opts: ModelFindOneAndDeleteOptions<K> = options !== undefined && ( typeof options !== 'object' || options === null )
+                ? { as: options as K }
+                : ( options ?? {} );
+            const conversion = ( opts.as ?? 'dto' ) as K;
+            const isSoft = Boolean( this._softDelete && !opts.hard );
+            const includeDeleted = Boolean( opts.includeDeleted || !isSoft );
+            const isPrimitiveId = typeof idOrFilter === 'string'
+                || typeof idOrFilter === 'number'
+                || isLibraryObjectId( idOrFilter )
+                || isForeignObjectIdLike( idOrFilter );
+
+            const findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> = isPrimitiveId
+                ? {
+                    filter          : { id: this.dbeID( idOrFilter as any ) } as any,
+                    access          : opts.access,
+                    context         : opts.context,
+                    traceID         : opts.traceID,
+                    session         : opts.session,
+                    includeDeleted
+                }
+                : { ...normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idOrFilter as any, opts ), includeDeleted };
+
+            const access = await this._access.resolveOrDeny({ operation: 'delete', method: 'findOneAndDelete', access: findOptions.access });
+
+            if( access.denied ){ return null }
+
+            const matchedIds = await this.#findMatchingSubdocIds(
+                findOptions,
+                access.filter,
+                1,
+                'findOneAndDelete',
+                opts.sort as any
+            );
+
+            if( matchedIds.length === 0 ){ return null }
+
+            const targetId = matchedIds[0];
+            const rawDoc = await this.#fetchSubdocSnapshot(
+                targetId,
+                this.dbeID( targetId ),
+                access,
+                'findOneAndDelete',
+                findOptions,
+                includeDeleted
+            );
+
+            let converted: Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null = null;
+
+            if( rawDoc )
+            {
+                converted = await this._converters.convert( rawDoc, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+
+                if( converted && opts.populate )
+                {
+                    await this._hydrateRelations([ converted ], opts.populate, { ...findOptions, includeDeleted });
+                }
+            }
+
+            const deleted = await this.#executeDeleteById(
+                targetId,
+                {
+                    ...opts,
+                    access  : findOptions.access,
+                    context : findOptions.context,
+                    traceID : findOptions.traceID,
+                    session : findOptions.session
+                },
+                'findOneAndDelete'
+            );
+
+            return deleted ? converted : null;
+        });
+    }
+
     public async delete( id: DTO['id'] | DBE['id'], options?: ModelDeleteOptions ): Promise<boolean>
     {
         return this.#executeDeleteById( id, options, options?.hard ? 'hardDelete' : 'delete' );
@@ -1383,7 +1635,7 @@ extends AbstractBaseModel<
     async #executeDeleteById(
         id: DTO['id'] | DBE['id'],
         options: ModelDeleteOptions | undefined,
-        method: 'delete' | 'hardDelete'
+        method: 'delete' | 'hardDelete' | 'findOneAndDelete'
     ): Promise<boolean>
     {
         return this.runOperation( async() =>
@@ -1544,12 +1796,8 @@ extends AbstractBaseModel<
         return this.runOperation( async() =>
         {
             const isSoft = Boolean( this._softDelete && !options?.hard );
-            const isIdArray = Array.isArray( idsOrFilter );
-            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options ) : undefined;
-            const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
-            const effectiveContext = isIdArray ? options?.context : findOptions?.context;
-            const effectiveTraceID = isIdArray ? options?.traceID : findOptions?.traceID;
-            const effectiveSession = isIdArray ? options?.session : findOptions?.session;
+            const findOptions = !Array.isArray( idsOrFilter ) ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options ) : undefined;
+            const { access: effectiveAccess, context: effectiveContext, traceID: effectiveTraceID, session: effectiveSession } = findOptions ?? options ?? {};
 
             const access = await this._access.resolveOrDeny({ operation: 'delete', method, access: effectiveAccess });
 
@@ -1717,12 +1965,8 @@ extends AbstractBaseModel<
         {
             if( !this._softDelete ){ return 0 }
 
-            const isIdArray = Array.isArray( idsOrFilter );
-            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options ) : undefined;
-            const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
-            const effectiveContext = isIdArray ? options?.context : findOptions?.context;
-            const effectiveTraceID = isIdArray ? options?.traceID : findOptions?.traceID;
-            const effectiveSession = isIdArray ? options?.session : findOptions?.session;
+            const findOptions = !Array.isArray( idsOrFilter ) ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options ) : undefined;
+            const { access: effectiveAccess, context: effectiveContext, traceID: effectiveTraceID, session: effectiveSession } = findOptions ?? options ?? {};
 
             const access = await this._access.resolveOrDeny({ operation: 'update', method: 'restoreMany', access: effectiveAccess });
 
@@ -1854,14 +2098,14 @@ extends AbstractBaseModel<
                 }
                 else if( 'update' in op )
                 {
-                    const res = await this.update( op.update.id, op.update.update, options );
+                    const res = await this.update( op.update.id, op.update.update, { ...options, expectedVersion: op.update.expectedVersion ?? options?.expectedVersion });
 
                     matchedCount += res.matchedRootCount;
                     modifiedCount += res.modifiedRootCount;
                 }
                 else if( 'updateOne' in op )
                 {
-                    const res = await this.updateOne( op.updateOne.filter as any, op.updateOne.update, options );
+                    const res = await this.updateOne( op.updateOne.filter as any, op.updateOne.update, { ...options, expectedVersion: op.updateOne.expectedVersion ?? options?.expectedVersion });
 
                     matchedCount += res.matchedCount;
                     modifiedCount += res.modifiedCount;
@@ -1877,29 +2121,13 @@ extends AbstractBaseModel<
                 {
                     const deleted = await this.delete( op.delete.id, { ...options, hard: op.delete.hard });
 
-                    if( deleted ){ deletedCount++ }
+                    deletedCount += deleted ? 1 : 0;
                 }
                 else if( 'deleteOne' in op )
                 {
-                    const findOptions = normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( op.deleteOne.filter as any, options );
-                    const access = await this._access.resolveOrDeny({ operation: 'delete', method: 'bulkWrite', access: findOptions.access });
+                    const deleted = await this.findOneAndDelete( op.deleteOne.filter as any, { ...options, hard: op.deleteOne.hard, as: 'dbe' as any });
 
-                    if( !access.denied )
-                    {
-                        const matched = await this.#findMatchingSubdocIds(
-                            { ...findOptions, includeDeleted: Boolean( op.deleteOne.hard ) },
-                            access.filter,
-                            1,
-                            'bulkWrite'
-                        );
-
-                        if( matched.length > 0 )
-                        {
-                            const deleted = await this.delete( matched[0], { ...options, hard: op.deleteOne.hard });
-
-                            if( deleted ){ deletedCount++ }
-                        }
-                    }
+                    deletedCount += deleted ? 1 : 0;
                 }
                 else if( 'deleteMany' in op )
                 {

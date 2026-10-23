@@ -29,6 +29,8 @@ function buildPropertyExtensions<DBE extends MongoPropertyDocument>(
         indexes             : config.indexes,
         timestamps          : config.timestamps,
         softDelete          : config.softDelete,
+        versioning          : config.versioning,
+        relations           : config.relations,
         hooks               : config.hooks
     };
 }

@@ -7,7 +7,10 @@ import
     GetManyOptions,
     GetOptions,
     ListResult,
+    ModelChangeEvent,
+    ModelChangeStream,
     ModelCreateOptions,
+    ModelExplainResult,
     ModelIndexDefinition,
     ModelIndexSpecification,
     ModelSoftDeleteConfig,
@@ -17,7 +20,9 @@ import
     ModelValidatorConfig,
     ModelValidatorFn,
     ModelValidatorInput,
+    ModelVersioningConfig,
     NormalizedModelIndex,
+    PopulateSpec,
     PropertyModelUpdateResponse,
     WithTotal
 }
@@ -103,7 +108,7 @@ export function attachCursorToItem<T>( dto: T, dbe: Document, sort: Document ): 
     return dto as T & { $cursor?: string };
 }
 
-const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'cursor', 'after', 'before', 'includeDeleted', 'access', 'context', 'traceID', 'session' ]);
+const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'populate', 'cursor', 'after', 'before', 'includeDeleted', 'access', 'context', 'traceID', 'session' ]);
 
 export function isCreateOptionsObject( v: unknown ): v is ModelCreateOptions
 {
@@ -155,17 +160,19 @@ export function resolveCreateFromArgs<ID>(
     };
 }
 
-export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, populate?: PopulateSpec, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
 {
     return Boolean(
         match
-        && typeof match === 'object'
+        && typeof match
+        === 'object'
         && !Array.isArray( match )
         && !isLibraryObjectId( match )
         && !isForeignObjectIdLike( match )
         && (
             'filter' in match
             || 'smartFilter' in match
+            || 'populate' in match
             || 'cursor' in match
             || 'after' in match
             || 'before' in match
@@ -176,9 +183,9 @@ export function isFindOptionsObject( match: unknown ): match is { filter?: unkno
 }
 
 export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilterType = any>(
-    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession },
-    optionsOrAccess?: string | { includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
-): { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, populate?: PopulateSpec, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession },
+    optionsOrAccess?: string | { populate?: PopulateSpec, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+): { filter: FilterType, smartFilter?: SmartFilterType, populate?: PopulateSpec, cursor?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
 {
     const opts = typeof optionsOrAccess === 'string' ? { access: optionsOrAccess } : optionsOrAccess;
 
@@ -190,12 +197,14 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
         const traceID = opts?.traceID ?? match.traceID;
         const session = opts?.session ?? match.session;
         const includeDeleted = opts?.includeDeleted ?? match.includeDeleted;
+        const populate = opts?.populate ?? match.populate;
         const cursor = normalizeCursorOption( match );
 
         return {
             filter      : ( match.filter ?? {} ) as FilterType,
             smartFilter : match.smartFilter as SmartFilterType | undefined,
             access      : opts?.access ?? match.access,
+            ...( populate !== undefined ? { populate } : {} ),
             ...( cursor !== undefined ? { cursor } : {} ),
             ...( includeDeleted !== undefined ? { includeDeleted } : {} ),
             ...( context !== undefined ? { context } : {} ),
@@ -207,6 +216,7 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
     return {
         filter : ( match ?? {} ) as FilterType,
         access : opts?.access,
+        ...( opts?.populate !== undefined ? { populate: opts.populate } : {} ),
         ...( opts?.includeDeleted !== undefined ? { includeDeleted: opts.includeDeleted } : {} ),
         ...( opts?.context !== undefined ? { context: opts.context } : {} ),
         ...( opts?.traceID !== undefined ? { traceID: opts.traceID } : {} ),
@@ -515,6 +525,354 @@ export type ResolvedSoftDeleteConfig =
     deletedAtField? : string
 };
 
+export type ResolvedVersioningConfig =
+{
+    field           : string
+    initialVersion  : number
+};
+
+export type NormalizedPopulateSpec =
+{
+    path            : string
+    as?             : string
+    includeDeleted? : boolean
+    populate?       : PopulateSpec
+};
+
+export function resolveVersioningConfig( config?: ModelVersioningConfig ): ResolvedVersioningConfig | undefined
+{
+    if( !config )
+    {
+        return undefined;
+    }
+
+    if( config === true )
+    {
+        return { field: 'version', initialVersion: 1 };
+    }
+
+    if( typeof config === 'string' )
+    {
+        return { field: config, initialVersion: 1 };
+    }
+
+    return {
+        field           : config.field ?? 'version',
+        initialVersion  : config.initialVersion ?? 1
+    };
+}
+
+export function applyCreateVersioning<T extends Record<string, any>>(
+    doc: T,
+    versioning?: ResolvedVersioningConfig
+): T
+{
+    if( !versioning || doc[versioning.field] !== undefined )
+    {
+        return doc;
+    }
+
+    return {
+        ...doc,
+        [versioning.field] : versioning.initialVersion
+    };
+}
+
+export function applyUpdateVersioning<T extends Record<string, any>>(
+    update: T,
+    versioning?: ResolvedVersioningConfig
+): T
+{
+    if( !versioning || !update || typeof update !== 'object' )
+    {
+        return update;
+    }
+
+    const field = versioning.field;
+
+    if( isUpdateOperator( update ) )
+    {
+        if( update.$set?.[field] !== undefined || update.$inc?.[field] !== undefined )
+        {
+            return update;
+        }
+
+        return {
+            ...update,
+            $inc : { ...( update.$inc ?? {} ), [field]: 1 }
+        } as unknown as T;
+    }
+
+    if( update[field] !== undefined )
+    {
+        return update;
+    }
+
+    const $set: Record<string, any> = {};
+    const $unset: Record<string, 1> = {};
+
+    for( const [ key, value ] of Object.entries( update ) )
+    {
+        if( value === undefined )
+        {
+            $unset[key] = 1;
+        }
+        else
+        {
+            $set[key] = value;
+        }
+    }
+
+    return {
+        ...( Object.keys( $set ).length > 0 ? { $set } : {} ),
+        ...( Object.keys( $unset ).length > 0 ? { $unset } : {} ),
+        $inc : { [field]: 1 }
+    } as unknown as T;
+}
+
+export function normalizePopulateSpecs( populate?: PopulateSpec ): NormalizedPopulateSpec[]
+{
+    if( !populate )
+    {
+        return [];
+    }
+
+    const items = Array.isArray( populate ) ? populate : [ populate ];
+    const byRootPath = new Map<string, NormalizedPopulateSpec>();
+
+    for( const raw of items )
+    {
+        if( !raw ){ continue }
+
+        const item = typeof raw === 'string' ? { path: raw } : raw;
+        const dotIdx = item.path.indexOf( '.' );
+
+        if( dotIdx !== -1 )
+        {
+            const rootPath = item.path.slice( 0, dotIdx );
+            const childSpec: NormalizedPopulateSpec =
+            {
+                ...item,
+                path : item.path.slice( dotIdx + 1 )
+            };
+            const existing = byRootPath.get( rootPath );
+
+            if( existing )
+            {
+                const prevNested = existing.populate
+                    ? ( Array.isArray( existing.populate ) ? existing.populate : [ existing.populate ] )
+                    : [];
+                existing.populate = [ ...prevNested, childSpec ];
+            }
+            else
+            {
+                byRootPath.set( rootPath, { path: rootPath, populate: [ childSpec ] });
+            }
+        }
+        else
+        {
+            const existing = byRootPath.get( item.path );
+
+            if( existing )
+            {
+                if( item.as !== undefined ){ existing.as = item.as }
+                if( item.includeDeleted !== undefined ){ existing.includeDeleted = item.includeDeleted }
+
+                if( item.populate !== undefined )
+                {
+                    const prevNested = existing.populate
+                        ? ( Array.isArray( existing.populate ) ? existing.populate : [ existing.populate ] )
+                        : [];
+                    const nextNested = Array.isArray( item.populate ) ? item.populate : [ item.populate ];
+                    existing.populate = [ ...prevNested, ...nextNested ];
+                }
+            }
+            else
+            {
+                byRootPath.set( item.path, { ...item });
+            }
+        }
+    }
+
+    return Array.from( byRootPath.values() );
+}
+
+export function extractExplainSummary(
+    collectionOrRaw: string | Document,
+    pipelineOrUndefined?: Document[],
+    maybeRaw?: Document
+): ModelExplainResult
+{
+    const hasCollectionArg = typeof collectionOrRaw === 'string';
+    const collection = hasCollectionArg ? collectionOrRaw : '';
+    const pipeline = hasCollectionArg ? ( pipelineOrUndefined ?? [] ) : [];
+    const raw = ( hasCollectionArg ? maybeRaw : collectionOrRaw ) ?? {};
+
+    let isCollectionScan = false;
+    const indexNames = new Set<string>();
+
+    const walkPlan = ( node: any ): void =>
+    {
+        if( !node || typeof node !== 'object' ){ return }
+
+        if( node.stage === 'COLLSCAN' )
+        {
+            isCollectionScan = true;
+        }
+
+        if( typeof node.indexName === 'string' )
+        {
+            indexNames.add( node.indexName );
+        }
+
+        for( const key of [ 'inputStage', 'queryPlan', 'queryPlanner', 'winningPlan', 'executionStats', 'executionStages', '$cursor' ] )
+        {
+            if( node[key] ){ walkPlan( node[key] ) }
+        }
+
+        for( const listKey of [ 'inputStages', 'stages' ] )
+        {
+            if( Array.isArray( node[listKey] ) )
+            {
+                for( const item of node[listKey] ){ walkPlan( item ) }
+            }
+        }
+
+        if( node.shards && typeof node.shards === 'object' )
+        {
+            const shardList = Array.isArray( node.shards ) ? node.shards : Object.values( node.shards );
+
+            for( const shard of shardList ){ walkPlan( shard ) }
+        }
+    };
+
+    walkPlan( raw );
+
+    const cursorBlock = Array.isArray( raw?.stages ) ? raw.stages[0]?.$cursor : undefined;
+    const queryPlanner = raw?.queryPlanner ?? cursorBlock?.queryPlanner;
+    const executionStats = raw?.executionStats ?? cursorBlock?.executionStats;
+    const winningPlan = queryPlanner?.winningPlan;
+    const indexes = Array.from( indexNames );
+
+    return {
+        collection,
+        pipeline,
+        winningPlan,
+        indexUsed           : indexes.length === 1 ? indexes[0] : ( indexes.length > 1 ? indexes : undefined ),
+        isCollectionScan,
+        totalDocsExamined   : executionStats?.totalDocsExamined,
+        totalKeysExamined   : executionStats?.totalKeysExamined,
+        executionTimeMillis : executionStats?.executionTimeMillis,
+        nReturned           : executionStats?.nReturned,
+        raw
+    };
+}
+
+export function createChangeStreamController<TEvent extends ModelChangeEvent<any, any, any> = ModelChangeEvent<any, any, any>>(
+    onClose?: () => void | Promise<void>
+): {
+    stream      : ModelChangeStream<any, any, any>
+    emitChange  : ( ev: TEvent ) => void
+    emitError   : ( err: Error ) => void
+    isClosed    : () => boolean
+}
+{
+    const changeListeners = new Set<( ev: TEvent ) => void>();
+    const errorListeners = new Set<( err: Error ) => void>();
+    const queue: TEvent[] = [];
+    const pendingResolvers: Array<( res: IteratorResult<TEvent> ) => void> = [];
+    let closed = false;
+
+    const emitChange = ( ev: TEvent ) =>
+    {
+        if( closed ){ return }
+
+        for( const fn of changeListeners )
+        {
+            try { fn( ev ) } catch {}
+        }
+
+        if( pendingResolvers.length > 0 )
+        {
+            pendingResolvers.shift()!({ value: ev, done: false });
+        }
+        else
+        {
+            queue.push( ev );
+        }
+    };
+
+    const emitError = ( err: Error ) =>
+    {
+        if( closed ){ return }
+
+        for( const fn of errorListeners )
+        {
+            try { fn( err ) } catch {}
+        }
+    };
+
+    const stream: ModelChangeStream<any, any, any> =
+    {
+        get closed()
+        {
+            return closed;
+        },
+        on( event: 'change' | 'error', listener: any )
+        {
+            if( event === 'change' ){ changeListeners.add( listener ) }
+            else if( event === 'error' ){ errorListeners.add( listener ) }
+
+            return stream;
+        },
+        async close()
+        {
+            if( closed ){ return }
+
+            closed = true;
+
+            while( pendingResolvers.length > 0 )
+            {
+                pendingResolvers.shift()!({ value: undefined as any, done: true });
+            }
+
+            await onClose?.();
+        },
+        [Symbol.asyncIterator]()
+        {
+            return {
+                next(): Promise<IteratorResult<TEvent>>
+                {
+                    if( queue.length > 0 )
+                    {
+                        return Promise.resolve({ value: queue.shift()!, done: false });
+                    }
+
+                    if( closed )
+                    {
+                        return Promise.resolve({ value: undefined as any, done: true });
+                    }
+
+                    return new Promise<IteratorResult<TEvent>>( resolve => pendingResolvers.push( resolve ));
+                },
+                async return(): Promise<IteratorResult<TEvent>>
+                {
+                    await stream.close();
+
+                    return { value: undefined as any, done: true };
+                }
+            };
+        }
+    };
+
+    return {
+        stream,
+        emitChange,
+        emitError,
+        isClosed : () => closed
+    };
+}
+
 export function resolveTimestampsConfig( config?: ModelTimestampsConfig ): ResolvedTimestampsConfig | undefined
 {
     if( !config )
@@ -598,24 +956,14 @@ export function applyUpdateTimestamps<T extends Record<string, any>>(
     {
         const out: Record<string, any> = { ...update };
 
-        if( timestamps.updatedAt )
+        if( timestamps.updatedAt && out.$set?.[timestamps.updatedAt] === undefined )
         {
-            const existingSet = ( out.$set && typeof out.$set === 'object' ) ? out.$set : {};
-
-            if( existingSet[timestamps.updatedAt] === undefined )
-            {
-                out.$set = { ...existingSet, [timestamps.updatedAt]: now };
-            }
+            out.$set = { ...( out.$set ?? {} ), [timestamps.updatedAt]: now };
         }
 
-        if( isUpsert && timestamps.createdAt && out.$set?.[timestamps.createdAt] === undefined )
+        if( isUpsert && timestamps.createdAt && out.$set?.[timestamps.createdAt] === undefined && out.$setOnInsert?.[timestamps.createdAt] === undefined )
         {
-            const existingSetOnInsert = ( out.$setOnInsert && typeof out.$setOnInsert === 'object' ) ? out.$setOnInsert : {};
-
-            if( existingSetOnInsert[timestamps.createdAt] === undefined )
-            {
-                out.$setOnInsert = { ...existingSetOnInsert, [timestamps.createdAt]: now };
-            }
+            out.$setOnInsert = { ...( out.$setOnInsert ?? {} ), [timestamps.createdAt]: now };
         }
 
         return out as T;

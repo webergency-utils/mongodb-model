@@ -4,16 +4,19 @@ import
     Collection,
     Document,
     Filter,
+    FindOptions,
     OptionalUnlessRequiredId,
     UpdateFilter
 }
 from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { ModelCacheConfig, extractTargetIdsFromFilter } from './cache.js';
-import { ModelAccessDeniedError } from './errors.js';
+import { ModelAccessDeniedError, ModelVersionConflictError } from './errors.js';
 import { ModelMutationOperation, ObservabilityConfig } from './events.js';
 import
 {
+    isForeignObjectIdLike,
+    isLibraryObjectId,
     mergeComputedProperties,
     resolveBSONObject,
     toUpdateOperations
@@ -42,10 +45,13 @@ import
     ModelCreateOptions,
     ModelDeleteOptions,
     ModelExtensions,
+    ModelFindOneAndDeleteOptions,
+    ModelFindOneAndUpdateOptions,
     ModelFindOptions,
     ModelHooksConfig,
     ModelIndexDefinition,
     ModelListOptions,
+    ModelRelationsConfig,
     ModelSoftDeleteConfig,
     ModelStreamOptions,
     ModelTimestampsConfig,
@@ -54,6 +60,7 @@ import
     ModelUpsertOptions,
     ModelUpsertResponse,
     ModelValidatorConfig,
+    ModelVersioningConfig,
     MongoRootDocument,
     OptimizerConfig
 }
@@ -97,6 +104,8 @@ extends AbstractBaseModel<
             indexes?        : ModelIndexDefinition<DBE>[]
             timestamps?     : ModelTimestampsConfig
             softDelete?     : ModelSoftDeleteConfig
+            versioning?     : ModelVersioningConfig
+            relations?      : ModelRelationsConfig<DBE>
             hooks?          : ModelHooksConfig<DBE>
         }
     )
@@ -114,11 +123,63 @@ extends AbstractBaseModel<
             indexes             : params.indexes,
             timestamps          : params.timestamps,
             softDelete          : params.softDelete,
+            versioning          : params.versioning,
+            relations           : params.relations,
             hooks               : params.hooks,
             idField             : '_id'
         });
 
         this.smartFilters = params.smartFilters;
+    }
+
+    #versionFilter( expectedVersion?: number ): Filter<DBE> | undefined
+    {
+        if( expectedVersion === undefined )
+        {
+            return undefined;
+        }
+
+        const field = this._versioning?.field ?? 'version';
+
+        return { [field]: expectedVersion } as Filter<DBE>;
+    }
+
+    async #assertNoVersionConflict(
+        _baseMatchWithoutVersion: Filter<DBE>,
+        expectedVersion: number | undefined,
+        _session?: ModelUpdateOptions['session'],
+        id?: unknown
+    ): Promise<void>
+    {
+        throw new ModelVersionConflictError( this, id, expectedVersion! );
+    }
+
+    async #prepareUpsertSetOnInsert(
+        updateOps: Record<string, any>,
+        finalMatch: Filter<DBE>,
+        targetIds: string[],
+        explicitId?: DTO['id'] | DBE['_id']
+    ): Promise<DTO['id']>
+    {
+        const generatedDtoId = ( explicitId ?? ( targetIds.length === 1 ? targetIds[0] : await this.id())) as DTO['id'];
+        const setOnInsert: Record<string, any> = { ...( updateOps.$setOnInsert ?? {} ) };
+
+        if( setOnInsert._id === undefined && updateOps.$set?._id === undefined && ( finalMatch as any )._id === undefined )
+        {
+            setOnInsert._id = this.dbeID( generatedDtoId );
+        }
+
+        if( this._softDelete && setOnInsert[this._softDelete.field] === undefined && updateOps.$set?.[this._softDelete.field] === undefined )
+        {
+            setOnInsert[this._softDelete.field] = this._softDelete.field === this._softDelete.deletedAtField ? null : false;
+        }
+
+        if( Object.keys( setOnInsert ).length > 0 )
+        {
+            updateOps.$setOnInsert = setOnInsert;
+        }
+
+        return generatedDtoId;
     }
 
     public override dbeID( id: DTO['id'] | DBE['_id'] ): DBE['_id']
@@ -475,7 +536,8 @@ extends AbstractBaseModel<
                 return { matchedCount: 0, modifiedCount: 0 };
             }
 
-            const match = combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!;
+            const baseMatchWithSoftDelete = combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!;
+            const match = combineMongoFilters( baseMatchWithSoftDelete, this.#versionFilter( options?.expectedVersion ))!;
             const start = Date.now();
             const session = this._resolveSession( options?.session );
             const pendingAfterCommit: Array<() => void | Promise<void>> = [];
@@ -492,19 +554,24 @@ extends AbstractBaseModel<
                 session
             }, pendingAfterCommit );
 
-            const validatedUpdate = await this._validateWrite(
+            const validatedUpdate = this._applyUpdateVersioning( await this._validateWrite(
                 hookedUpdate,
                 { operation: 'update', method: 'update', id },
                 start,
                 options,
                 match
-            );
+            ));
 
             try
             {
                 if( options?.documentBefore || options?.documentAfter )
                 {
                     const snapshot = await this.#findOneAndUpdateWithSnapshots( match, validatedUpdate, options, 'update' );
+
+                    if( snapshot.matchedCount === 0 && options?.expectedVersion !== undefined )
+                    {
+                        await this.#assertNoVersionConflict( baseMatchWithSoftDelete, options.expectedVersion, options.session, id );
+                    }
 
                     this._invalidateCache([ id ], snapshot.matchedCount > 0 );
                     await this._runAfterHook( 'afterUpdate',
@@ -545,6 +612,11 @@ extends AbstractBaseModel<
                     toUpdateOperations( validatedUpdate ),
                     ...this._sessionArg( options?.session )
                 );
+
+                if( res.matchedCount === 0 && options?.expectedVersion !== undefined )
+                {
+                    await this.#assertNoVersionConflict( baseMatchWithSoftDelete, options.expectedVersion, options.session, id );
+                }
 
                 this._invalidateCache([ id ], res.matchedCount > 0 );
                 await this._runAfterHook( 'afterUpdate',
@@ -672,7 +744,8 @@ extends AbstractBaseModel<
         operation: 'update' | 'delete',
         method: ModelMutationOperation,
         options?: { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ModelUpdateOptions['session'], includeDeleted?: boolean },
-        limit?: number
+        limit?: number,
+        sort?: FindOptions['sort']
     ): Promise<{
         finalMatch  : Filter<DBE> | null
         targetIds   : string[]
@@ -708,6 +781,7 @@ extends AbstractBaseModel<
                 smartFilter     : resolvedSmart,
                 accessFilter    : effectiveAccessFilter,
                 projection      : { _id: 1 },
+                sort,
                 limit
             });
 
@@ -807,7 +881,8 @@ extends AbstractBaseModel<
                     return { matchedCount: 0, modifiedCount: 0 };
                 }
 
-                const match = combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!;
+                const baseMatchWithSoftDelete = combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!;
+                const match = combineMongoFilters( baseMatchWithSoftDelete, this.#versionFilter( options?.expectedVersion ))!;
                 const start = Date.now();
                 const session = this._resolveSession( options?.session );
                 const pendingAfterCommit: Array<() => void | Promise<void>> = [];
@@ -824,13 +899,13 @@ extends AbstractBaseModel<
                     session
                 }, pendingAfterCommit );
 
-                const validatedUpdate = await this._validateWrite(
+                const validatedUpdate = this._applyUpdateVersioning( await this._validateWrite(
                     hookedUpdate,
                     { operation: 'update', method: 'updateMany', ids: idsOrFilter },
                     start,
                     options,
                     match
-                );
+                ));
                 let res: { matchedCount: number, modifiedCount: number };
 
                 try
@@ -840,6 +915,11 @@ extends AbstractBaseModel<
                         toUpdateOperations( validatedUpdate ),
                         ...this._sessionArg( options?.session )
                     );
+
+                    if( res.matchedCount === 0 && options?.expectedVersion !== undefined )
+                    {
+                        await this.#assertNoVersionConflict( baseMatchWithSoftDelete, options.expectedVersion, options.session, idsOrFilter[0] );
+                    }
                 }
                 catch( e )
                 {
@@ -914,6 +994,7 @@ extends AbstractBaseModel<
                 return { matchedCount: 0, modifiedCount: 0 };
             }
 
+            const versionedMatch = combineMongoFilters( finalMatch, this.#versionFilter( options?.expectedVersion ))!;
             const start = Date.now();
             const resolvedSession = this._resolveSession( session );
             const pendingAfterCommit: Array<() => void | Promise<void>> = [];
@@ -923,30 +1004,35 @@ extends AbstractBaseModel<
                 operation   : 'update',
                 method      : 'updateMany',
                 ids         : targetIds.length > 0 ? targetIds : undefined,
-                filter      : finalMatch,
+                filter      : versionedMatch,
                 update      : timestampedUpdate,
                 context,
                 traceID,
                 session     : resolvedSession
             }, pendingAfterCommit );
 
-            const validatedUpdate = await this._validateWrite(
+            const validatedUpdate = this._applyUpdateVersioning( await this._validateWrite(
                 hookedUpdate,
                 { operation: 'update', method: 'updateMany', ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
                 start,
                 { ...options, context, traceID },
-                finalMatch,
+                versionedMatch,
                 smartFilter
-            );
+            ));
             let res: { matchedCount: number, modifiedCount: number };
 
             try
             {
                 res = await this.collection.updateMany(
-                    finalMatch,
+                    versionedMatch,
                     toUpdateOperations( validatedUpdate ),
                     ...this._sessionArg( session )
                 );
+
+                if( res.matchedCount === 0 && options?.expectedVersion !== undefined )
+                {
+                    await this.#assertNoVersionConflict( finalMatch, options.expectedVersion, session, targetIds[0] );
+                }
             }
             catch( e )
             {
@@ -1042,6 +1128,7 @@ extends AbstractBaseModel<
                 return { matchedCount: 0, modifiedCount: 0 };
             }
 
+            const versionedMatch = combineMongoFilters( finalMatch, this.#versionFilter( options?.expectedVersion ))!;
             const start = Date.now();
             const resolvedSession = this._resolveSession( session );
             const pendingAfterCommit: Array<() => void | Promise<void>> = [];
@@ -1051,32 +1138,38 @@ extends AbstractBaseModel<
                 operation   : 'update',
                 method      : 'updateOne',
                 ids         : targetIds.length > 0 ? targetIds : undefined,
-                filter      : finalMatch,
+                filter      : versionedMatch,
                 update      : timestampedUpdate,
                 context,
                 traceID,
                 session     : resolvedSession
             }, pendingAfterCommit );
 
-            const validatedUpdate = await this._validateWrite(
+            const validatedUpdate = this._applyUpdateVersioning( await this._validateWrite(
                 hookedUpdate,
                 { operation: 'update', method: 'updateOne', ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
                 start,
                 { ...options, context, traceID },
-                finalMatch,
+                versionedMatch,
                 smartFilter
-            );
+            ));
 
             try
             {
                 if( options?.documentBefore || options?.documentAfter )
                 {
                     const snapshot = await this.#findOneAndUpdateWithSnapshots(
-                        finalMatch,
+                        versionedMatch,
                         validatedUpdate,
                         { ...options, context, traceID, session },
                         'updateOne'
                     );
+
+                    if( snapshot.matchedCount === 0 && options?.expectedVersion !== undefined )
+                    {
+                        await this.#assertNoVersionConflict( finalMatch, options.expectedVersion, session, targetIds[0] );
+                    }
+
                     const idsToEvict = targetIds.length > 0
                         ? targetIds
                         : ( snapshot.document?._id !== undefined ? [ String( this.dtoID( snapshot.document._id )) ] : null );
@@ -1095,7 +1188,7 @@ extends AbstractBaseModel<
                         operation       : 'update',
                         method          : 'updateOne',
                         ids             : idsToEvict ?? undefined,
-                        filter          : finalMatch,
+                        filter          : versionedMatch,
                         update          : validatedUpdate as Document,
                         matchedCount    : snapshot.matchedCount,
                         modifiedCount   : snapshot.modifiedCount,
@@ -1111,7 +1204,7 @@ extends AbstractBaseModel<
                         matchedCount    : snapshot.matchedCount,
                         modifiedCount   : snapshot.modifiedCount,
                         ids             : idsToEvict ?? undefined,
-                        filter          : finalMatch,
+                        filter          : versionedMatch,
                         smartFilter,
                         context,
                         traceID
@@ -1126,10 +1219,15 @@ extends AbstractBaseModel<
                 }
 
                 const res = await this.collection.updateOne(
-                    finalMatch,
+                    versionedMatch,
                     toUpdateOperations( validatedUpdate ),
                     ...this._sessionArg( session )
                 );
+
+                if( res.matchedCount === 0 && options?.expectedVersion !== undefined )
+                {
+                    await this.#assertNoVersionConflict( finalMatch, options.expectedVersion, session, targetIds[0] );
+                }
 
                 if( targetIds.length > 0 )
                 {
@@ -1231,40 +1329,25 @@ extends AbstractBaseModel<
                 session     : resolvedSession
             }, pendingAfterCommit );
 
-            const validatedUpdate = await this._validateWrite(
+            const validatedUpdate = this._applyUpdateVersioning( await this._validateWrite(
                 hookedUpdate,
                 { operation: 'update', method: 'upsert', ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
                 start,
                 { ...options, context, traceID },
                 finalMatch,
                 smartFilter
-            );
+            ));
 
+            const versionedMatch = combineMongoFilters( finalMatch, this.#versionFilter( options?.expectedVersion ))!;
             const updateOps = toUpdateOperations( validatedUpdate ) as Record<string, any>;
-            const generatedDtoId = ( options?.id ?? ( targetIds.length === 1 ? targetIds[0] : await this.id())) as DTO['id'];
-            const setOnInsert: Record<string, any> = { ...( updateOps.$setOnInsert ?? {} ) };
-
-            if( setOnInsert._id === undefined && updateOps.$set?._id === undefined && ( finalMatch as any )._id === undefined )
-            {
-                setOnInsert._id = this.dbeID( generatedDtoId );
-            }
-
-            if( this._softDelete && setOnInsert[this._softDelete.field] === undefined && updateOps.$set?.[this._softDelete.field] === undefined )
-            {
-                setOnInsert[this._softDelete.field] = this._softDelete.field === this._softDelete.deletedAtField ? null : false;
-            }
-
-            if( Object.keys( setOnInsert ).length > 0 )
-            {
-                updateOps.$setOnInsert = setOnInsert;
-            }
+            const generatedDtoId = await this.#prepareUpsertSetOnInsert( updateOps, finalMatch, targetIds, options?.id );
 
             try
             {
                 if( options?.documentBefore || options?.documentAfter )
                 {
                     const snapshot = await this.#findOneAndUpdateWithSnapshots(
-                        finalMatch,
+                        versionedMatch,
                         updateOps as UpdateFilter<DBE>,
                         { ...options, context, traceID, session, upsert: true },
                         'upsert'
@@ -1290,7 +1373,7 @@ extends AbstractBaseModel<
                         method          : 'upsert',
                         id              : resolvedId,
                         ids             : idsToEvict ?? undefined,
-                        filter          : finalMatch,
+                        filter          : versionedMatch,
                         update          : updateOps,
                         matchedCount    : snapshot.matchedCount,
                         modifiedCount   : snapshot.modifiedCount,
@@ -1308,7 +1391,7 @@ extends AbstractBaseModel<
                         modifiedCount   : snapshot.modifiedCount,
                         upsertedCount   : snapshot.upsertedCount,
                         ids             : idsToEvict ?? ( upsertedId !== undefined ? [ upsertedId ] : undefined ),
-                        filter          : finalMatch,
+                        filter          : versionedMatch,
                         smartFilter,
                         context,
                         traceID
@@ -1328,7 +1411,7 @@ extends AbstractBaseModel<
                 }
 
                 const res = await this.collection.updateOne(
-                    finalMatch,
+                    versionedMatch,
                     updateOps as UpdateFilter<DBE>,
                     this._withSession({ upsert: true }, session )
                 );
@@ -1389,9 +1472,313 @@ extends AbstractBaseModel<
                     modifiedCount   : res.modifiedCount
                 };
             }
+            catch( e: any )
+            {
+                const errToThrow = options?.expectedVersion !== undefined && e?.code === 11000
+                    ? new ModelVersionConflictError( this, targetIds[0], options.expectedVersion )
+                    : e;
+
+                this._emitError( errToThrow, 'upsert', Date.now() - start,
+                {
+                    filter      : finalMatch,
+                    smartFilter,
+                    context,
+                    traceID
+                });
+
+                throw errToThrow;
+            }
+        });
+    }
+
+    public async findOneAndUpdate<K extends keyof Extensions['converters'] = 'dto'>(
+        idOrFilter: DTO['id'] | DBE['_id'] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        update: Partial<DBE> | UpdateFilter<DBE>,
+        options?: ModelFindOneAndUpdateOptions<K> | K
+    ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
+    {
+        return this.runOperation( async(): Promise<any> =>
+        {
+            const opts: ModelFindOneAndUpdateOptions<K> = options !== undefined && ( typeof options !== 'object' || options === null )
+                ? { as: options as K }
+                : ( options ?? {} );
+            const conversion = ( opts.as ?? 'dto' ) as K;
+            const returnDocument = opts.returnDocument ?? 'after';
+            const isPrimitiveId = typeof idOrFilter === 'string'
+                || typeof idOrFilter === 'number'
+                || isLibraryObjectId( idOrFilter )
+                || isForeignObjectIdLike( idOrFilter );
+            const matchInput = isPrimitiveId
+                ? { _id: this.dbeID( idOrFilter as any ) } as Filter<DBE>
+                : idOrFilter as any;
+            const {
+                finalMatch  : baseMatchWithoutVersion,
+                targetIds,
+                rawFilter,
+                smartFilter,
+                context = opts.context,
+                traceID = opts.traceID,
+                session = opts.session
+            } = await this.#resolveFilterMatch(
+                matchInput,
+                'update',
+                'findOneAndUpdate',
+                opts,
+                1,
+                opts.sort
+            );
+
+            if( !baseMatchWithoutVersion )
+            {
+                return null;
+            }
+
+            const finalMatch = combineMongoFilters( baseMatchWithoutVersion, this.#versionFilter( opts.expectedVersion ))!;
+            const start = Date.now();
+            const resolvedSession = this._resolveSession( session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            const now = new Date();
+            const isUpsert = Boolean( opts.upsert );
+            const timestampedUpdate = this._applyUpdateTimestamps( update as Record<string, any>, now, isUpsert );
+            const hookedUpdate = await this._runBeforeHook( 'beforeUpdate',
+            {
+                operation   : 'update',
+                method      : 'findOneAndUpdate',
+                id          : isPrimitiveId ? idOrFilter : undefined,
+                ids         : targetIds.length > 0 ? targetIds : undefined,
+                filter      : finalMatch,
+                update      : timestampedUpdate,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
+            const validatedUpdate = this._applyUpdateVersioning( await this._validateWrite(
+                hookedUpdate,
+                { operation: 'update', method: 'findOneAndUpdate', id: isPrimitiveId ? idOrFilter : undefined, ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
+                start,
+                { ...opts, context, traceID },
+                finalMatch,
+                smartFilter
+            ));
+
+            const updateOps = toUpdateOperations( validatedUpdate ) as Record<string, any>;
+
+            if( isUpsert )
+            {
+                await this.#prepareUpsertSetOnInsert( updateOps, finalMatch, targetIds, opts.id );
+            }
+
+            let rawDoc: DBE | null = null;
+
+            try
+            {
+                const findAndUpdateOpts = this._withSession(
+                {
+                    returnDocument,
+                    ...( isUpsert ? { upsert: true } : {} ),
+                    ...( opts.sort ? { sort: opts.sort } : {} ),
+                    collation : { locale: 'en' }
+                }, session );
+
+                if( typeof ( this.collection as any ).findOneAndUpdate === 'function' )
+                {
+                    const res = await this.collection.findOneAndUpdate(
+                        finalMatch,
+                        updateOps as UpdateFilter<DBE>,
+                        findAndUpdateOpts
+                    );
+                    rawDoc = ( ( res as any )?.value !== undefined ? ( res as any ).value : res ) as DBE | null;
+                }
+                else
+                {
+                    const before = await this.collection.findOne( finalMatch, this._withSession({ ...( opts.sort ? { sort: opts.sort } : {} ), collation: { locale: 'en' } }, session )) as DBE | null;
+                    const upRes = await this.collection.updateOne(
+                        finalMatch,
+                        updateOps as UpdateFilter<DBE>,
+                        this._withSession( isUpsert ? { upsert: true } : {}, session )
+                    );
+
+                    if( returnDocument === 'before' )
+                    {
+                        rawDoc = before;
+                    }
+                    else if( upRes.matchedCount > 0 || ( upRes as any ).upsertedCount > 0 )
+                    {
+                        rawDoc = await this.collection.findOne( baseMatchWithoutVersion, this._withSession({ collation: { locale: 'en' } }, session )) as DBE | null;
+                    }
+                }
+
+                if( !rawDoc && !isUpsert && opts.expectedVersion !== undefined )
+                {
+                    await this.#assertNoVersionConflict( baseMatchWithoutVersion, opts.expectedVersion, session, isPrimitiveId ? idOrFilter : targetIds[0] );
+                }
+            }
+            catch( e: any )
+            {
+                const errToThrow = opts.expectedVersion !== undefined && e?.code === 11000
+                    ? new ModelVersionConflictError( this, isPrimitiveId ? idOrFilter : targetIds[0], opts.expectedVersion )
+                    : e;
+
+                this._emitError( errToThrow, 'findOneAndUpdate', Date.now() - start,
+                {
+                    filter      : finalMatch,
+                    smartFilter,
+                    context,
+                    traceID
+                });
+
+                throw errToThrow;
+            }
+
+            const duration = Date.now() - start;
+            const count = rawDoc ? 1 : 0;
+            const docId = rawDoc?._id !== undefined ? this.dtoID( rawDoc._id ) : ( isPrimitiveId ? idOrFilter : undefined );
+            const affectedIds = rawDoc?._id !== undefined ? [ String( docId ) ] : targetIds;
+
+            this._invalidateCache( affectedIds, count > 0 );
+
+            await this._runAfterHook( 'afterUpdate',
+            {
+                operation       : 'update',
+                method          : 'findOneAndUpdate',
+                id              : docId,
+                ids             : affectedIds,
+                filter          : finalMatch,
+                update          : updateOps,
+                matchedCount    : count,
+                modifiedCount   : count,
+                documentBefore  : returnDocument === 'before' ? ( rawDoc ?? undefined ) : undefined,
+                documentAfter   : returnDocument === 'after' ? ( rawDoc ?? undefined ) : undefined,
+                context,
+                traceID,
+                session         : resolvedSession
+            }, pendingAfterCommit );
+
+            const convStart = Date.now();
+            const converted = rawDoc
+                ? await this._converters.convert( rawDoc, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>
+                : null;
+            const converterDuration = Date.now() - convStart;
+
+            if( converted && opts.populate )
+            {
+                await this._hydrateRelations([ converted ], opts.populate, { ...opts, context, traceID, session });
+            }
+
+            this._emitMutation( 'findOneAndUpdate', duration,
+            {
+                converterDuration,
+                matchedCount    : count,
+                modifiedCount   : count,
+                ids             : affectedIds,
+                filter          : finalMatch,
+                smartFilter,
+                context,
+                traceID
+            });
+
+            return converted;
+        });
+    }
+
+    public async findOneAndDelete<K extends keyof Extensions['converters'] = 'dto'>(
+        idOrFilter: DTO['id'] | DBE['_id'] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        options?: ModelFindOneAndDeleteOptions<K> | K
+    ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
+    {
+        return this.runOperation( async(): Promise<any> =>
+        {
+            const opts: ModelFindOneAndDeleteOptions<K> = options !== undefined && ( typeof options !== 'object' || options === null )
+                ? { as: options as K }
+                : ( options ?? {} );
+            const conversion = ( opts.as ?? 'dto' ) as K;
+            const isSoft = Boolean( this._softDelete && !opts.hard );
+            const isPrimitiveId = typeof idOrFilter === 'string'
+                || typeof idOrFilter === 'number'
+                || isLibraryObjectId( idOrFilter )
+                || isForeignObjectIdLike( idOrFilter );
+            const matchInput = isPrimitiveId
+                ? { _id: this.dbeID( idOrFilter as any ) } as Filter<DBE>
+                : idOrFilter as any;
+            const {
+                finalMatch,
+                targetIds,
+                smartFilter,
+                context = opts.context,
+                traceID = opts.traceID,
+                session = opts.session
+            } = await this.#resolveFilterMatch(
+                matchInput,
+                'delete',
+                'findOneAndDelete',
+                { ...opts, includeDeleted: Boolean( opts.includeDeleted || !isSoft ) },
+                1,
+                opts.sort
+            );
+
+            if( !finalMatch )
+            {
+                return null;
+            }
+
+            const start = Date.now();
+            const resolvedSession = this._resolveSession( session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+
+            await this._runBeforeHook( 'beforeDelete',
+            {
+                operation   : 'delete',
+                method      : 'findOneAndDelete',
+                id          : isPrimitiveId ? idOrFilter : undefined,
+                ids         : targetIds.length > 0 ? targetIds : undefined,
+                filter      : finalMatch,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
+            let rawDoc: DBE | null = null;
+
+            try
+            {
+                const findOpts = this._withSession({ ...( opts.sort ? { sort: opts.sort } : {} ), collation: { locale: 'en' } }, session );
+
+                if( isSoft )
+                {
+                    const softUpdate = this._applyUpdateVersioning( buildSoftDeleteUpdate( this._softDelete!, this._timestamps ) as Record<string, any> );
+
+                    if( typeof ( this.collection as any ).findOneAndUpdate === 'function' )
+                    {
+                        const res = await this.collection.findOneAndUpdate(
+                            finalMatch,
+                            softUpdate as UpdateFilter<DBE>,
+                            { ...findOpts, returnDocument: 'before' }
+                        );
+                        rawDoc = ( ( res as any )?.value !== undefined ? ( res as any ).value : res ) as DBE | null;
+                    }
+                    else
+                    {
+                        const before = await this.collection.findOne( finalMatch, findOpts ) as DBE | null;
+                        const upRes = await this.collection.updateOne( finalMatch, softUpdate as UpdateFilter<DBE>, ...this._sessionArg( session ));
+                        rawDoc = ( upRes.modifiedCount || upRes.matchedCount ) ? before : null;
+                    }
+                }
+                else if( typeof ( this.collection as any ).findOneAndDelete === 'function' )
+                {
+                    const res = await this.collection.findOneAndDelete( finalMatch, findOpts );
+                    rawDoc = ( ( res as any )?.value !== undefined ? ( res as any ).value : res ) as DBE | null;
+                }
+                else
+                {
+                    const before = await this.collection.findOne( finalMatch, findOpts ) as DBE | null;
+                    const delRes = await this.collection.deleteOne( finalMatch, ...this._sessionArg( session ));
+                    rawDoc = delRes.deletedCount > 0 ? before : null;
+                }
+            }
             catch( e )
             {
-                this._emitError( e, 'upsert', Date.now() - start,
+                this._emitError( e, 'findOneAndDelete', Date.now() - start,
                 {
                     filter      : finalMatch,
                     smartFilter,
@@ -1401,6 +1788,50 @@ extends AbstractBaseModel<
 
                 throw e;
             }
+
+            const duration = Date.now() - start;
+            const deletedCount = rawDoc ? 1 : 0;
+            const docId = rawDoc?._id !== undefined ? this.dtoID( rawDoc._id ) : ( isPrimitiveId ? idOrFilter : undefined );
+            const affectedIds = rawDoc?._id !== undefined ? [ String( docId ) ] : targetIds;
+
+            this._invalidateCache( affectedIds, deletedCount > 0 );
+
+            await this._runAfterHook( 'afterDelete',
+            {
+                operation   : 'delete',
+                method      : 'findOneAndDelete',
+                id          : docId,
+                ids         : affectedIds,
+                filter      : finalMatch,
+                deletedCount,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
+            const convStart = Date.now();
+            const converted = rawDoc
+                ? await this._converters.convert( rawDoc, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>
+                : null;
+            const converterDuration = Date.now() - convStart;
+
+            if( converted && opts.populate )
+            {
+                await this._hydrateRelations([ converted ], opts.populate, { ...opts, context, traceID, session });
+            }
+
+            this._emitMutation( 'findOneAndDelete', duration,
+            {
+                converterDuration,
+                deletedCount,
+                ids             : affectedIds,
+                filter          : finalMatch,
+                smartFilter,
+                context,
+                traceID
+            });
+
+            return converted;
         });
     }
 
@@ -1978,6 +2409,8 @@ extends AbstractBaseModel<
             const insertedIds: DTO['id'][] = [];
             const targetedIds: string[] = [];
             let hasBroadMutation = false;
+            let versionedOpCount = 0;
+            let firstVersionedCheck: { id?: unknown, expectedVersion: number } | undefined;
 
             for( const op of operations )
             {
@@ -2043,60 +2476,19 @@ extends AbstractBaseModel<
                         }
                     });
                 }
-                else if( 'update' in op )
-                {
-                    const baseMatch = await this._access.match(
-                        resolveBSONObject({ _id: this.dbeID( op.update.id ) }) as Filter<DBE>,
-                        { operation: 'update', method: 'bulkWrite', access: options?.access }
-                    );
-
-                    if( !baseMatch ){ continue }
-
-                    const match = combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!;
-                    const timestamped = this._applyUpdateTimestamps( op.update.update as Record<string, any>, now );
-                    const hooked = await this._runBeforeHook( 'beforeUpdate',
-                    {
-                        operation   : 'update',
-                        method      : 'bulkWrite',
-                        id          : op.update.id,
-                        filter      : match,
-                        update      : timestamped,
-                        context     : options?.context,
-                        traceID     : options?.traceID,
-                        session
-                    }, pendingAfterCommit );
-                    const validated = await this._validateWrite( hooked, { operation: 'update', method: 'bulkWrite', id: op.update.id }, start, options, match );
-
-                    targetedIds.push( String( this.dtoID( op.update.id )));
-                    pendingAfterHooks.push({
-                        hook    : 'afterUpdate',
-                        ctx     :
-                        {
-                            operation   : 'update',
-                            method      : 'bulkWrite',
-                            id          : op.update.id,
-                            filter      : match,
-                            update      : validated as Document,
-                            context     : options?.context,
-                            traceID     : options?.traceID,
-                            session
-                        }
-                    });
-                    rawOps.push({
-                        updateOne : {
-                            filter  : match,
-                            update  : toUpdateOperations( validated ) as UpdateFilter<DBE>
-                        }
-                    });
-                }
-                else if( 'updateOne' in op || 'updateMany' in op || 'upsert' in op )
+                else if( 'update' in op || 'updateOne' in op || 'updateMany' in op || 'upsert' in op )
                 {
                     const isMany = 'updateMany' in op;
-                    const isUpsert = 'upsert' in op || Boolean(( 'updateOne' in op ? op.updateOne.upsert : ( 'updateMany' in op ? op.updateMany.upsert : false )));
-                    const spec = 'updateOne' in op ? op.updateOne : ( 'updateMany' in op ? op.updateMany : op.upsert );
-                    const normalizedFilter = Array.isArray( spec.filter )
-                        ? { _id: { $in: spec.filter.map( id => this.dbeID( id )) } } as Filter<DBE>
-                        : spec.filter;
+                    const singleId = 'update' in op ? op.update.id : undefined;
+                    const spec: any = 'update' in op
+                        ? op.update
+                        : ( 'updateOne' in op ? op.updateOne : ( 'updateMany' in op ? op.updateMany : op.upsert ));
+                    const isUpsert = 'upsert' in op || Boolean( spec.upsert );
+                    const normalizedFilter = singleId !== undefined
+                        ? { _id: this.dbeID( singleId ) } as Filter<DBE>
+                        : ( Array.isArray( spec.filter )
+                            ? { _id: { $in: spec.filter.map(( id: any ) => this.dbeID( id )) } } as Filter<DBE>
+                            : spec.filter );
                     const { finalMatch, targetIds } = await this.#resolveFilterMatch(
                         normalizedFilter,
                         'update',
@@ -2107,19 +2499,28 @@ extends AbstractBaseModel<
 
                     if( !finalMatch ){ continue }
 
+                    const expectedVer = spec.expectedVersion ?? options?.expectedVersion;
+                    const versionedMatch = combineMongoFilters( finalMatch, this.#versionFilter( expectedVer ))!;
+
+                    if( expectedVer !== undefined && !isUpsert )
+                    {
+                        versionedOpCount++;
+                        firstVersionedCheck ??= { id: singleId ?? targetIds[0], expectedVersion: expectedVer };
+                    }
                     const timestamped = this._applyUpdateTimestamps( spec.update as Record<string, any>, now, isUpsert );
                     const hooked = await this._runBeforeHook( 'beforeUpdate',
                     {
                         operation   : 'update',
                         method      : 'bulkWrite',
+                        id          : singleId,
                         ids         : targetIds.length > 0 ? targetIds : undefined,
-                        filter      : finalMatch,
+                        filter      : versionedMatch,
                         update      : timestamped,
                         context     : options?.context,
                         traceID     : options?.traceID,
                         session
                     }, pendingAfterCommit );
-                    const validated = await this._validateWrite( hooked, { operation: 'update', method: 'bulkWrite', filter: finalMatch }, start, options, finalMatch );
+                    const validated = this._applyUpdateVersioning( await this._validateWrite( hooked, { operation: 'update', method: 'bulkWrite', id: singleId, filter: versionedMatch }, start, options, versionedMatch ));
                     const updateOps = toUpdateOperations( validated ) as Record<string, any>;
 
                     if( isUpsert && this._softDelete )
@@ -2136,100 +2537,36 @@ extends AbstractBaseModel<
                         {
                             operation   : 'update',
                             method      : 'bulkWrite',
+                            id          : singleId,
                             ids         : targetIds.length > 0 ? targetIds : undefined,
-                            filter      : finalMatch,
-                            update      : updateOps as Document,
+                            filter      : versionedMatch,
+                            update      : ( singleId !== undefined ? validated : updateOps ) as Document,
                             context     : options?.context,
                             traceID     : options?.traceID,
                             session
                         }
                     });
 
-                    if( isMany )
+                    const opPayload =
                     {
-                        rawOps.push({
-                            updateMany : {
-                                filter  : finalMatch,
-                                update  : updateOps as UpdateFilter<DBE>,
-                                ...( isUpsert ? { upsert: true } : {} )
-                            }
-                        });
-                    }
-                    else
-                    {
-                        rawOps.push({
-                            updateOne : {
-                                filter  : finalMatch,
-                                update  : updateOps as UpdateFilter<DBE>,
-                                ...( isUpsert ? { upsert: true } : {} )
-                            }
-                        });
-                    }
+                        filter  : versionedMatch,
+                        update  : updateOps as UpdateFilter<DBE>,
+                        ...( isUpsert ? { upsert: true } : {} )
+                    };
+
+                    rawOps.push( isMany ? { updateMany: opPayload } : { updateOne: opPayload });
                 }
-                else if( 'delete' in op )
-                {
-                    const baseMatch = await this._access.match(
-                        resolveBSONObject({ _id: this.dbeID( op.delete.id ) }) as Filter<DBE>,
-                        { operation: 'delete', method: 'bulkWrite', access: options?.access }
-                    );
-
-                    if( !baseMatch ){ continue }
-
-                    const isSoft = Boolean( this._softDelete && !op.delete.hard );
-                    const match = isSoft
-                        ? combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!
-                        : baseMatch;
-
-                    await this._runBeforeHook( 'beforeDelete',
-                    {
-                        operation   : 'delete',
-                        method      : 'bulkWrite',
-                        id          : op.delete.id,
-                        filter      : match,
-                        context     : options?.context,
-                        traceID     : options?.traceID,
-                        session
-                    }, pendingAfterCommit );
-
-                    targetedIds.push( String( this.dtoID( op.delete.id )));
-                    pendingAfterHooks.push({
-                        hook    : 'afterDelete',
-                        ctx     :
-                        {
-                            operation   : 'delete',
-                            method      : 'bulkWrite',
-                            id          : op.delete.id,
-                            filter      : match,
-                            context     : options?.context,
-                            traceID     : options?.traceID,
-                            session
-                        }
-                    });
-
-                    if( isSoft )
-                    {
-                        rawOps.push({
-                            updateOne : {
-                                filter  : match,
-                                update  : buildSoftDeleteUpdate( this._softDelete!, this._timestamps, now ) as UpdateFilter<DBE>
-                            }
-                        });
-                    }
-                    else
-                    {
-                        rawOps.push({
-                            deleteOne : { filter: match }
-                        });
-                    }
-                }
-                else if( 'deleteOne' in op || 'deleteMany' in op )
+                else if( 'delete' in op || 'deleteOne' in op || 'deleteMany' in op )
                 {
                     const isMany = 'deleteMany' in op;
-                    const spec = 'deleteOne' in op ? op.deleteOne : op.deleteMany;
+                    const singleId = 'delete' in op ? op.delete.id : undefined;
+                    const spec: any = 'delete' in op ? op.delete : ( 'deleteOne' in op ? op.deleteOne : op.deleteMany );
                     const isSoft = Boolean( this._softDelete && !spec.hard );
-                    const normalizedFilter = Array.isArray( spec.filter )
-                        ? { _id: { $in: spec.filter.map( id => this.dbeID( id )) } } as Filter<DBE>
-                        : spec.filter;
+                    const normalizedFilter = singleId !== undefined
+                        ? { _id: this.dbeID( singleId ) } as Filter<DBE>
+                        : ( Array.isArray( spec.filter )
+                            ? { _id: { $in: spec.filter.map(( id: any ) => this.dbeID( id )) } } as Filter<DBE>
+                            : spec.filter );
                     const { finalMatch, targetIds } = await this.#resolveFilterMatch(
                         normalizedFilter,
                         'delete',
@@ -2244,6 +2581,7 @@ extends AbstractBaseModel<
                     {
                         operation   : 'delete',
                         method      : 'bulkWrite',
+                        id          : singleId,
                         ids         : targetIds.length > 0 ? targetIds : undefined,
                         filter      : finalMatch,
                         context     : options?.context,
@@ -2260,6 +2598,7 @@ extends AbstractBaseModel<
                         {
                             operation   : 'delete',
                             method      : 'bulkWrite',
+                            id          : singleId,
                             ids         : targetIds.length > 0 ? targetIds : undefined,
                             filter      : finalMatch,
                             context     : options?.context,
@@ -2311,6 +2650,11 @@ extends AbstractBaseModel<
                 res = Object.keys( bulkOpts ).length > 0
                     ? await this.collection.bulkWrite( rawOps, bulkOpts )
                     : await this.collection.bulkWrite( rawOps );
+
+                if( versionedOpCount > 0 && firstVersionedCheck && ( res?.matchedCount ?? 0 ) < versionedOpCount )
+                {
+                    throw new ModelVersionConflictError( this, firstVersionedCheck.id, firstVersionedCheck.expectedVersion );
+                }
             }
             catch( e )
             {

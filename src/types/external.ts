@@ -18,7 +18,7 @@ import
 from './internal.js';
 
 export type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
-export type { ModelCacheConfig, ModelCacheInstance, ModelCacheOptions } from '../cache.js';
+export type { ModelCacheConfig, ModelCacheInstance, ModelCacheOptions, ModelCacheStats, ModelExternalCacheStore } from '../cache.js';
 export type
 {
     ModelQueryContext,
@@ -52,6 +52,47 @@ export type ModelUpdateOptions =
 {
     documentBefore? : boolean
     documentAfter?  : boolean
+    expectedVersion?: number
+    access?         : string
+    context?        : Record<string, unknown>
+    traceID?        : string
+    session?        : ClientSession
+};
+
+export type PopulateItemSpec =
+    | string
+    | {
+        path            : string
+        as?             : string
+        includeDeleted? : boolean
+        populate?       : PopulateSpec
+    };
+
+export type PopulateSpec = PopulateItemSpec | PopulateItemSpec[];
+
+export type ModelFindOneAndUpdateOptions<K extends string | number | symbol = 'dto'> =
+{
+    as?             : K
+    returnDocument? : 'before' | 'after'
+    upsert?         : boolean
+    id?             : any
+    sort?           : FindOptions['sort']
+    expectedVersion?: number
+    populate?       : PopulateSpec
+    includeDeleted? : boolean
+    access?         : string
+    context?        : Record<string, unknown>
+    traceID?        : string
+    session?        : ClientSession
+};
+
+export type ModelFindOneAndDeleteOptions<K extends string | number | symbol = 'dto'> =
+{
+    as?             : K
+    hard?           : boolean
+    sort?           : FindOptions['sort']
+    populate?       : PopulateSpec
+    includeDeleted? : boolean
     access?         : string
     context?        : Record<string, unknown>
     traceID?        : string
@@ -139,21 +180,22 @@ export type PropertyModelUpsertResponse<DBE extends Document, IdType = any> =
 
 export type ModelBulkWriteOptions =
 {
-    ordered?    : boolean
-    access?     : string
-    context?    : Record<string, unknown>
-    traceID?    : string
-    session?    : ClientSession
+    ordered?        : boolean
+    expectedVersion?: number
+    access?         : string
+    context?        : Record<string, unknown>
+    traceID?        : string
+    session?        : ClientSession
 };
 
 export type ModelBulkWriteOperation<DBE extends Document, IdType = any, Filters = never> =
     | { create: Omit<DBE, '_id'> & { _id?: DBE['_id'] }, id?: IdType }
     | { create: { data: Omit<DBE, '_id'> & { _id?: DBE['_id'] }, id?: IdType } }
     | { insertOne: { document: Omit<DBE, '_id'> & { _id?: DBE['_id'] } } }
-    | { update: { id: IdType, update: Partial<DBE> | UpdateFilter<DBE> } }
-    | { updateOne: { filter: Filter<DBE> | ModelFindOptions<DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE>, upsert?: boolean, id?: IdType } }
-    | { updateMany: { filter: IdType[] | Filter<DBE> | ModelFindOptions<DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE>, upsert?: boolean } }
-    | { upsert: { filter: Filter<DBE> | ModelFindOptions<DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE> } }
+    | { update: { id: IdType, update: Partial<DBE> | UpdateFilter<DBE>, expectedVersion?: number } }
+    | { updateOne: { filter: Filter<DBE> | ModelFindOptions<DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE>, upsert?: boolean, id?: IdType, expectedVersion?: number } }
+    | { updateMany: { filter: IdType[] | Filter<DBE> | ModelFindOptions<DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE>, upsert?: boolean, expectedVersion?: number } }
+    | { upsert: { filter: Filter<DBE> | ModelFindOptions<DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE>, expectedVersion?: number } }
     | { delete: { id: IdType, hard?: boolean } }
     | { deleteOne: { filter: Filter<DBE> | ModelFindOptions<DBE, Filters>, hard?: boolean } }
     | { deleteMany: { filter: IdType[] | Filter<DBE> | ModelFindOptions<DBE, Filters>, hard?: boolean } };
@@ -167,9 +209,9 @@ export type PropertyModelBulkWriteOperation
 >
 =
     | { create: { parentID: any, data: Omit<DBE, 'id'> & { id?: DBE['id'] }, id?: IdType } }
-    | { update: { id: IdType, update: Partial<DBE> | UpdateFilter<DBE> } }
-    | { updateOne: { filter: PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE> } }
-    | { updateMany: { filter: IdType[] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE> } }
+    | { update: { id: IdType, update: Partial<DBE> | UpdateFilter<DBE>, expectedVersion?: number } }
+    | { updateOne: { filter: PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE>, expectedVersion?: number } }
+    | { updateMany: { filter: IdType[] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, Filters>, update: Partial<DBE> | UpdateFilter<DBE>, expectedVersion?: number } }
     | { delete: { id: IdType, hard?: boolean } }
     | { deleteOne: { filter: PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, Filters>, hard?: boolean } }
     | { deleteMany: { filter: IdType[] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, Filters>, hard?: boolean } };
@@ -238,6 +280,105 @@ export type ModelSoftDeleteOptions =
 
 export type ModelSoftDeleteConfig = boolean | ModelSoftDeleteOptions;
 
+export type ModelVersioningOptions =
+{
+    field?          : string
+    initialVersion? : number
+};
+
+export type ModelVersioningConfig = boolean | string | ModelVersioningOptions;
+
+export type ModelRelationTarget =
+    | string
+    | { getMany: ( ...args: any[] ) => Promise<any[]>, list: ( ...args: any[] ) => Promise<any[]>, dtoID?: ( id: any ) => any }
+    | ( () => string | { getMany: ( ...args: any[] ) => Promise<any[]>, list: ( ...args: any[] ) => Promise<any[]>, dtoID?: ( id: any ) => any } | undefined );
+
+export type ModelRelationDefinition<DBE extends Document = Document> =
+{
+    model           : ModelRelationTarget
+    localField?     : ( keyof DBE & string ) | ( string & {} )
+    foreignField?   : string
+    type?           : 'one' | 'many'
+    as?             : string
+    justOne?        : boolean
+    includeDeleted? : boolean
+};
+
+export type ModelRelationsConfig<DBE extends Document = Document> = Record<string, ModelRelationDefinition<DBE>>;
+
+export type ModelExplainVerbosity = 'queryPlanner' | 'executionStats' | 'allPlansExecution';
+
+export type ModelExplainResult =
+{
+    collection          : string
+    pipeline            : Document[]
+    winningPlan?        : Document
+    indexUsed?          : string | string[]
+    isCollectionScan    : boolean
+    totalDocsExamined?  : number
+    totalKeysExamined?  : number
+    executionTimeMillis?: number
+    nReturned?          : number
+    raw                 : Document
+};
+
+export type ModelsHealthCheckResult =
+{
+    ok              : boolean
+    latencyMs       : number
+    modelsCount     : number
+    collectionsCount: number
+    inflightCount   : number
+    closed          : boolean
+    error?          : string
+};
+
+export type ModelChangeOperationType = 'insert' | 'update' | 'replace' | 'delete' | 'invalidate' | 'drop';
+
+export type ModelChangeEvent<DBE extends Document = Document, DTO = Document, IdType = any> =
+{
+    operationType       : ModelChangeOperationType
+    collection          : string
+    model?              : string
+    id?                 : IdType
+    documentKey?        : Document
+    fullDocument?       : DBE
+    dto?                : DTO | null
+    updateDescription?  :
+    {
+        updatedFields?      : Record<string, any>
+        removedFields?      : string[]
+        truncatedArrays?    : Array<{ field: string, newSize: number }>
+    }
+    resumeToken?        : unknown
+    raw                 : Document
+};
+
+export type ModelWatchOptions<K extends string | number | symbol = 'dto'> =
+{
+    operations?         : ModelChangeOperationType[]
+    filter?             : Document
+    pipeline?           : Document[]
+    fullDocument?       : 'default' | 'updateLookup' | 'whenAvailable' | 'required'
+    resumeAfter?        : unknown
+    startAfter?         : unknown
+    batchSize?          : number
+    maxAwaitTimeMS?     : number
+    invalidateCache?    : boolean
+    as?                 : K
+    convert?            : boolean
+    onChange?           : ( event: ModelChangeEvent<any, any, any> ) => void | Promise<void>
+    onError?            : ( error: Error ) => void
+};
+
+export interface ModelChangeStream<DBE extends Document = Document, DTO = Document, IdType = any> extends AsyncIterable<ModelChangeEvent<DBE, DTO, IdType>>
+{
+    on( event: 'change', listener: ( change: ModelChangeEvent<DBE, DTO, IdType> ) => void ): this;
+    on( event: 'error', listener: ( error: Error ) => void ): this;
+    close(): Promise<void>;
+    readonly closed: boolean;
+}
+
 export type ModelHookContext<DBE extends Document = Document> =
 {
     model?          : unknown
@@ -303,6 +444,7 @@ export type WithTotal<T> = T extends Array<infer U>
 export type GetOptions<K extends string | number | symbol = 'dto'> =
 {
     as?             : K
+    populate?       : PopulateSpec
     includeDeleted? : boolean
     access?         : string
     context?        : Record<string, unknown>
@@ -314,6 +456,7 @@ export type GetManyOptions<K extends string | number | symbol = 'dto'> =
 {
     as?             : K
     filter?         : boolean
+    populate?       : PopulateSpec
     includeDeleted? : boolean
     access?         : string
     context?        : Record<string, unknown>
@@ -330,6 +473,7 @@ export type ModelListOptions<DBE extends Document, Filters = never, Properties =
     filter?             : Filter<DBE>
     smartFilter?        : ModelSmartFilter<Filters>
     computedProperties? : ComputedPropertiesParam<Properties extends AbstractModelProperties<any> ? Properties : any>
+    populate?           : PopulateSpec
     cursor?             : string
     after?              : string
     before?             : string
@@ -359,6 +503,7 @@ export type PropertyModelListOptions
     filter?             : PropertyModelFilter<RootDBE, DBE>
     smartFilter?        : ModelSmartFilter<FirstType<Filters>>
     computedProperties? : ComputedPropertiesParam<SecondType<Properties> extends AbstractModelProperties<any> ? SecondType<Properties> : any>
+    populate?           : PopulateSpec
     cursor?             : string
     after?              : string
     before?             : string
@@ -387,6 +532,7 @@ export type ModelFindOptions<DBE extends Document, Filters = never> =
 {
     filter?         : Filter<DBE>
     smartFilter?    : ModelSmartFilter<Filters>
+    populate?       : PopulateSpec
     cursor?         : string
     after?          : string
     before?         : string
@@ -407,6 +553,7 @@ export type PropertyModelFindOptions
 {
     filter?         : PropertyModelFilter<RootDBE, DBE>
     smartFilter?    : ModelSmartFilter<SecondType<Filters>>
+    populate?       : PopulateSpec
     cursor?         : string
     after?          : string
     before?         : string
@@ -534,6 +681,8 @@ export type ConstructorExtensions<E extends PropertyModelExtensions<any, any, an
         indexes?            : ModelIndexDefinition[]
         timestamps?         : ModelTimestampsConfig
         softDelete?         : ModelSoftDeleteConfig
+        versioning?         : ModelVersioningConfig
+        relations?          : E['relations']
         hooks?              : E['hooks']
     }
 
@@ -556,6 +705,8 @@ export type ModelExtensions
     indexes?            : ModelIndexDefinition[]
     timestamps?         : ModelTimestampsConfig
     softDelete?         : ModelSoftDeleteConfig
+    versioning?         : ModelVersioningConfig
+    relations?          : ModelRelationsConfig<DBE>
     hooks?              : ModelHooksConfig<DBE>
 }
 
@@ -578,6 +729,8 @@ export type PropertyModelExtensions
     indexes?            : ModelIndexDefinition[]
     timestamps?         : ModelTimestampsConfig
     softDelete?         : ModelSoftDeleteConfig
+    versioning?         : ModelVersioningConfig
+    relations?          : ModelRelationsConfig<DBE>
     hooks?              : ModelHooksConfig<DBE>
 }
 
@@ -626,7 +779,7 @@ export type ModelAccessConfig<T = Document> =
     defaults? : AccessDefaultsMap | AccessDefaultsFn
 }
 
-export type ModelValidationOperation = 'create' | 'createMany' | 'update' | 'updateOne' | 'updateMany' | 'upsert' | 'bulkWrite';
+export type ModelValidationOperation = 'create' | 'createMany' | 'update' | 'updateOne' | 'updateMany' | 'upsert' | 'findOneAndUpdate' | 'bulkWrite';
 
 export type ModelValidationContext =
 {

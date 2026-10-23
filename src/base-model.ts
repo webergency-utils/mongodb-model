@@ -11,7 +11,7 @@ from 'mongodb';
 import Aggregator from '@webergency-utils/aggregator';
 import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
 import { AccessControl } from './access-control.js';
-import { ModelCache, ModelCacheConfig, buildCacheKey } from './cache.js';
+import { ModelCache, ModelCacheConfig, ModelCacheStats, buildCacheKey } from './cache.js';
 import { ConverterManager } from './converters.js';
 import { ModelConverterError, ModelError } from './errors.js';
 import
@@ -53,22 +53,29 @@ import
 {
     ResolvedSoftDeleteConfig,
     ResolvedTimestampsConfig,
+    ResolvedVersioningConfig,
     applyCreateTimestamps,
+    applyCreateVersioning,
     applyUpdateTimestamps,
+    applyUpdateVersioning,
     attachCursorToItem,
     attachListMetadata,
     buildSoftDeleteFilter,
     combineMongoFilters,
     convertDocuments,
+    createChangeStreamController,
     executeModelValidator,
+    extractExplainSummary,
     normalizeCursorOption,
     normalizeExistsOptions,
     normalizeFindMatch,
     normalizeGetManyOptions,
     normalizeGetOptions,
     normalizeModelIndexes,
+    normalizePopulateSpecs,
     resolveSoftDeleteConfig,
-    resolveTimestampsConfig
+    resolveTimestampsConfig,
+    resolveVersioningConfig
 }
 from './operations.js';
 import { PipelineBuilder } from './pipeline-builder.js';
@@ -95,11 +102,17 @@ import
     GetManyOptions,
     GetOptions,
     ModelAccessConfig,
+    ModelChangeEvent,
+    ModelChangeOperationType,
+    ModelChangeStream,
     ModelDistinctOptions,
     ModelExistsOptions,
+    ModelExplainResult,
+    ModelExplainVerbosity,
     ModelHookContext,
     ModelHooksConfig,
     ModelIndexDefinition,
+    ModelRelationsConfig,
     ModelSoftDeleteConfig,
     ModelSyncIndexesOptions,
     ModelSyncIndexesResult,
@@ -107,10 +120,13 @@ import
     ModelValidationContext,
     ModelValidationOperation,
     ModelValidatorConfig,
+    ModelVersioningConfig,
+    ModelWatchOptions,
     MongoRootDocument,
     NormalizedModelIndex,
     OptimizerConfig,
     OptimizerOptions,
+    PopulateSpec,
     WithTotal
 }
 from './types/external.js';
@@ -138,6 +154,8 @@ export type BaseModelParams<DBE extends Document> =
     indexes?                : ModelIndexDefinition[]
     timestamps?             : ModelTimestampsConfig
     softDelete?             : ModelSoftDeleteConfig
+    versioning?             : ModelVersioningConfig
+    relations?              : ModelRelationsConfig<DBE>
     hooks?                  : ModelHooksConfig<DBE>
     idField                 : '_id' | 'id'
     prefix?                 : string
@@ -181,6 +199,8 @@ export abstract class AbstractBaseModel
     protected _indexes: NormalizedModelIndex[];
     protected _timestamps?: ResolvedTimestampsConfig;
     protected _softDelete?: ResolvedSoftDeleteConfig;
+    protected _versioning?: ResolvedVersioningConfig;
+    protected _relations?: ModelRelationsConfig<DBE>;
     protected _hooks?: ModelHooksConfig<DBE>;
     protected _idField: '_id' | 'id';
     protected _prefix?: string;
@@ -208,6 +228,8 @@ export abstract class AbstractBaseModel
         this._indexes = normalizeModelIndexes( params.indexes, params.prefix );
         this._timestamps = resolveTimestampsConfig( params.timestamps );
         this._softDelete = resolveSoftDeleteConfig( params.softDelete );
+        this._versioning = resolveVersioningConfig( params.versioning );
+        this._relations = params.relations;
         this._hooks = params.hooks;
         this._pipelineBuilder = new PipelineBuilder<CollectionDoc>();
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
@@ -741,6 +763,89 @@ export abstract class AbstractBaseModel
         this._emitCache( 'invalidate' );
     }
 
+    public cacheStats(): ModelCacheStats
+    {
+        if( !this._cache )
+        {
+            return {
+                enabled         : false,
+                hits            : 0,
+                misses          : 0,
+                sets            : 0,
+                invalidations   : 0,
+                clears          : 0,
+                size            : 0,
+                hitRate         : 0
+            };
+        }
+
+        return this._cache.stats();
+    }
+
+    public async invalidateCache( ids?: IdType | IdType[], options?: { notifySiblings?: boolean } ): Promise<void>
+    {
+        const notifySiblings = options?.notifySiblings !== false;
+
+        if( ids === undefined )
+        {
+            if( notifySiblings )
+            {
+                this._notifySiblingCacheInvalidation();
+            }
+
+            if( this._cache )
+            {
+                await this._cache.clearAsync();
+                this._emitCache( 'invalidate' );
+            }
+
+            return;
+        }
+
+        const idArray = Array.isArray( ids ) ? ids : [ ids ];
+
+        if( idArray.length === 0 ){ return }
+
+        const normalizedIds = idArray.map( id => String( this.dtoID( id )));
+
+        if( notifySiblings )
+        {
+            this._notifySiblingCacheInvalidation();
+        }
+
+        if( this._cache )
+        {
+            const evicted = await this._cache.invalidateIdsAsync( normalizedIds );
+
+            if( evicted.length > 0 )
+            {
+                this._emitCache( 'invalidate', { ids: normalizedIds });
+            }
+        }
+    }
+
+    public async primeCache<K extends keyof Extensions['converters'] = 'dto'>(
+        id: IdType,
+        value: unknown,
+        options?: { as?: K, access?: string, includeDeleted?: boolean }
+    ): Promise<void>
+    {
+        if( !this._cache ){ return }
+
+        const conversion = String( options?.as ?? 'dto' );
+        const access = await this._access.resolveOrDeny({ operation: 'read', method: 'get', access: options?.access });
+
+        if( access.denied ){ return }
+
+        const baseScopeKey = access.filter ? objectHash( access.filter ) : undefined;
+        const scopeKey = options?.includeDeleted ? `${baseScopeKey ?? ''}|incDel` : baseScopeKey;
+        const dtoId = String( this.dtoID( id ));
+        const cacheKey = buildCacheKey( conversion, dtoId, scopeKey );
+
+        await this._cache.setAsync( cacheKey, value, [ dtoId ]);
+        this._emitCache( 'set', { key: cacheKey, ids: [ dtoId ], conversion });
+    }
+
     protected _notifySiblingCacheInvalidation(): void
     {
         this._models[INVALIDATE_COLLECTION_CACHE]?.( this, this.collection.collectionName );
@@ -833,12 +938,189 @@ export abstract class AbstractBaseModel
 
     protected _applyCreateTimestamps( doc: Record<string, any>, now: Date = new Date() ): Record<string, any>
     {
-        return applyCreateTimestamps( doc, this._timestamps, now );
+        return applyCreateVersioning( applyCreateTimestamps( doc, this._timestamps, now ), this._versioning );
     }
 
     protected _applyUpdateTimestamps( update: Record<string, any>, now: Date = new Date(), isUpsert: boolean = false ): Record<string, any>
     {
         return applyUpdateTimestamps( update, this._timestamps, now, isUpsert );
+    }
+
+    protected _applyUpdateVersioning<T extends Record<string, any>>( update: T ): T
+    {
+        return applyUpdateVersioning( update, this._versioning );
+    }
+
+    protected async _hydrateRelations<T>(
+        items: T[],
+        populate?: PopulateSpec,
+        options?: { access?: string, includeDeleted?: boolean, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+    ): Promise<T[]>
+    {
+        if( !populate || !this._relations || items.length === 0 )
+        {
+            return items;
+        }
+
+        const specs = normalizePopulateSpecs( populate );
+
+        if( specs.length === 0 )
+        {
+            return items;
+        }
+
+        const validItems = items.filter(( item ): item is NonNullable<T> => item !== null && item !== undefined && typeof item === 'object' );
+
+        if( validItems.length === 0 )
+        {
+            return items;
+        }
+
+        for( const spec of specs )
+        {
+            const relName = spec.path;
+            const def = this._relations[relName];
+
+            if( !def ){ continue }
+
+            const rawTarget = typeof def.model === 'function' ? def.model() : def.model;
+            const targetModel = typeof rawTarget === 'string' ? this._models.getModel( rawTarget ) : rawTarget;
+
+            if( !targetModel ){ continue }
+
+            const conversion = spec.as ?? def.as ?? 'dto';
+            const includeDeleted = spec.includeDeleted ?? def.includeDeleted ?? options?.includeDeleted;
+            const foreignField = def.foreignField ?? '_id';
+
+            if( foreignField !== '_id' && foreignField !== 'id' )
+            {
+                const localField = ( def.localField as string | undefined ) ?? 'id';
+                const getLocalVal = ( item: any ) => item[localField] ?? item._id;
+                const uniqueLocalVals = Array.from( new Set( validItems.map( getLocalVal ).filter( v => v !== undefined && v !== null )));
+                const isSingle = Boolean( def.type === 'one' || def.justOne );
+
+                if( uniqueLocalVals.length > 0 )
+                {
+                    const relatedList = await targetModel.list(
+                        {
+                            filter          : { [foreignField]: { $in: uniqueLocalVals } },
+                            limit           : 0,
+                            includeDeleted,
+                            populate        : spec.populate,
+                            access          : options?.access,
+                            context         : options?.context,
+                            traceID         : options?.traceID,
+                            session         : options?.session
+                        },
+                        conversion as any
+                    );
+
+                    const grouped = new Map<string, any[]>();
+
+                    for( const relItem of relatedList )
+                    {
+                        const fkVal = ( relItem as any )?.[foreignField];
+
+                        if( fkVal === undefined || fkVal === null ){ continue }
+
+                        for( const k of ( Array.isArray( fkVal ) ? fkVal : [ fkVal ] ))
+                        {
+                            const key = String( k );
+                            const bucket = grouped.get( key ) ?? [];
+
+                            bucket.push( relItem );
+                            grouped.set( key, bucket );
+                        }
+                    }
+
+                    for( const item of validItems )
+                    {
+                        const matches = grouped.get( String( getLocalVal( item ))) ?? [];
+
+                        ( item as any )[relName] = isSingle ? ( matches[0] ?? null ) : matches;
+                    }
+                }
+                else
+                {
+                    for( const item of validItems )
+                    {
+                        ( item as any )[relName] = isSingle ? null : [];
+                    }
+                }
+
+                continue;
+            }
+
+            const resolveLocalField = ( item: Record<string, any> ): string =>
+            {
+                if( def.localField ){ return def.localField as string }
+                if( `${relName}Id` in item ){ return `${relName}Id` }
+                if( `${relName}Ids` in item ){ return `${relName}Ids` }
+                if( `${relName}_id` in item ){ return `${relName}_id` }
+
+                return relName;
+            };
+
+            const normId = ( v: unknown ) => String(( targetModel as any ).dtoID( v ));
+            const idMap = new Map<string, any>();
+
+            for( const item of validItems )
+            {
+                const rawVal = ( item as any )[resolveLocalField( item as Record<string, any> )];
+
+                for( const v of ( Array.isArray( rawVal ) ? rawVal : [ rawVal ] ))
+                {
+                    if( v !== undefined && v !== null )
+                    {
+                        idMap.set( normId( v ), v );
+                    }
+                }
+            }
+
+            const uniqueIds = Array.from( idMap.values() );
+            const uniqueNormKeys = Array.from( idMap.keys() );
+            const fetched = uniqueIds.length > 0
+                ? await targetModel.getMany( uniqueIds,
+                {
+                    as              : conversion as any,
+                    includeDeleted,
+                    populate        : spec.populate,
+                    access          : options?.access,
+                    context         : options?.context,
+                    traceID         : options?.traceID,
+                    session         : options?.session
+                })
+                : [];
+
+            const byId = new Map<string, any>();
+
+            for( let i = 0; i < uniqueNormKeys.length; i++ )
+            {
+                if( fetched[i] !== null && fetched[i] !== undefined )
+                {
+                    byId.set( uniqueNormKeys[i], fetched[i] );
+                }
+            }
+
+            for( const item of validItems )
+            {
+                const rawVal = ( item as any )[resolveLocalField( item as Record<string, any> )];
+                const isMany = def.type === 'many' || ( def.type === undefined && !def.justOne && Array.isArray( rawVal ));
+
+                if( isMany )
+                {
+                    const list = Array.isArray( rawVal ) ? rawVal : [ rawVal ];
+
+                    ( item as any )[relName] = list.map( v => byId.get( normId( v ))).filter( Boolean );
+                }
+                else
+                {
+                    ( item as any )[relName] = ( rawVal !== undefined && rawVal !== null && byId.get( normId( rawVal ))) || null;
+                }
+            }
+        }
+
+        return items;
     }
 
     protected _softDeleteFilter( includeDeleted?: boolean ): Document | undefined
@@ -1277,11 +1559,18 @@ export abstract class AbstractBaseModel
             {
                 dtoId = String( this.dtoID( idOrIds ));
                 cacheKey = buildCacheKey( String( conversion ), dtoId, scopeKey );
-                const cached = this._cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
+                const cached = this._cache.hasAsyncStore
+                    ? await this._cache.getAsync<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey, [ dtoId ])
+                    : this._cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
 
                 if( cached !== undefined )
                 {
                     this.#emitCacheEntry( 'hit', cacheKey, dtoId, conversion, options );
+
+                    if( options.populate )
+                    {
+                        await this._hydrateRelations([ cached ], options.populate, options );
+                    }
 
                     return cached;
                 }
@@ -1324,8 +1613,21 @@ export abstract class AbstractBaseModel
 
             if( this._cache && !session && cacheKey && dtoId !== undefined && result !== null )
             {
-                this._cache.set( cacheKey, result, [ dtoId ]);
+                if( this._cache.hasAsyncStore )
+                {
+                    await this._cache.setAsync( cacheKey, result, [ dtoId ]);
+                }
+                else
+                {
+                    this._cache.set( cacheKey, result, [ dtoId ]);
+                }
+
                 this.#emitCacheEntry( 'set', cacheKey, dtoId, conversion, options );
+            }
+
+            if( result !== null && options.populate )
+            {
+                await this._hydrateRelations([ result ], options.populate, options );
             }
 
             return result;
@@ -1380,7 +1682,9 @@ export abstract class AbstractBaseModel
                     const id = ids[i];
                     const dtoId = String( this.dtoID( id ));
                     const cacheKey = buildCacheKey( String( conversion ), dtoId, scopeKey );
-                    const cached = this._cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
+                    const cached = this._cache.hasAsyncStore
+                        ? await this._cache.getAsync<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey, [ dtoId ])
+                        : this._cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
 
                     if( cached !== undefined )
                     {
@@ -1443,7 +1747,14 @@ export abstract class AbstractBaseModel
 
                         if( entry !== null )
                         {
-                            this._cache.set( target.cacheKey, entry, [ target.dtoId ]);
+                            if( this._cache.hasAsyncStore )
+                            {
+                                await this._cache.setAsync( target.cacheKey, entry, [ target.dtoId ]);
+                            }
+                            else
+                            {
+                                this._cache.set( target.cacheKey, entry, [ target.dtoId ]);
+                            }
 
                             if( observeCache )
                             {
@@ -1453,7 +1764,14 @@ export abstract class AbstractBaseModel
                     }
                 }
 
-                return options.filter ? results.filter( Boolean ) : results;
+                const finalCachedResults = options.filter ? results.filter( Boolean ) : results;
+
+                if( options.populate )
+                {
+                    await this._hydrateRelations( finalCachedResults, options.populate, options );
+                }
+
+                return finalCachedResults;
             }
 
             const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, batchScopeKey, ids,
@@ -1485,18 +1803,23 @@ export abstract class AbstractBaseModel
 
             benchmark?.step( 'CONVERTER' );
 
+            if( options.populate )
+            {
+                await this._hydrateRelations( entries, options.populate, options );
+            }
+
             return entries as Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
         });
     }
 
-    protected _stripObservabilityOptions<T extends { context?: Record<string, unknown>, traceID?: string, session?: ClientSession }>( options: T ): Omit<T, 'context' | 'traceID' | 'session'>
+    protected _stripObservabilityOptions<T extends { context?: Record<string, unknown>, traceID?: string, session?: ClientSession, populate?: PopulateSpec }>( options: T ): Omit<T, 'context' | 'traceID' | 'session' | 'populate'>
     {
-        if( !options || ( options.context === undefined && options.traceID === undefined && options.session === undefined ) )
+        if( !options || ( options.context === undefined && options.traceID === undefined && options.session === undefined && options.populate === undefined ) )
         {
-            return ( options ?? {} ) as Omit<T, 'context' | 'traceID' | 'session'>;
+            return ( options ?? {} ) as Omit<T, 'context' | 'traceID' | 'session' | 'populate'>;
         }
 
-        const { context: _c, traceID: _t, session: _s, ...rest } = options;
+        const { context: _c, traceID: _t, session: _s, populate: _p, ...rest } = options;
 
         return rest;
     }
@@ -1592,6 +1915,11 @@ export abstract class AbstractBaseModel
         }));
 
         benchmark?.step( 'CONVERTER' );
+
+        if( options.populate )
+        {
+            await this._hydrateRelations( items, options.populate, options );
+        }
 
         const first = orderedEntries[0];
         const last = orderedEntries[orderedEntries.length - 1];
@@ -1945,6 +2273,11 @@ export abstract class AbstractBaseModel
 
             benchmark?.step( 'CONVERTER' );
 
+            if( data && opts.populate )
+            {
+                await this._hydrateRelations([ data ], opts.populate, opts );
+            }
+
             return data;
         }) as Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
     }
@@ -2193,6 +2526,194 @@ export abstract class AbstractBaseModel
 
             return uniqueValues;
         });
+    }
+
+    public async explain(
+        optionsOrPipeline: ListOpts | Document[] = {} as ListOpts,
+        verbosity: ModelExplainVerbosity = 'executionStats'
+    ): Promise<ModelExplainResult>
+    {
+        return this.runOperation( async() =>
+        {
+            let pipeline: Document[];
+            let session: ClientSession | undefined;
+
+            if( Array.isArray( optionsOrPipeline ) )
+            {
+                const access = await this._access.resolveOrDeny({ operation: 'read', method: 'explain' });
+
+                pipeline = this._optimizePipeline([
+                    ...await this.pipeline({ [RESOLVED_ACCESS]: access }, 'dbe' as any, 'explain' ),
+                    ...( resolveBSONObject( optionsOrPipeline ) as Document[] )
+                ]);
+            }
+            else
+            {
+                const opts = ( optionsOrPipeline ?? {} ) as any;
+                session = opts.session;
+                const bsonInput = this._stripObservabilityOptions( opts );
+                const { projection: convProjection } = this.converters['dto'];
+                const access = await this._access.resolveOrDeny({ operation: 'read', method: 'explain', access: opts.access });
+                const resolvedList = resolveBSONObject( bsonInput );
+                const effectiveCursor = normalizeCursorOption( resolvedList );
+                let { sort = { [this._idField]: 1 }, projection = convProjection } = resolvedList;
+
+                if( !sort[this._idField] )
+                {
+                    sort = { ...sort, [this._idField]: 1 };
+                }
+
+                pipeline = await this.pipeline(
+                {
+                    ...resolvedList,
+                    cursor              : effectiveCursor,
+                    sort,
+                    projection,
+                    [RESOLVED_ACCESS]   : access,
+                    [INCLUDE_DELETED]   : opts.includeDeleted
+                } as any, 'dto' as any, 'explain' );
+
+                pipeline = this._optimizePipeline( pipeline );
+            }
+
+            const aggOpts = this._withSession({ collation: { locale: 'en' } }, session );
+            const cursor = this.collection.aggregate( pipeline, aggOpts ) as any;
+            const db = ( this._models as any )?.client?.db?.();
+            const raw: Document = ( await cursor?.explain?.( verbosity ))
+                ?? ( await db?.command?.({ explain: { aggregate: this.collection.collectionName, pipeline, cursor: {} }, verbosity }))
+                ?? { stages: pipeline };
+
+            return extractExplainSummary( this._collectionLabel, pipeline, raw );
+        });
+    }
+
+    public watch<K extends keyof Extensions['converters'] = 'dto'>(
+        options?: ModelWatchOptions<K>
+    ): ModelChangeStream<DBE, Awaited<ReturnType<Extensions['converters'][K]['converter']>>, IdType>
+    {
+        type DTOOut = Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+        type EventOut = ModelChangeEvent<DBE, DTOOut, IdType>;
+
+        const watchPipeline: Document[] = [];
+
+        if( options?.operations?.length )
+        {
+            watchPipeline.push({ $match: { operationType: { $in: options.operations } } });
+        }
+
+        if( options?.filter )
+        {
+            watchPipeline.push({ $match: options.filter });
+        }
+
+        if( options?.pipeline?.length )
+        {
+            watchPipeline.push( ...options.pipeline );
+        }
+
+        const watchOpts: Record<string, any> = {};
+
+        for( const key of [ 'fullDocument', 'resumeAfter', 'startAfter', 'batchSize', 'maxAwaitTimeMS' ] as const )
+        {
+            if( options?.[key] !== undefined ){ watchOpts[key] = options[key] }
+        }
+
+        const rawWatch = ( this.collection as any ).watch?.(
+            watchPipeline,
+            ...( Object.keys( watchOpts ).length > 0 ? [ watchOpts ] : [] )
+        );
+
+        const { stream, emitChange, emitError, isClosed } = createChangeStreamController<EventOut>( async() =>
+        {
+            await rawWatch?.close?.();
+        });
+
+        const handleRawChange = async( rawChange: Document ): Promise<void> =>
+        {
+            if( isClosed() || !rawChange ){ return }
+
+            const operationType = ( rawChange.operationType ?? 'update' ) as ModelChangeOperationType;
+            const rawId = rawChange.documentKey?._id ?? rawChange.fullDocument?._id;
+            const dtoId = rawId !== undefined ? ( this.dtoID( rawId ) as unknown as IdType ) : undefined;
+
+            if( options?.invalidateCache !== false )
+            {
+                if( this._idField === '_id' && rawId !== undefined )
+                {
+                    this._invalidateCache([ rawId ], true );
+                }
+                else
+                {
+                    this._clearCache( true );
+                }
+            }
+
+            let dto: DTOOut | null | undefined = undefined;
+
+            if( options?.convert !== false && rawChange.fullDocument && this._idField === '_id' )
+            {
+                const conversion = ( options?.as ?? 'dto' ) as K;
+                dto = await this._converters.convert( rawChange.fullDocument as DBE, conversion ) as DTOOut;
+            }
+
+            const event: EventOut =
+            {
+                operationType,
+                collection          : this._collectionLabel,
+                model               : this.constructor.name,
+                id                  : dtoId,
+                documentKey         : rawChange.documentKey,
+                fullDocument        : rawChange.fullDocument as DBE | undefined,
+                dto,
+                updateDescription   : rawChange.updateDescription,
+                resumeToken         : rawChange._id as Record<string, unknown> | undefined,
+                raw                 : rawChange
+            };
+
+            await Promise.resolve( options?.onChange?.( event )).catch(() => {});
+            emitChange( event );
+        };
+
+        const handleRawError = ( err: unknown ): void =>
+        {
+            if( isClosed() ){ return }
+
+            const normalizedErr = err instanceof Error ? err : new Error( String( err ));
+
+            options?.onError?.( normalizedErr );
+            emitError( normalizedErr );
+        };
+
+        if( typeof rawWatch?.on === 'function' )
+        {
+            rawWatch.on( 'change', ( doc: Document ) =>
+            {
+                void handleRawChange( doc ).catch( handleRawError );
+            });
+
+            rawWatch.on( 'error', handleRawError );
+        }
+        else if( typeof rawWatch?.[Symbol.asyncIterator] === 'function' )
+        {
+            void ( async() =>
+            {
+                try
+                {
+                    for await( const doc of rawWatch )
+                    {
+                        if( isClosed() ){ break }
+
+                        await handleRawChange( doc );
+                    }
+                }
+                catch( err )
+                {
+                    handleRawError( err );
+                }
+            })();
+        }
+
+        return stream;
     }
 
     protected async accessFilter( _name: string ): Promise<AccessFilterResult<AccessFilterDoc>> {}

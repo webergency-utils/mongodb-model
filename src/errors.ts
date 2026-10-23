@@ -79,3 +79,23 @@ export class ModelAccessConfigError extends ModelError
         Error.captureStackTrace( this, this.constructor );
     }
 }
+
+export class ModelVersionConflictError extends ModelError
+{
+    public readonly id?: unknown;
+    public readonly expectedVersion?: number;
+
+    constructor( model: object, id?: unknown, expectedVersion?: number, message?: string )
+    {
+        super(
+            'MODEL_VERSION_CONFLICT',
+            model,
+            message ?? `Version conflict${id !== undefined ? ` for ${String( id )}` : ''}${expectedVersion !== undefined ? ` (expected version ${expectedVersion})` : ''}`
+        );
+
+        this.id = id;
+        this.expectedVersion = expectedVersion;
+
+        Error.captureStackTrace( this, this.constructor );
+    }
+}

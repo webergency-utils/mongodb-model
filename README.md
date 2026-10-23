@@ -82,10 +82,10 @@ See `example/` for a full domain (organizations → jobs → embedded applicatio
 
 - **Registry:** `AbstractModels` owns the shared `MongoClient`, Flow `scope`, transactions, collection-wide cache invalidation, and `shutdown()`.
 - **Shared Base Model:** `AbstractBaseModel` is the shared superclass of `AbstractModel` and `AbstractPropertyModel`, owning collaborator state, lifecycle tracking, `ModelCache`, observability emitters (`on` / `off`), `Aggregator` batching, and read methods (`get`, `getMany`, `find`, `aggregate`, `count`, `exists`).
-- **Root models:** `AbstractModel` / `defineModel` / `Model` — document CRUD (`create`, `createFrom`, `createMany`, `update`, `updateOne`, `updateMany`, `upsert`, `delete`, `deleteMany`, `restore`, `restoreMany`, `hardDelete`, `hardDeleteMany`, `bulkWrite`), `list`/`stream`/`find`/`aggregate`/`count`/`exists`/`distinct`, `syncIndexes`, converter recipes, smart filters, computed properties, named access, timestamps, soft delete, and lifecycle hooks.
-- **Property models:** `AbstractPropertyModel` / `definePropertyModel` / `PropertyModel` — embedded array/object paths (e.g. `applications[]`) with the same read/write surface (`create(parentID, ...)`, `createFrom(parentID, ...)`, `createMany(parentID, ...)`, `update`, `updateOne`, `updateMany`, `upsert`, `delete`, `deleteMany`, `restore`, `restoreMany`, `hardDelete`, `hardDeleteMany`, `bulkWrite`, `distinct`, `syncIndexes`).
+- **Root models:** `AbstractModel` / `defineModel` / `Model` — document CRUD (`create`, `createFrom`, `createMany`, `update`, `updateOne`, `updateMany`, `upsert`, `findOneAndUpdate`, `findOneAndDelete`, `delete`, `deleteMany`, `restore`, `restoreMany`, `hardDelete`, `hardDeleteMany`, `bulkWrite`), `list`/`stream`/`find`/`aggregate`/`count`/`exists`/`distinct`/`explain`/`watch`, `syncIndexes`, converter recipes, smart filters, computed properties, relations (`populate`), named access, timestamps, soft delete, optimistic concurrency (`versioning`), and lifecycle hooks.
+- **Property models:** `AbstractPropertyModel` / `definePropertyModel` / `PropertyModel` — embedded array/object paths (e.g. `applications[]`) with the same read/write surface (`create(parentID, ...)`, `createFrom(parentID, ...)`, `createMany(parentID, ...)`, `update`, `updateOne`, `updateMany`, `upsert`, `findOneAndUpdate`, `findOneAndDelete`, `delete`, `deleteMany`, `restore`, `restoreMany`, `hardDelete`, `hardDeleteMany`, `bulkWrite`, `distinct`, `explain`, `watch`, `syncIndexes`).
 - **Access:** Named policies in `access.filters`; `defaults` picks a policy from operation + Flow auth. Subdocument ID mutations verify subdocument predicates via pipeline before mutating.
-- **Caching:** Built-in `ModelCache` (`cache: true | ModelCacheOptions | ModelCacheInstance`) caches `get` / `getMany` results per conversion and access scope, automatically invalidating on ID mutations, clearing on filter mutations, and invalidating sibling models registered on the same collection.
+- **Caching:** Built-in `ModelCache` (`cache: true | ModelCacheOptions | ModelCacheInstance`) caches `get` / `getMany` results per conversion and access scope with optional distributed L2 store (`store: ModelExternalCacheStore`), automatically invalidating on ID mutations, clearing on filter mutations, and invalidating sibling models registered on the same collection.
 - **Observability:** Hierarchical `observability` configuration (`AbstractModels` -> `AbstractModel` -> `AbstractPropertyModel`) with O(1) fast-path operation filtering (`operations`), three-tier synchronous `context` resolution (`options.context` > `models.scope` `context` > `observability.context`), rich caller `query` / `mutation` metadata, and `internal: true` pre-query attribution.
 - **Pagination:** Opaque cursors from `list` (`next:` / `prev:`); `stream` yields one converted document at a time.
 - **Dual ObjectId installs:** BSON resolve / update / access / cursor paths coerce foreign ObjectId-like values.
@@ -192,13 +192,35 @@ Configure `observability` on `AbstractModels`, `AbstractModel`, or `AbstractProp
 - **Declarative Index Management (`indexes` & `syncIndexes`)**: Declare `indexes` on root and property models (property model index keys are automatically prefixed with the embedded path). Call `await model.syncIndexes({ dryRun?, dropObsolete?, background? })` or `await models.syncIndexes(...)` to inspect and synchronize collection indexes.
 - **Bulk Operations (`bulkWrite`)**: `await model.bulkWrite(operations, options?)` executes mixed batch mutations (`create`, `insertOne`, `update`, `updateOne`, `updateMany`, `upsert`, `delete`, `deleteOne`, `deleteMany`) with full access control, timestamps, soft-delete translation, validation, hooks, observability, and cache invalidation.
 
+### Atomic `findOneAndUpdate` & `findOneAndDelete`, Optimistic Concurrency, Relations, Explain, Change Streams & L2 Cache
+
+- **Atomic `findOneAndUpdate` & `findOneAndDelete`:**
+  - `await model.findOneAndUpdate(idOrFilter, update, options?)` and `await model.findOneAndDelete(idOrFilter, options?)` (available on both `AbstractModel` and `AbstractPropertyModel`) atomically mutate and return the converted DTO (default `'dto'`, or any converter via `{ as: 'summary' }` or shorthand `'summary'`).
+  - Supports `{ returnDocument: 'before' | 'after', sort, upsert, expectedVersion, populate, hard }`.
+- **Optimistic Concurrency Control (`versioning` & `ModelVersionConflictError`):**
+  - Configure `versioning: true | 'versionField' | { field?: string, initialVersion?: number }` on models.
+  - Automatically initializes the version field on `create` / `createMany` / `upsert` and increments it via `$inc` on updates.
+  - Pass `{ expectedVersion: number }` to `update`, `updateOne`, `updateMany`, `findOneAndUpdate`, or `bulkWrite` operations; if a concurrent write modified the document first, throws `ModelVersionConflictError` (`MODEL_VERSION_CONFLICT`).
+- **Application-Level Relation Hydration (`relations` & `populate`):**
+  - Declare `relations` on `defineModel` / `definePropertyModel` (`{ author: { model: () => users, localField: 'authorId', type: 'one' }, comments: { model: 'comments', foreignField: 'postId', type: 'many' } }`).
+  - Pass `populate: 'author' | ['author', 'comments'] | [{ path: 'author', as: 'summary', populate: 'organization' }]` (or dot-notation `'author.organization'`) to `get`, `getMany`, `find`, `list`, `findOneAndUpdate`, and `findOneAndDelete`. Hydrates related records in batched `getMany` / `list` calls (DataLoader-style) without `$lookup` pipeline bloat.
+- **Query Plan Inspection & Diagnostics (`explain`, `ping`, `healthCheck`, `cacheStats`):**
+  - `await model.explain(listOptionsOrPipeline?, verbosity?)` returns a structured `ModelExplainResult` (`collection`, `pipeline`, `winningPlan`, `indexUsed`, `isCollectionScan`, `totalDocsExamined`, `totalKeysExamined`, `executionTimeMillis`, `nReturned`, `raw`).
+  - `await models.ping()` and `await models.healthCheck()` report connectivity, latency, registered model/collection counts, in-flight operation count, and shutdown status.
+  - `model.cacheStats()` returns `{ hits, misses, sets, invalidations, clears, size, hitRate }`.
+- **Change Streams & Cross-Instance Cache Invalidation (`watch`):**
+  - `const stream = model.watch({ operations, filter, fullDocument, as, invalidateCache, onChange, onError })` (and `models.watch(...)`) wraps MongoDB Change Streams with automatic local/sibling cache invalidation, DTO conversion, event emitter (`stream.on('change' | 'error', ...)`), and `AsyncIterable` (`for await (const ev of stream)`) support.
+- **Async / Distributed L2 Cache Adapter (`ModelExternalCacheStore`, `invalidateCache`, `primeCache`):**
+  - Pass `store: ModelExternalCacheStore` (`get`, `getMany`, `set`, `setMany`, `delete`, `clear`) in `cache` options for a two-tier L1 (in-memory) + L2 (Redis / Valkey / custom) cache with automatic L1 backfill on L2 hits.
+  - `model.invalidateCache(idOrIds?)` and `model.primeCache(id, value, options?)` provide public cache invalidation and warming hooks.
+
 ### Helpers (selected)
 
 Re-exported object helpers include `objectHash`, `objectFlatten`, `deleteNullishProperties`, `i18n`, and related utilities. Pipeline/access internals (`PipelineBuilder`, `AccessControl`) are available for advanced composition.
 
 ### Errors
 
-- `ModelError`, `ModelQueryError`, `ModelConverterError`, `ModelAccessDeniedError`, `ModelAccessConfigError`, `ModelValidationError`, `ConverterRecipeError`
+- `ModelError`, `ModelQueryError`, `ModelConverterError`, `ModelAccessDeniedError`, `ModelAccessConfigError`, `ModelValidationError`, `ModelVersionConflictError`, `ConverterRecipeError`
 
 ## Troubleshooting
 

@@ -1,6 +1,27 @@
 import { ObjectId } from 'mongodb';
 import { isForeignObjectIdLike, isLibraryObjectId } from './helpers/mongo.js';
 
+export interface ModelExternalCacheStore
+{
+    get( key: string ): unknown | undefined | Promise<unknown | undefined>;
+    set( key: string, value: unknown, ttlMs?: number, ids?: string[] ): void | Promise<void>;
+    invalidateIds?( ids: string[] ): string[] | void | Promise<string[] | void>;
+    delete?( key: string | string[] ): void | Promise<void>;
+    clear?(): void | Promise<void>;
+}
+
+export type ModelCacheStats =
+{
+    enabled         : boolean
+    hits            : number
+    misses          : number
+    sets            : number
+    invalidations   : number
+    clears          : number
+    size            : number
+    hitRate         : number
+};
+
 export type ModelCacheOptions =
 {
     ttl?     : number
@@ -8,6 +29,7 @@ export type ModelCacheOptions =
     sliding? : boolean
     maxSize? : number
     clone?   : boolean
+    store?   : ModelExternalCacheStore
 };
 
 export interface ModelCacheInstance
@@ -16,6 +38,7 @@ export interface ModelCacheInstance
     set( key: string, value: unknown, ids?: string[] ): void;
     invalidateIds( ids: string[] ): string[];
     clear(): void;
+    stats?(): ModelCacheStats;
 }
 
 export type ModelCacheConfig = boolean | ModelCacheOptions | ModelCacheInstance;
@@ -214,6 +237,7 @@ export function extractTargetIdsFromFilter(
 export class ModelCache implements ModelCacheInstance
 {
     #delegate?: ModelCacheInstance;
+    #store?: ModelExternalCacheStore;
     #entries = new Map<string, CacheEntry>();
     #idIndex = new Map<string, Set<string>>();
     #ttl: number;
@@ -221,6 +245,11 @@ export class ModelCache implements ModelCacheInstance
     #sliding: boolean;
     #maxSize?: number;
     #clone: boolean;
+    #hits = 0;
+    #misses = 0;
+    #sets = 0;
+    #invalidations = 0;
+    #clears = 0;
 
     constructor( config: ModelCacheConfig = true )
     {
@@ -241,6 +270,33 @@ export class ModelCache implements ModelCacheInstance
         this.#sliding = options.sliding ?? false;
         this.#maxSize = options.maxSize;
         this.#clone = options.clone ?? true;
+        this.#store = options.store;
+    }
+
+    public get hasAsyncStore(): boolean
+    {
+        return Boolean( this.#store );
+    }
+
+    public stats(): ModelCacheStats
+    {
+        if( this.#delegate?.stats )
+        {
+            return this.#delegate.stats();
+        }
+
+        const total = this.#hits + this.#misses;
+
+        return {
+            enabled         : true,
+            hits            : this.#hits,
+            misses          : this.#misses,
+            sets            : this.#sets,
+            invalidations   : this.#invalidations,
+            clears          : this.#clears,
+            size            : this.#entries.size,
+            hitRate         : total > 0 ? this.#hits / total : 0
+        };
     }
 
     public get<T = unknown>( key: string ): T | undefined
@@ -249,13 +305,24 @@ export class ModelCache implements ModelCacheInstance
         {
             const val = this.#delegate.get( key );
 
-            return ( val !== undefined && this.#clone ? cloneCachedValue( val ) : val ) as T | undefined;
+            if( val !== undefined )
+            {
+                this.#hits++;
+
+                return ( this.#clone ? cloneCachedValue( val ) : val ) as T;
+            }
+
+            this.#misses++;
+
+            return undefined;
         }
 
         const entry = this.#entries.get( key );
 
         if( !entry )
         {
+            this.#misses++;
+
             return undefined;
         }
 
@@ -264,6 +331,7 @@ export class ModelCache implements ModelCacheInstance
         if( now >= entry.expiresAt )
         {
             this.#deleteKey( key, entry );
+            this.#misses++;
 
             return undefined;
         }
@@ -279,21 +347,37 @@ export class ModelCache implements ModelCacheInstance
         // Refresh LRU order
         this.#entries.delete( key );
         this.#entries.set( key, entry );
+        this.#hits++;
 
         return ( this.#clone ? cloneCachedValue( entry.value ) : entry.value ) as T;
     }
 
-    public set( key: string, value: unknown, ids: string[] = [] ): void
+    public async getAsync<T = unknown>( key: string, ids: string[] = [] ): Promise<T | undefined>
     {
-        const storedValue = this.#clone ? cloneCachedValue( value ) : value;
+        const local = this.get<T>( key );
 
-        if( this.#delegate )
+        if( local !== undefined || !this.#store )
         {
-            this.#delegate.set( key, storedValue, ids );
-
-            return;
+            return local;
         }
 
+        const externalVal = await this.#store.get( key );
+
+        if( externalVal !== undefined )
+        {
+            this.#misses--;
+            this.#hits++;
+            this.#setLocal( key, externalVal, ids );
+
+            return ( this.#clone ? cloneCachedValue( externalVal ) : externalVal ) as T;
+        }
+
+        return undefined;
+    }
+
+    #setLocal( key: string, value: unknown, ids: string[] = [] ): unknown
+    {
+        const storedValue = this.#clone ? cloneCachedValue( value ) : value;
         const existing = this.#entries.get( key );
 
         if( existing )
@@ -339,25 +423,54 @@ export class ModelCache implements ModelCacheInstance
 
             keysForId.add( key );
         }
+
+        return storedValue;
     }
 
-    public invalidateIds( ids: string[] ): string[]
+    public set( key: string, value: unknown, ids: string[] = [] ): void
     {
+        this.#sets++;
+
         if( this.#delegate )
         {
-            return this.#delegate.invalidateIds( ids );
+            const storedValue = this.#clone ? cloneCachedValue( value ) : value;
+
+            this.#delegate.set( key, storedValue, ids );
+
+            return;
         }
 
+        const storedValue = this.#setLocal( key, value, ids );
+
+        if( this.#store )
+        {
+            void Promise.resolve( this.#store.set( key, storedValue, this.#ttl, ids )).catch(() => {});
+        }
+    }
+
+    public async setAsync( key: string, value: unknown, ids: string[] = [] ): Promise<void>
+    {
+        if( !this.#store )
+        {
+            this.set( key, value, ids );
+
+            return;
+        }
+
+        this.#sets++;
+        const storedValue = this.#setLocal( key, value, ids );
+        await this.#store.set( key, storedValue, this.#ttl, ids );
+    }
+
+    #invalidateLocalIds( ids: string[] ): string[]
+    {
         const evictedKeys: string[] = [];
 
         for( const id of ids )
         {
             const keys = this.#idIndex.get( id );
 
-            if( !keys )
-            {
-                continue;
-            }
+            if( !keys ){ continue }
 
             this.#idIndex.delete( id );
 
@@ -376,8 +489,63 @@ export class ModelCache implements ModelCacheInstance
         return evictedKeys;
     }
 
+    public invalidateIds( ids: string[] ): string[]
+    {
+        this.#invalidations++;
+
+        if( this.#delegate )
+        {
+            return this.#delegate.invalidateIds( ids );
+        }
+
+        const evictedKeys = this.#invalidateLocalIds( ids );
+
+        if( this.#store )
+        {
+            if( typeof this.#store.invalidateIds === 'function' )
+            {
+                void Promise.resolve( this.#store.invalidateIds( ids )).catch(() => {});
+            }
+            else if( typeof this.#store.delete === 'function' && evictedKeys.length > 0 )
+            {
+                void Promise.resolve( this.#store.delete( evictedKeys )).catch(() => {});
+            }
+        }
+
+        return evictedKeys;
+    }
+
+    public async invalidateIdsAsync( ids: string[] ): Promise<string[]>
+    {
+        if( !this.#store )
+        {
+            return this.invalidateIds( ids );
+        }
+
+        this.#invalidations++;
+        const evictedKeys = this.#invalidateLocalIds( ids );
+
+        if( typeof this.#store.invalidateIds === 'function' )
+        {
+            const storeEvicted = await this.#store.invalidateIds( ids );
+
+            if( Array.isArray( storeEvicted ) && storeEvicted.length > 0 )
+            {
+                return Array.from( new Set([ ...evictedKeys, ...storeEvicted ]) );
+            }
+        }
+        else if( typeof this.#store.delete === 'function' && evictedKeys.length > 0 )
+        {
+            await this.#store.delete( evictedKeys );
+        }
+
+        return evictedKeys;
+    }
+
     public clear(): void
     {
+        this.#clears++;
+
         if( this.#delegate )
         {
             this.#delegate.clear();
@@ -387,6 +555,26 @@ export class ModelCache implements ModelCacheInstance
 
         this.#entries.clear();
         this.#idIndex.clear();
+
+        if( this.#store?.clear )
+        {
+            void Promise.resolve( this.#store.clear() ).catch(() => {});
+        }
+    }
+
+    public async clearAsync(): Promise<void>
+    {
+        if( !this.#store )
+        {
+            this.clear();
+
+            return;
+        }
+
+        this.#clears++;
+        this.#entries.clear();
+        this.#idIndex.clear();
+        await this.#store.clear?.();
     }
 
     #deleteKey( key: string, entry: CacheEntry ): void

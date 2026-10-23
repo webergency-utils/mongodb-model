@@ -12,7 +12,7 @@ export * from './models.js';
 export * from './events.js';
 export { EMIT_OBSERVABILITY_EVENT, GET_OBSERVABILITY_OPTIONS, GET_OPTIMIZER_OPTIONS, GET_PARENT, HAS_OBSERVABILITY_LISTENERS, REGISTER_MODEL, RESOLVED_OPERATION_FILTER, RESOLVED_SESSION } from './symbols.js';
 export { getActiveSession } from './flow.js';
-export { defaultIndexName, executeModelValidator, normalizeCursorOption, normalizeModelIndexes, resolveSoftDeleteConfig, resolveTimestampsConfig } from './operations.js';
+export { defaultIndexName, executeModelValidator, extractExplainSummary, normalizeCursorOption, normalizeModelIndexes, normalizePopulateSpecs, resolveSoftDeleteConfig, resolveTimestampsConfig, resolveVersioningConfig } from './operations.js';
 export { PipelineBuilder } from './pipeline-builder.js';
 export { AccessControl } from './access-control.js';
 export { ConverterManager } from './converters.js';

@@ -1,5 +1,6 @@
-import { MongoClient, WithTransactionCallback } from 'mongodb';
+import { ClientSession, MongoClient, WithTransactionCallback } from 'mongodb';
 import { ModelError } from './errors.js';
+import { createChangeStreamController } from './operations.js';
 import
 {
     ModelEventEmitter,
@@ -33,7 +34,19 @@ import
 }
 from './symbols.js';
 import type { AbstractBaseModel } from './base-model.js';
-import type { ModelSyncIndexesOptions, ModelSyncIndexesResult, ModelsOptions, OptimizerConfig, OptimizerOptions } from './types/external.js';
+import type
+{
+    ModelChangeEvent,
+    ModelChangeStream,
+    ModelSyncIndexesOptions,
+    ModelSyncIndexesResult,
+    ModelWatchOptions,
+    ModelsHealthCheckResult,
+    ModelsOptions,
+    OptimizerConfig,
+    OptimizerOptions
+}
+from './types/external.js';
 
 const Clients = new Map<string, MongoClient>();
 const ClosedClients = new WeakSet<MongoClient>();
@@ -212,6 +225,120 @@ export class AbstractModels
     public getCollectionModels( collection: string ): Set<ModelInstance> | undefined
     {
         return this.#collectionModels.get( collection );
+    }
+
+    public getModel( name: string ): ModelInstance | undefined
+    {
+        return this.#models.get( name ) ?? ( this as Record<string, any> )[name];
+    }
+
+    public async ping( options?: { session?: ClientSession } ): Promise<{ ok: boolean, latencyMs: number }>
+    {
+        const release = this.trackOperation();
+        const start = Date.now();
+
+        try
+        {
+            const db = ( this.client as any ).db?.();
+
+            await db?.command?.({ ping: 1 }, ...( options?.session ? [{ session: options.session }] : [] ));
+
+            return {
+                ok          : true,
+                latencyMs   : Date.now() - start
+            };
+        }
+        finally
+        {
+            release();
+        }
+    }
+
+    public async healthCheck(): Promise<ModelsHealthCheckResult>
+    {
+        const isClosed = this.#closed || ClosedClients.has( this.client );
+        const state = inflightState( this.client );
+
+        if( isClosed )
+        {
+            return {
+                ok                  : false,
+                latencyMs           : 0,
+                modelsCount         : this.#models.size,
+                collectionsCount    : this.#collectionModels.size,
+                inflightCount       : state.count,
+                closed              : true,
+                error               : 'Models have been shut down'
+            };
+        }
+
+        const start = Date.now();
+
+        try
+        {
+            const { latencyMs } = await this.ping();
+
+            return {
+                ok                  : true,
+                latencyMs,
+                modelsCount         : this.#models.size,
+                collectionsCount    : this.#collectionModels.size,
+                inflightCount       : state.count,
+                closed              : false
+            };
+        }
+        catch( err: any )
+        {
+            return {
+                ok                  : false,
+                latencyMs           : Date.now() - start,
+                modelsCount         : this.#models.size,
+                collectionsCount    : this.#collectionModels.size,
+                inflightCount       : state.count,
+                closed              : false,
+                error               : err?.message ?? String( err )
+            };
+        }
+    }
+
+    public watch( options?: ModelWatchOptions ): ModelChangeStream
+    {
+        const childStreams: ModelChangeStream[] = [];
+        const { stream, emitChange, emitError } = createChangeStreamController<ModelChangeEvent>( async() =>
+        {
+            await Promise.all( childStreams.map( s => s.close() ));
+        });
+
+        for( const models of this.#collectionModels.values() )
+        {
+            const firstModel = ( Array.from( models ).find( m => !( m as any )._prefix ) ?? models.values().next().value ) as any;
+
+            if( firstModel )
+            {
+                const child = firstModel.watch(
+                {
+                    ...options,
+                    onChange    : undefined,
+                    onError     : undefined
+                }) as ModelChangeStream;
+
+                child.on( 'change', ( ev ) =>
+                {
+                    void Promise.resolve( options?.onChange?.( ev )).catch(() => {});
+                    emitChange( ev );
+                });
+
+                child.on( 'error', ( err ) =>
+                {
+                    options?.onError?.( err );
+                    emitError( err );
+                });
+
+                childStreams.push( child );
+            }
+        }
+
+        return stream;
     }
 
     public async syncIndexes( options?: ModelSyncIndexesOptions ): Promise<ModelSyncIndexesResult[]>

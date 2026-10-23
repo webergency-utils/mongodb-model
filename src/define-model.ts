@@ -23,6 +23,8 @@ function buildExtensions<DBE extends MongoRootDocument>(
         indexes             : config.indexes,
         timestamps          : config.timestamps,
         softDelete          : config.softDelete,
+        versioning          : config.versioning,
+        relations           : config.relations,
         hooks               : config.hooks
     };
 }
