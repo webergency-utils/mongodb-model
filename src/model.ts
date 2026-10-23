@@ -4,65 +4,36 @@ import
     Document,
     Filter,
     FindOptions,
-    ObjectId,
     OptionalUnlessRequiredId,
     UpdateFilter
 }
 from 'mongodb';
-import Aggregator from '@webergency-utils/aggregator';
-import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
-import { AccessControl } from './access-control.js';
-import { ModelCache, ModelCacheConfig, buildCacheKey, extractTargetIdsFromFilter } from './cache.js';
-import { ConverterManager } from './converters.js';
-import { ModelAccessDeniedError, ModelError } from './errors.js';
-import
-{
-    ModelCacheEvent,
-    ModelEventEmitter,
-    ModelEventHandler,
-    ModelEventName,
-    ModelMutationEvent,
-    ModelMutationOperation,
-    ModelQueryEvent,
-    ModelQueryOperation,
-    ObservabilityConfig,
-    ObservabilityOptions,
-    dispatchObservabilityEvent,
-    resolveObservabilityOptions
-}
-from './events.js';
+import { AbstractBaseModel } from './base-model.js';
+import { ModelCacheConfig, extractTargetIdsFromFilter } from './cache.js';
+import { ModelAccessDeniedError } from './errors.js';
+import { ObservabilityConfig } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
 {
-    Arr,
     DUMP,
     LOG_FILE,
-    isSet,
-    map,
     mergeComputedProperties,
-    objectHash,
     resolveBSONObject,
     toUpdateOperations
 }
 from './helpers/index.js';
+import { getCursor } from './helpers/mongo.js';
 import { AbstractModels } from './models.js';
 import
 {
     attachCursorToItem,
     attachListMetadata,
-    convertDocuments,
-    normalizeExistsOptions,
     normalizeFindMatch,
-    normalizeGetManyOptions,
-    normalizeGetOptions,
     resolveCreateFromArgs
 }
 from './operations.js';
-import { PipelineBuilder } from './pipeline-builder.js';
-import { ComputedPropertyResolver, SmartFilterResolver } from './resolvers.js';
-import { GET_OBSERVABILITY_OPTIONS, GET_OPTIMIZER_OPTIONS, REGISTER_MODEL } from './symbols.js';
-import { getCursor } from './helpers/mongo.js';
+import { RESOLVED_ACCESS } from './symbols.js';
 import
 {
     AbstractModelProperties,
@@ -83,7 +54,6 @@ import
     ModelUpdateResponse,
     MongoRootDocument,
     OptimizerConfig,
-    OptimizerOptions,
     WithTotal
 }
 from './types/external.js';
@@ -98,273 +68,58 @@ export abstract class AbstractModel
     DTO extends Document,
     Extensions extends ModelExtensions<DBE, AbstractModelSmartFilters<ExtractSmartFilters<Extensions>>, AbstractModelProperties<ExtractComputedProperties<Extensions>>>
 >
+extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 {
-    #models: AbstractModels;
-    #findAggregator: Aggregator<DTO['id'], DBE | null>;
-    #converters: ConverterManager<DBE>;
-    #access: AccessControl<DBE>;
-    #smartFilters: SmartFilterResolver;
-    #computedProperties: ComputedPropertyResolver;
-    #pipelineBuilder = new PipelineBuilder<DBE>();
-    #events = new ModelEventEmitter();
-    #cache?: ModelCache;
-    #optimizer?: OptimizerConfig;
-    #observability?: ObservabilityConfig;
-
-    public converters: Extensions['converters'];
     public smartFilters?: ExtractSmartFilters<Extensions>;
 
-    protected constructor( models: AbstractModels, public collection: Collection<DBE>, params: Extensions & { cache?: ModelCacheConfig, optimizer?: OptimizerConfig, observability?: ObservabilityConfig } )
+    protected constructor(
+        models: AbstractModels,
+        collection: Collection<DBE>,
+        params: Extensions & { cache?: ModelCacheConfig, optimizer?: OptimizerConfig, observability?: ObservabilityConfig }
+    )
     {
-        this.#models = models;
-        this.#cache = params.cache ? new ModelCache( params.cache ) : undefined;
-        this.#optimizer = params.optimizer;
-        this.#observability = params.observability;
-        this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
+        super( models, collection,
+        {
+            cache               : params.cache,
+            converters          : params.converters,
+            smartFilters        : params.smartFilters,
+            computedProperties  : params.computedProperties,
+            access              : params.access,
+            optimizer           : params.optimizer,
+            observability       : params.observability,
+            idField             : '_id'
+        });
+
         this.smartFilters = params.smartFilters;
-        this.#converters = new ConverterManager( this, this.converters, ( err, op ) => this.#emitError( err, op ));
-        this.#access = new AccessControl(
-        {
-            model            : this,
-            config           : params.access,
-            filterOverridden : this.accessFilter !== AbstractModel.prototype.accessFilter,
-            invokeFilter     : ( name ) => this.accessFilter( name )
-        });
-        this.#smartFilters = new SmartFilterResolver( this, this.smartFilters );
-        this.#computedProperties = new ComputedPropertyResolver( this, params.computedProperties );
-
-        models[REGISTER_MODEL]( this, collection.collectionName );
-
-        this.#findAggregator = new Aggregator( async( ids: Array<DTO['id']>, conversion: keyof Extensions['converters'], accessCtx?: { method: string, access?: string, scopeKey?: string } ) =>
-        {
-            try
-            {
-                let pipeline = await this.pipeline(
-                {
-                    filter      : { _id: { $in: ids.map( id => this.dbeID( id )) } } as Filter<DBE>,
-                    projection  : this.converters[conversion].projection,
-                    access      : accessCtx?.access
-                }, conversion, accessCtx?.method ?? 'get' );
-
-                pipeline = this.#optimizePipeline( pipeline );
-
-                flowGet( 'log' ) && DUMP( pipeline );
-
-                const start = Date.now();
-                const documents = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray();
-                const duration = Date.now() - start;
-
-                LOG_FILE( `Collection: ${this.collection.collectionName}` );
-                LOG_FILE( `TIME: ${duration} ms` );
-                LOG_FILE( pipeline, true );
-
-                this.#emitQuery( 'get', pipeline, duration,
-                {
-                    resultCount : documents.length,
-                    conversion  : String( conversion )
-                });
-
-                return map(
-                    ids.map( id => this.dtoID( id )),
-                    documents as DBE[],
-                    ( dbe: DBE ) => this.dtoID( dbe._id )
-                );
-            }
-            catch( e: any )
-            {
-                this.#emitError( e, 'get' );
-
-                if( e instanceof ModelError )
-                {
-                    throw e;
-                }
-
-                throw new ModelError( 'MODEL_GET_ERROR', this, e?.toString?.() ?? String( e ), e );
-            }
-        });
     }
 
-    [GET_OPTIMIZER_OPTIONS](): OptimizerOptions | undefined
-    {
-        if( this.#optimizer === undefined ){ return this.#models[GET_OPTIMIZER_OPTIONS]() }
-
-        if( this.#optimizer === false ){ return undefined }
-
-        if( this.#optimizer === true ){ return {} }
-
-        return this.#optimizer;
-    }
-
-    [GET_OBSERVABILITY_OPTIONS](): ObservabilityOptions | undefined
-    {
-        return resolveObservabilityOptions( this.#observability, this.#models[GET_OBSERVABILITY_OPTIONS]() );
-    }
-
-    #optimizePipeline( pipeline: Document[] ): Document[]
-    {
-        const options = this[GET_OPTIMIZER_OPTIONS]();
-
-        return options !== undefined ? optimizePipeline( pipeline, options ) : pipeline;
-    }
-
-    public on<E extends ModelEventName>( event: E, handler: ModelEventHandler<E> ): () => void
-    {
-        return this.#events.on( event, handler );
-    }
-
-    public off<E extends ModelEventName>( event: E, handler: ModelEventHandler<E> ): void
-    {
-        this.#events.off( event, handler );
-    }
-
-    #emitQuery(
-        operation: ModelQueryOperation,
-        pipeline: Document[],
-        duration: number,
-        extra?: Partial<Omit<ModelQueryEvent, 'collection' | 'operation' | 'pipeline' | 'duration'>>
-    )
-    {
-        dispatchObservabilityEvent(
-            'query',
-            {
-                collection  : this.collection.collectionName,
-                model       : this.constructor.name,
-                pipeline,
-                duration,
-                operation,
-                ...extra
-            },
-            this.#events,
-            this.#models,
-            this[GET_OBSERVABILITY_OPTIONS]()
-        );
-    }
-
-    #emitMutation(
-        operation: ModelMutationOperation,
-        duration: number,
-        extra?: Partial<Omit<ModelMutationEvent, 'collection' | 'operation' | 'duration'>>
-    )
-    {
-        dispatchObservabilityEvent(
-            'mutation',
-            {
-                collection  : this.collection.collectionName,
-                model       : this.constructor.name,
-                operation,
-                duration,
-                ...extra
-            },
-            this.#events,
-            this.#models,
-            this[GET_OBSERVABILITY_OPTIONS]()
-        );
-    }
-
-    #emitCache(
-        operation: ModelCacheEvent['operation'],
-        extra?: Partial<Omit<ModelCacheEvent, 'collection' | 'operation'>>
-    )
-    {
-        dispatchObservabilityEvent(
-            'cache',
-            {
-                collection  : this.collection.collectionName,
-                model       : this.constructor.name,
-                operation,
-                ...extra
-            },
-            this.#events,
-            this.#models,
-            this[GET_OBSERVABILITY_OPTIONS]()
-        );
-    }
-
-    #emitError( error: unknown, operation?: string, duration?: number )
-    {
-        dispatchObservabilityEvent(
-            'error',
-            {
-                collection  : this.collection.collectionName,
-                model       : this.constructor.name,
-                error       : error instanceof Error ? error : new Error( String( error )),
-                operation,
-                duration
-            },
-            this.#events,
-            this.#models,
-            this[GET_OBSERVABILITY_OPTIONS]()
-        );
-    }
-
-    #invalidateCache( ids: Array<any> ): void
-    {
-        if( !this.#cache || !ids.length ){ return }
-
-        const normalizedIds = ids.map( id => String( this.dtoID( id )));
-        const evicted = this.#cache.invalidateIds( normalizedIds );
-
-        if( evicted.length > 0 )
-        {
-            this.#emitCache( 'invalidate', { ids: normalizedIds });
-        }
-    }
-
-    protected id(): DTO['id'] | Promise<DTO['id']>
-    {
-        return new ObjectId().toString() as DTO['id'];
-    }
-
-    public dbeID( id: DTO['id'] | DBE['_id'] ): DBE['_id']
+    public override dbeID( id: DTO['id'] | DBE['_id'] ): DBE['_id']
     {
         return id as DBE['_id'];
     }
 
-    public dtoID( dbeID: DBE['_id'] | DTO['id'] ): DTO['id']
+    public override dtoID( dbeID: DBE['_id'] | DTO['id'] ): DTO['id']
     {
         return dbeID as DTO['id'];
     }
 
-    protected ensureOpen(): void
-    {
-        this.#models.assertOpen();
-    }
-
-    protected trackOperation(): () => void
-    {
-        return this.#models.trackOperation();
-    }
-
-    protected async runOperation<T>( operation: () => Promise<T> ): Promise<T>
-    {
-        const release = this.trackOperation();
-
-        try
-        {
-            return await operation();
-        }
-        finally
-        {
-            release();
-        }
-    }
-
-    protected async pipeline<K extends keyof Extensions['converters']>(
+    protected override async pipeline<K extends keyof Extensions['converters']>(
         options: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>,
         conversion?: K,
         method: string = 'pipeline'
     ): Promise<Document[]>
     {
+        const preResolvedAccess = ( options as any )?.[RESOLVED_ACCESS] as { denied: boolean, filter?: Filter<DBE> } | undefined;
         const { computedProperties: converterComputedProperties } = this.converters[conversion ?? 'dto'];
         const { filter, sort, limit, skip, pipeline, projection, computedProperties: optionsComputedProperties, smartFilter, access } = resolveBSONObject( options ) as ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>;
 
         const converterProperties = { '': await this.resolveComputedProperties( converterComputedProperties ) };
         const optionsProperties = { '': await this.resolveComputedProperties( optionsComputedProperties ) };
         const computedProperties = mergeComputedProperties( converterProperties, optionsProperties )[''];
-        const accessResult = await this.#access.resolveOrDeny({ operation: 'read', method, access });
+        const accessResult = preResolvedAccess ?? await this._access.resolveOrDeny({ operation: 'read', method, access });
         const accessFilter = accessResult.denied ? ({ _id: { $exists: false } } as Filter<DBE>) : accessResult.filter;
 
-        return this.#pipelineBuilder.pipeline(
+        return this._pipelineBuilder.pipeline(
         {
             filter,
             projection,
@@ -384,7 +139,7 @@ export abstract class AbstractModel
 
         try
         {
-            const access = await this.#access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
+            const access = await this._access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
 
             if( access.denied )
             {
@@ -397,19 +152,19 @@ export abstract class AbstractModel
             try
             {
                 await this.collection.insertOne( resolveBSONObject({ ...dbe, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE> );
-                this.#emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
+                this._emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
             }
             catch( e: any )
             {
                 if( options?.duplicateIgnore === true && e.code === 11000 )
                 {
                     const existingId = this.dtoID( await this.collection.findOne( e.keyValue, { projection: { _id: 1 }, collation: { locale: 'en' } }).then( r => r?._id ));
-                    this.#emitMutation( 'create', Date.now() - start, { insertedCount: 0, ids: [ existingId ] });
+                    this._emitMutation( 'create', Date.now() - start, { insertedCount: 0, ids: [ existingId ] });
 
                     return existingId;
                 }
 
-                this.#emitError( e, 'create', Date.now() - start );
+                this._emitError( e, 'create', Date.now() - start );
 
                 throw e;
             }
@@ -443,11 +198,11 @@ export abstract class AbstractModel
 
             try
             {
-                dbe = await this.#converters.convertFrom( data, fromKey );
+                dbe = await this._converters.convertFrom( data, fromKey );
             }
             catch( e )
             {
-                this.#emitError( e, 'createFrom', Date.now() - start );
+                this._emitError( e, 'createFrom', Date.now() - start );
 
                 throw e;
             }
@@ -455,7 +210,7 @@ export abstract class AbstractModel
             const resolvedId = explicitId ?? ( dbe._id !== undefined ? this.dtoID( dbe._id ) as DTO['id'] : undefined );
             const createdId = await this.create( dbe, resolvedId, resolvedOptions );
 
-            this.#emitMutation( 'createFrom', Date.now() - start, { insertedCount: 1, ids: [ createdId ] });
+            this._emitMutation( 'createFrom', Date.now() - start, { insertedCount: 1, ids: [ createdId ] });
 
             return createdId;
         });
@@ -472,7 +227,7 @@ export abstract class AbstractModel
             const explicitIds = Array.isArray( idsOrOptions ) ? idsOrOptions : undefined;
             const resolvedOptions = Array.isArray( idsOrOptions ) ? options : idsOrOptions;
 
-            const access = await this.#access.resolveOrDeny({ operation: 'create', method: 'createMany', access: resolvedOptions?.access });
+            const access = await this._access.resolveOrDeny({ operation: 'create', method: 'createMany', access: resolvedOptions?.access });
 
             if( access.denied )
             {
@@ -481,7 +236,7 @@ export abstract class AbstractModel
 
             if( items.length === 0 )
             {
-                this.#emitMutation( 'createMany', 0, { insertedCount: 0, ids: [] });
+                this._emitMutation( 'createMany', 0, { insertedCount: 0, ids: [] });
 
                 return [];
             }
@@ -504,13 +259,13 @@ export abstract class AbstractModel
             try
             {
                 await this.collection.insertMany( docs );
-                this.#emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
+                this._emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
 
                 return ids;
             }
             catch( e: any )
             {
-                this.#emitError( e, 'createMany', Date.now() - start );
+                this._emitError( e, 'createMany', Date.now() - start );
 
                 throw e;
             }
@@ -523,7 +278,7 @@ export abstract class AbstractModel
 
         try
         {
-            const match = await this.#access.match(
+            const match = await this._access.match(
                 resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
                 { operation: 'update', method: 'update', access: options?.access }
             );
@@ -550,8 +305,8 @@ export abstract class AbstractModel
                 const matchedCount = document ? 1 : 0;
                 const modifiedCount = document ? 1 : 0;
 
-                this.#invalidateCache([ id ]);
-                this.#emitMutation( 'update', Date.now() - start,
+                this._invalidateCache([ id ]);
+                this._emitMutation( 'update', Date.now() - start,
                 {
                     matchedCount,
                     modifiedCount,
@@ -568,8 +323,8 @@ export abstract class AbstractModel
 
             const res = await this.collection.updateOne( match, toUpdateOperations( update ));
 
-            this.#invalidateCache([ id ]);
-            this.#emitMutation( 'update', Date.now() - start,
+            this._invalidateCache([ id ]);
+            this._emitMutation( 'update', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
@@ -601,7 +356,7 @@ export abstract class AbstractModel
             ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
             : rawFilter;
 
-        const finalMatch = await this.#access.match(
+        const finalMatch = await this._access.match(
             resolveBSONObject( combinedFilter ) as Filter<DBE>,
             { operation, method, access }
         );
@@ -621,7 +376,7 @@ export abstract class AbstractModel
         {
             if( Array.isArray( idsOrFilter ) )
             {
-                const match = await this.#access.match(
+                const match = await this._access.match(
                     resolveBSONObject({ _id: { $in: idsOrFilter.map( id => this.dbeID( id )) } }) as Filter<DBE>,
                     { operation: 'update', method: 'updateMany', access: options?.access }
                 );
@@ -633,7 +388,7 @@ export abstract class AbstractModel
 
                 if( idsOrFilter.length === 0 )
                 {
-                    this.#emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: [] });
+                    this._emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: [] });
 
                     return { matchedCount: 0, modifiedCount: 0 };
                 }
@@ -641,8 +396,8 @@ export abstract class AbstractModel
                 const start = Date.now();
                 const res = await this.collection.updateMany( match, toUpdateOperations( update ));
 
-                this.#invalidateCache( idsOrFilter );
-                this.#emitMutation( 'updateMany', Date.now() - start,
+                this._invalidateCache( idsOrFilter );
+                this._emitMutation( 'updateMany', Date.now() - start,
                 {
                     matchedCount    : res.matchedCount,
                     modifiedCount   : res.modifiedCount,
@@ -667,10 +422,10 @@ export abstract class AbstractModel
 
             if( targetIds && targetIds.length > 0 )
             {
-                this.#invalidateCache( targetIds );
+                this._invalidateCache( targetIds );
             }
 
-            this.#emitMutation( 'updateMany', Date.now() - start,
+            this._emitMutation( 'updateMany', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
@@ -724,10 +479,10 @@ export abstract class AbstractModel
 
                 if( idsToEvict && idsToEvict.length > 0 )
                 {
-                    this.#invalidateCache( idsToEvict );
+                    this._invalidateCache( idsToEvict );
                 }
 
-                this.#emitMutation( 'updateOne', Date.now() - start,
+                this._emitMutation( 'updateOne', Date.now() - start,
                 {
                     matchedCount,
                     modifiedCount,
@@ -747,10 +502,10 @@ export abstract class AbstractModel
 
             if( targetIds && targetIds.length > 0 )
             {
-                this.#invalidateCache( targetIds );
+                this._invalidateCache( targetIds );
             }
 
-            this.#emitMutation( 'updateOne', Date.now() - start,
+            this._emitMutation( 'updateOne', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
@@ -765,25 +520,25 @@ export abstract class AbstractModel
         });
     }
 
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         id: DTO['id'] | DBE['_id'],
         options?: GetOptions<K> | K
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['_id']>,
         conversion: K,
         filtered: true
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['_id']>,
         options: GetManyOptions<K> & { filter: true }
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['_id']>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>;
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         idOrIds: DTO['id'] | DBE['_id'] | Array<DTO['id'] | DBE['_id']>,
         optionsOrConversion?: GetOptions<K> | GetManyOptions<K> | K,
         filtered?: boolean
@@ -793,226 +548,39 @@ export abstract class AbstractModel
         | Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
     >
     {
-        if( Array.isArray( idOrIds ) )
-        {
-            return this.getMany( idOrIds, normalizeGetManyOptions<K>( optionsOrConversion as GetManyOptions<K> | K, filtered ));
-        }
-
-        const release = this.trackOperation();
-
-        try
-        {
-            const options = normalizeGetOptions<K>( optionsOrConversion as GetOptions<K> | K );
-            const conversion = ( options.as ?? 'dto' ) as K;
-            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'get', access: options.access });
-
-            if( access.denied ){ return null }
-
-            const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
-            const dtoId = String( this.dtoID( idOrIds ));
-            const cacheKey = this.#cache ? buildCacheKey( String( conversion ), dtoId, scopeKey ) : undefined;
-
-            if( this.#cache && cacheKey )
-            {
-                const cached = this.#cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
-
-                if( cached !== undefined )
-                {
-                    this.#emitCache( 'hit', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-
-                    return cached;
-                }
-
-                this.#emitCache( 'miss', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-            }
-
-            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
-            const documents = await this.#findAggregator.execute( Arr( idOrIds ), conversion, { method: 'get', access: options.access, scopeKey } ) as Array<DBE | null>;
-
-            benchmark?.step( 'QUERY' );
-
-            const entries = await convertDocuments( this.#converters, documents, conversion );
-
-            benchmark?.step( 'CONVERTER' );
-
-            const result = ( entries[0] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
-
-            if( this.#cache && cacheKey && result !== null )
-            {
-                this.#cache.set( cacheKey, result, [ dtoId ]);
-                this.#emitCache( 'set', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-            }
-
-            return result;
-        }
-        finally
-        {
-            release();
-        }
+        return super.get( idOrIds, optionsOrConversion as any, filtered );
     }
 
-    public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['_id']>,
         options: GetManyOptions<K> & { filter: true }
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['_id']>,
         conversion: K,
         filtered: true
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['_id']>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>;
-    public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['_id']>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>
     {
-        const release = this.trackOperation();
-
-        try
-        {
-            const options = normalizeGetManyOptions<K>( optionsOrConversion, filtered );
-            const conversion = ( options.as ?? 'dto' ) as K;
-            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'getMany', access: options.access });
-
-            if( access.denied )
-            {
-                return options.filter ? [] : ids.map(() => null );
-            }
-
-            const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
-            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
-
-            if( this.#cache )
-            {
-                const results: Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null> = new Array( ids.length ).fill( null );
-                const missing: Array<{ index: number, id: DTO['id'] | DBE['_id'], dtoId: string, cacheKey: string }> = [];
-
-                for( let i = 0; i < ids.length; i++ )
-                {
-                    const id = ids[i];
-                    const dtoId = String( this.dtoID( id ));
-                    const cacheKey = buildCacheKey( String( conversion ), dtoId, scopeKey );
-                    const cached = this.#cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
-
-                    if( cached !== undefined )
-                    {
-                        results[i] = cached;
-                        this.#emitCache( 'hit', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-                    }
-                    else
-                    {
-                        this.#emitCache( 'miss', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-                        missing.push({ index: i, id, dtoId, cacheKey });
-                    }
-                }
-
-                if( missing.length > 0 )
-                {
-                    const documents = await this.#findAggregator.execute(
-                        missing.map( m => m.id ) as DTO['id'][],
-                        conversion,
-                        { method: 'getMany', access: options.access, scopeKey }
-                    ) as Array<DBE | null>;
-
-                    benchmark?.step( 'QUERY' );
-
-                    const converted = await convertDocuments( this.#converters, documents, conversion, false );
-
-                    benchmark?.step( 'CONVERTER' );
-
-                    for( let j = 0; j < missing.length; j++ )
-                    {
-                        const entry = ( converted[j] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
-                        const target = missing[j];
-
-                        results[target.index] = entry;
-
-                        if( entry !== null )
-                        {
-                            this.#cache.set( target.cacheKey, entry, [ target.dtoId ]);
-                            this.#emitCache( 'set', { key: target.cacheKey, ids: [ target.dtoId ], conversion: String( conversion ) });
-                        }
-                    }
-                }
-
-                return options.filter ? results.filter( Boolean ) : results;
-            }
-
-            const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion, { method: 'getMany', access: options.access, scopeKey } ) as Array<DBE | null>;
-
-            benchmark?.step( 'QUERY' );
-
-            const entries = await convertDocuments( this.#converters, documents, conversion, options.filter === true );
-
-            benchmark?.step( 'CONVERTER' );
-
-            return entries as Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
-        }
-        finally
-        {
-            release();
-        }
+        return super.getMany( ids, optionsOrConversion as any, filtered );
     }
 
-    public async find<K extends keyof Extensions['converters']>(
+    public override async find<K extends keyof Extensions['converters']>(
         options: ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
         conversion: K = 'dto' as K,
         sort?: FindOptions['sort']
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
     {
-        return this.runOperation( async() =>
-        {
-            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'find', access: options.access });
-
-            if( access.denied ){ return null }
-
-            const { projection } = this.converters[conversion];
-            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':find(' + String( conversion ) + ')' ) : undefined;
-
-            let pipeline = await this.pipeline(
-            {
-                filter      : options.filter,
-                smartFilter : options.smartFilter,
-                projection,
-                sort,
-                limit       : 1,
-                access      : options.access
-            }, conversion, 'find' );
-
-            pipeline = this.#optimizePipeline( pipeline );
-
-            flowGet( 'log' ) && DUMP( pipeline );
-
-            const start = Date.now();
-            const dbe = ( await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() )[0] as DBE | undefined;
-            const duration = Date.now() - start;
-
-            LOG_FILE( `Collection: ${this.collection.collectionName}` );
-            LOG_FILE( `TIME: ${duration} ms` );
-            LOG_FILE( pipeline, true );
-
-            benchmark?.step( 'QUERY' );
-
-            const convStart = Date.now();
-            const data = dbe ? await this.#converters.convert( dbe, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> : null;
-            const converterDuration = Date.now() - convStart;
-
-            this.#emitQuery( 'find', pipeline, duration,
-            {
-                converterDuration,
-                resultCount : data ? 1 : 0,
-                conversion  : String( conversion )
-            });
-
-            benchmark?.step( 'CONVERTER' );
-
-            return data;
-        }) as Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
+        return super.find( options, conversion, sort );
     }
 
     public async list<K extends keyof Extensions['converters']>(
@@ -1039,7 +607,7 @@ export abstract class AbstractModel
 
             try
             {
-                accessFilter = await this.#access.resolve({ operation: 'read', method: 'list', access: options.access });
+                accessFilter = await this._access.resolve({ operation: 'read', method: 'list', access: options.access });
             }
             catch( e )
             {
@@ -1073,12 +641,12 @@ export abstract class AbstractModel
 
             let [ pipeline, countPipeline ] = await Promise.all(
             [
-                this.#pipelineBuilder.pipeline( params ),
-                options.count ? this.#pipelineBuilder.count( params ) : undefined
+                this._pipelineBuilder.pipeline( params ),
+                options.count ? this._pipelineBuilder.count( params ) : undefined
             ]);
 
-            pipeline = this.#optimizePipeline( pipeline );
-            countPipeline && ( countPipeline = this.#optimizePipeline( countPipeline ));
+            pipeline = this._optimizePipeline( pipeline );
+            countPipeline && ( countPipeline = this._optimizePipeline( countPipeline ));
 
             flowGet( 'log' ) && DUMP( pipeline );
             flowGet( 'log' ) && countPipeline && DUMP( countPipeline );
@@ -1104,7 +672,7 @@ export abstract class AbstractModel
                     LOG_FILE( `Collection: ${this.collection.collectionName}` );
                     LOG_FILE( `TIME: ${duration} ms` );
                     LOG_FILE( countPipeline, true );
-                    this.#emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
+                    this._emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
 
                     return r[0]?.count ?? 0;
                 }) : undefined
@@ -1117,13 +685,13 @@ export abstract class AbstractModel
             const convStart = Date.now();
             const items = await Promise.all( orderedEntries.map( async( dbe ) =>
             {
-                const dto = await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
+                const dto = await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
 
                 return attachCursorToItem( dto, dbe, sort );
             }));
             const converterDuration = Date.now() - convStart;
 
-            this.#emitQuery( 'list', pipeline, queryDuration,
+            this._emitQuery( 'list', pipeline, queryDuration,
             {
                 converterDuration,
                 resultCount : items.length,
@@ -1172,7 +740,7 @@ export abstract class AbstractModel
 
             try
             {
-                accessFilter = await this.#access.resolve({ operation: 'read', method: 'stream', access: options.access });
+                accessFilter = await this._access.resolve({ operation: 'read', method: 'stream', access: options.access });
             }
             catch( e )
             {
@@ -1189,7 +757,7 @@ export abstract class AbstractModel
             const optionsProperties = { '': await this.resolveComputedProperties( optionsCompProps ) };
             const computedProperties = mergeComputedProperties( converterProperties, optionsProperties )[''];
 
-            let pipeline = await this.#pipelineBuilder.pipeline(
+            let pipeline = await this._pipelineBuilder.pipeline(
             {
                 ...rest,
                 filter,
@@ -1203,7 +771,7 @@ export abstract class AbstractModel
                 computedProperties
             });
 
-            pipeline = this.#optimizePipeline( pipeline );
+            pipeline = this._optimizePipeline( pipeline );
 
             flowGet( 'log' ) && DUMP( pipeline );
 
@@ -1218,11 +786,11 @@ export abstract class AbstractModel
                 LOG_FILE( `Collection: ${this.collection.collectionName}` );
                 LOG_FILE( `TIME: ${duration} ms` );
                 LOG_FILE( pipeline, true );
-                this.#emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
+                this._emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
 
                 for( const dbe of entries.reverse() )
                 {
-                    yield await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
                 }
 
                 return;
@@ -1240,15 +808,15 @@ export abstract class AbstractModel
                     LOG_FILE( `Collection: ${this.collection.collectionName}` );
                     LOG_FILE( `TIME: ${duration} ms` );
                     LOG_FILE( pipeline, true );
-                    this.#emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
+                    this._emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
                 }
 
-                yield await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
             }
 
             if( !emitted )
             {
-                this.#emitQuery( 'stream', pipeline, Date.now() - start, { conversion: String( conversion ) });
+                this._emitQuery( 'stream', pipeline, Date.now() - start, { conversion: String( conversion ) });
             }
         }
         finally
@@ -1257,125 +825,54 @@ export abstract class AbstractModel
         }
     }
 
-    public async aggregate<T>(
+    public override async aggregate<T>(
         pipeline: Document[],
         options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
     ): Promise<T[]>
     {
-        return this.runOperation( async() =>
-        {
-            let aggregationPipeline: Document[];
-
-            if( isSet( options ))
-            {
-                aggregationPipeline = [ ...await this.pipeline( options!, 'dbe', 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
-            }
-            else
-            {
-                const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'aggregate' });
-
-                if( access.denied ){ return [] }
-
-                aggregationPipeline = access.filter
-                    ? [{ $match: access.filter }, ...( resolveBSONObject( pipeline ) as Document[] )]
-                    : resolveBSONObject( pipeline ) as Document[];
-            }
-
-            aggregationPipeline = this.#optimizePipeline( aggregationPipeline );
-
-            flowGet( 'log' ) && DUMP( aggregationPipeline );
-
-            const start = Date.now();
-            const res = await this.collection.aggregate( aggregationPipeline, { collation: { locale: 'en' } }).toArray() as T[];
-            const duration = Date.now() - start;
-
-            LOG_FILE( `Collection: ${this.collection.collectionName}` );
-            LOG_FILE( `TIME: ${duration} ms` );
-            LOG_FILE( aggregationPipeline, true );
-            this.#emitQuery( 'aggregate', aggregationPipeline, duration, { resultCount: res.length });
-
-            return res;
-        });
+        return super.aggregate<T>( pipeline, options );
     }
 
-    public async count(
+    public override async count(
         options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
     ): Promise<number>;
-    public async count(
+    public override async count(
         pipeline: Document[],
         options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
     ): Promise<number>;
-    public async count(
+    public override async count(
         pipelineOrOptions?: Document[] | ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>,
         options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
     ): Promise<number>
     {
-        if( Array.isArray( pipelineOrOptions ) )
-        {
-            const countPipeline = [ ...pipelineOrOptions, { $count: 'count' }];
-
-            return this.aggregate<{ count: number }>( countPipeline, options ).then( r => r[0]?.count ?? 0 );
-        }
-
-        return this.aggregate<{ count: number }>([{ $count: 'count' }], pipelineOrOptions ).then( r => r[0]?.count ?? 0 );
+        return super.count( pipelineOrOptions as any, options );
     }
 
-    public async exists(
+    public override async exists(
         idOrFilter?: DTO['id'] | DBE['_id'] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
         options?: { access?: string }
     ): Promise<boolean>
     {
-        return this.runOperation( async() =>
-        {
-            const findOptions = normalizeExistsOptions<Filter<DBE>, any>(
-                idOrFilter,
-                '_id',
-                id => this.dbeID( id ),
-                options?.access
-            );
-
-            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'exists', access: findOptions.access });
-
-            if( access.denied ){ return false }
-
-            let pipeline = await this.pipeline(
-            {
-                filter      : findOptions.filter,
-                smartFilter : findOptions.smartFilter,
-                projection  : { _id: 1 },
-                limit       : 1,
-                access      : findOptions.access
-            }, 'dbe' as any, 'exists' );
-
-            pipeline = this.#optimizePipeline( pipeline );
-
-            const start = Date.now();
-            const res = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray();
-            const duration = Date.now() - start;
-
-            this.#emitQuery( 'exists', pipeline, duration, { resultCount: res.length });
-
-            return res.length > 0;
-        });
+        return super.exists( idOrFilter, options );
     }
 
-    protected async accessFilter( _name: string ): Promise<AccessFilterResult<DBE>> {}
+    protected override async accessFilter( _name: string ): Promise<AccessFilterResult<DBE>> {}
 
-    public async resolveSmartFilter( smartFilter: Record<string, any> )
+    public override async resolveSmartFilter( smartFilter: Record<string, any> )
     {
-        return this.#smartFilters.resolve( smartFilter ) as Promise<{ filter?: Filter<DBE>, pipeline?: Document[] }>;
+        return this._smartFilters.resolve( smartFilter ) as Promise<{ filter?: Filter<DBE>, pipeline?: Document[] }>;
     }
 
-    public async resolveComputedProperties( properties?: ComputedPropertiesParam<any> ): Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>
+    public override async resolveComputedProperties( properties?: ComputedPropertiesParam<any> ): Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>
     {
-        return this.#computedProperties.resolve( properties ) as Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>;
+        return this._computedProperties.resolve( properties ) as Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>;
     }
 
     public async delete( id: DTO['id'] | DBE['_id'], options?: ModelDeleteOptions ): Promise<boolean>
     {
         return this.runOperation( async() =>
         {
-            const match = await this.#access.match(
+            const match = await this._access.match(
                 resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
                 { operation: 'delete', method: 'delete', access: options?.access }
             );
@@ -1385,8 +882,8 @@ export abstract class AbstractModel
             const start = Date.now();
             const res = await this.collection.deleteOne( match );
 
-            this.#invalidateCache([ id ]);
-            this.#emitMutation( 'delete', Date.now() - start,
+            this._invalidateCache([ id ]);
+            this._emitMutation( 'delete', Date.now() - start,
             {
                 deletedCount    : res.deletedCount,
                 ids             : [ id ]
@@ -1405,7 +902,7 @@ export abstract class AbstractModel
         {
             if( Array.isArray( idsOrFilter ) )
             {
-                const match = await this.#access.match(
+                const match = await this._access.match(
                     resolveBSONObject({ _id: { $in: idsOrFilter.map( id => this.dbeID( id )) } }) as Filter<DBE>,
                     { operation: 'delete', method: 'deleteMany', access: options?.access }
                 );
@@ -1414,7 +911,7 @@ export abstract class AbstractModel
 
                 if( idsOrFilter.length === 0 )
                 {
-                    this.#emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: [] });
+                    this._emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: [] });
 
                     return 0;
                 }
@@ -1422,8 +919,8 @@ export abstract class AbstractModel
                 const start = Date.now();
                 const res = await this.collection.deleteMany( match );
 
-                this.#invalidateCache( idsOrFilter );
-                this.#emitMutation( 'deleteMany', Date.now() - start,
+                this._invalidateCache( idsOrFilter );
+                this._emitMutation( 'deleteMany', Date.now() - start,
                 {
                     deletedCount    : res.deletedCount,
                     ids             : idsOrFilter
@@ -1441,10 +938,10 @@ export abstract class AbstractModel
 
             if( targetIds && targetIds.length > 0 )
             {
-                this.#invalidateCache( targetIds );
+                this._invalidateCache( targetIds );
             }
 
-            this.#emitMutation( 'deleteMany', Date.now() - start,
+            this._emitMutation( 'deleteMany', Date.now() - start,
             {
                 deletedCount    : res.deletedCount,
                 ids             : targetIds ?? undefined,

@@ -5,39 +5,17 @@ import
     Filter,
     Filter as MongoFilter,
     FindOptions,
-    ObjectId,
     UpdateFilter,
     UpdateOptions
 }
 from 'mongodb';
-import Aggregator from '@webergency-utils/aggregator';
-import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
-import { AccessControl } from './access-control.js';
-import { ModelCache, buildCacheKey, extractTargetIdsFromFilter } from './cache.js';
-import { ConverterManager } from './converters.js';
+import { AbstractBaseModel } from './base-model.js';
+import { extractTargetIdsFromFilter } from './cache.js';
 import { ModelAccessDeniedError, ModelError } from './errors.js';
-import
-{
-    ModelCacheEvent,
-    ModelEventEmitter,
-    ModelEventHandler,
-    ModelEventName,
-    ModelMutationEvent,
-    ModelMutationOperation,
-    ModelQueryEvent,
-    ModelQueryOperation,
-    ObservabilityConfig,
-    ObservabilityOptions,
-    dispatchObservabilityEvent,
-    resolveObservabilityOptions
-}
-from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
 {
-    Arr,
-    DUMP,
     LOG,
     LOG_FILE,
     addPrefixToFilter,
@@ -49,9 +27,7 @@ import
     getUsedFields,
     isExclusionProjection,
     isSet,
-    map,
     mergeComputedProperties,
-    objectHash,
     optimizeMatch,
     projectionToReplace,
     propertyModelUpdateParams,
@@ -69,17 +45,11 @@ import
     attachListMetadata,
     attachPropertyUpdateMetadata,
     buildPropertyDeleteOperation,
-    convertDocuments,
-    normalizeExistsOptions,
     normalizeFindMatch,
-    normalizeGetManyOptions,
-    normalizeGetOptions,
     resolveCreateFromArgs
 }
 from './operations.js';
-import { PipelineBuilder } from './pipeline-builder.js';
-import { ComputedPropertyResolver, SmartFilterResolver } from './resolvers.js';
-import { GET_OBSERVABILITY_OPTIONS, GET_OPTIMIZER_OPTIONS, GET_PARENT, REGISTER_MODEL } from './symbols.js';
+import { GET_PARENT, RESOLVED_ACCESS } from './symbols.js';
 import
 {
     AbstractPropertyModelComputedProperties,
@@ -96,8 +66,6 @@ import
     ModelUpdateOptions,
     MongoPropertyDocument,
     MongoRootDocument,
-    OptimizerConfig,
-    OptimizerOptions,
     PropertyModelAggregateOptions,
     PropertyModelExtensions,
     PropertyModelFilter,
@@ -120,296 +88,78 @@ export abstract class AbstractPropertyModel
     DTO extends Document,
     Extensions extends PropertyModelExtensions<DBE, AbstractPropertyModelSmartFilters<any, any>, AbstractPropertyModelComputedProperties<any, any>>
 >
+extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
 {
-    #findAggregator: Aggregator<DTO['id'] | DBE['id'], DBE | null>;
     #paths: { path: string, array: boolean }[];
     #prefix: string;
-    #converters: ConverterManager<DBE>;
-    #access: AccessControl<DBE>;
-    #smartFilters: SmartFilterResolver;
-    #computedProperties: ComputedPropertyResolver;
-    #pipelineBuilder = new PipelineBuilder<RootDBE>();
-    #models: AbstractModels;
-    #events = new ModelEventEmitter();
-    #cache?: ModelCache;
-    #optimizer?: OptimizerConfig;
-    #observability?: ObservabilityConfig;
 
-    public converters: Extensions['converters'];
     public smartFilters?: FirstType<ExtractSmartFilters<Extensions>>;
 
-    protected constructor( models: AbstractModels, public collection: Collection<RootDBE>, path: string, params: ConstructorExtensions<Extensions> )
+    protected constructor(
+        models: AbstractModels,
+        collection: Collection<RootDBE>,
+        path: string,
+        params: ConstructorExtensions<Extensions>
+    )
     {
-        this.#models = models;
-        this.#cache = params.cache ? new ModelCache( params.cache ) : undefined;
-        this.#optimizer = params.optimizer;
-        this.#observability = params.observability;
-        this.#paths = [ ...path.matchAll( /[^\[\]]+(\[\])?/g ) ].map( m => ({ path: m[0].replace( /^\./, '' ).replace( /\[\]$/, '' ), array: m[0].endsWith( '[]' ) }));
-        this.#prefix = this.#paths.map( p => p.path ).join( '.' );
-        this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
-        this.smartFilters = params.smartFilters;
-        this.#converters = new ConverterManager( this, this.converters, ( err, op ) => this.#emitError( err, op ));
-        this.#access = new AccessControl(
+        const paths = [ ...path.matchAll( /[^\[\]]+(\[\])?/g ) ].map( m => ({ path: m[0].replace( /^\./, '' ).replace( /\[\]$/, '' ), array: m[0].endsWith( '[]' ) }));
+        const prefix = paths.map( p => p.path ).join( '.' );
+
+        super( models, collection,
         {
-            model            : this,
-            config           : params.access,
-            filterOverridden : this.accessFilter !== AbstractPropertyModel.prototype.accessFilter,
-            invokeFilter     : ( name ) => this.accessFilter( name ) as any
-        });
-        this.#smartFilters = new SmartFilterResolver( this, this.smartFilters,
-        {
-            prefix          : this.#prefix,
-            parentResolve   : ( smartFilter ) =>
+            cache                       : params.cache,
+            converters                  : params.converters,
+            smartFilters                : params.smartFilters,
+            computedProperties          : params.computedProperties,
+            access                      : params.access,
+            optimizer                   : params.optimizer,
+            observability               : params.observability,
+            idField                     : 'id',
+            prefix,
+            smartFilterOptions          :
             {
-                const parent = this.#models[GET_PARENT]( this.collection.collectionName, this.#prefix );
-
-                return parent ? parent.resolveSmartFilter( smartFilter ) : Promise.resolve({});
-            }
-        });
-        this.#computedProperties = new ComputedPropertyResolver( this, params.computedProperties,
-        {
-            prefix          : this.#prefix,
-            parentResolve   : ( properties ) =>
-            {
-                const parent = this.#models[GET_PARENT]( this.collection.collectionName, this.#prefix );
-
-                return parent ? parent.resolveComputedProperties( properties ) : Promise.resolve({});
-            }
-        });
-
-        this.#findAggregator = new Aggregator( async( ids: Array<DTO['id'] | DBE['id']>, conversion: keyof Extensions['converters'], accessCtx?: { method: string, access?: string, scopeKey?: string } ) =>
-        {
-            try
-            {
-                ids = ids.map( id => this.dtoID( id ));
-
-                let pipeline = await this.pipeline(
+                prefix,
+                parentResolve : ( smartFilter ) =>
                 {
-                    filter      : { id: { $in: ids.map( id => this.dbeID( id )) } },
-                    projection  : this.converters[conversion].projection,
-                    access      : accessCtx?.access
-                }, conversion, accessCtx?.method ?? 'get' );
+                    const parent = models[GET_PARENT]( collection.collectionName, prefix );
 
-                pipeline = this.#optimizePipeline( pipeline );
-
-                const start = Date.now();
-                const documents = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as DBE[];
-                const duration = Date.now() - start;
-
-                LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-                LOG_FILE( `TIME: ${duration} ms` );
-                LOG_FILE( pipeline, true );
-                this.#emitQuery( 'get', pipeline, duration,
-                {
-                    resultCount : documents.length,
-                    conversion  : String( conversion )
-                });
-
-                return map(
-                    ids.map( id => this.dtoID( id )),
-                    documents,
-                    ( dbe: DBE ) => this.dtoID( dbe.id )
-                );
-            }
-            catch( e: any )
-            {
-                this.#emitError( e, 'get' );
-
-                if( e instanceof ModelError )
-                {
-                    throw e;
+                    return parent ? parent.resolveSmartFilter( smartFilter ) : Promise.resolve({});
                 }
+            },
+            computedPropertyOptions     :
+            {
+                prefix,
+                parentResolve : ( properties ) =>
+                {
+                    const parent = models[GET_PARENT]( collection.collectionName, prefix );
 
-                throw new ModelError( 'MODEL_GET_ERROR', this, e?.toString?.() ?? String( e ), e );
+                    return parent ? parent.resolveComputedProperties( properties ) : Promise.resolve({});
+                }
             }
         });
 
-        models[REGISTER_MODEL]( this, collection.collectionName, this.#prefix );
+        this.#paths = paths;
+        this.#prefix = prefix;
+        this.smartFilters = params.smartFilters;
     }
 
-    [GET_OPTIMIZER_OPTIONS](): OptimizerOptions | undefined
-    {
-        if( this.#optimizer === undefined )
-        {
-            const parent = this.#models[GET_PARENT]( this.collection.collectionName, this.#prefix );
-
-            return typeof parent?.[GET_OPTIMIZER_OPTIONS] === 'function'
-                ? parent[GET_OPTIMIZER_OPTIONS]()
-                : this.#models[GET_OPTIMIZER_OPTIONS]();
-        }
-
-        if( this.#optimizer === false ){ return undefined }
-
-        if( this.#optimizer === true ){ return {} }
-
-        return this.#optimizer;
-    }
-
-    [GET_OBSERVABILITY_OPTIONS](): ObservabilityOptions | undefined
-    {
-        const parent = this.#models[GET_PARENT]( this.collection.collectionName, this.#prefix );
-        const parentOptions = typeof parent?.[GET_OBSERVABILITY_OPTIONS] === 'function'
-            ? parent[GET_OBSERVABILITY_OPTIONS]()
-            : this.#models[GET_OBSERVABILITY_OPTIONS]();
-
-        return resolveObservabilityOptions( this.#observability, parentOptions );
-    }
-
-    #optimizePipeline( pipeline: Document[] ): Document[]
-    {
-        const options = this[GET_OPTIMIZER_OPTIONS]();
-
-        return options !== undefined ? optimizePipeline( pipeline, options ) : pipeline;
-    }
-
-    public on<E extends ModelEventName>( event: E, handler: ModelEventHandler<E> ): () => void
-    {
-        return this.#events.on( event, handler );
-    }
-
-    public off<E extends ModelEventName>( event: E, handler: ModelEventHandler<E> ): void
-    {
-        this.#events.off( event, handler );
-    }
-
-    #emitQuery(
-        operation: ModelQueryOperation,
-        pipeline: Document[],
-        duration: number,
-        extra?: Partial<Omit<ModelQueryEvent, 'collection' | 'operation' | 'pipeline' | 'duration'>>
-    )
-    {
-        dispatchObservabilityEvent(
-            'query',
-            {
-                collection  : `${this.collection.collectionName}.${this.#prefix}`,
-                model       : this.constructor.name,
-                pipeline,
-                duration,
-                operation,
-                ...extra
-            },
-            this.#events,
-            this.#models,
-            this[GET_OBSERVABILITY_OPTIONS]()
-        );
-    }
-
-    #emitMutation(
-        operation: ModelMutationOperation,
-        duration: number,
-        extra?: Partial<Omit<ModelMutationEvent, 'collection' | 'operation' | 'duration'>>
-    )
-    {
-        dispatchObservabilityEvent(
-            'mutation',
-            {
-                collection  : `${this.collection.collectionName}.${this.#prefix}`,
-                model       : this.constructor.name,
-                operation,
-                duration,
-                ...extra
-            },
-            this.#events,
-            this.#models,
-            this[GET_OBSERVABILITY_OPTIONS]()
-        );
-    }
-
-    #emitCache(
-        operation: ModelCacheEvent['operation'],
-        extra?: Partial<Omit<ModelCacheEvent, 'collection' | 'operation'>>
-    )
-    {
-        dispatchObservabilityEvent(
-            'cache',
-            {
-                collection  : `${this.collection.collectionName}.${this.#prefix}`,
-                model       : this.constructor.name,
-                operation,
-                ...extra
-            },
-            this.#events,
-            this.#models,
-            this[GET_OBSERVABILITY_OPTIONS]()
-        );
-    }
-
-    #emitError( error: unknown, operation?: string, duration?: number )
-    {
-        dispatchObservabilityEvent(
-            'error',
-            {
-                collection  : `${this.collection.collectionName}.${this.#prefix}`,
-                model       : this.constructor.name,
-                error       : error instanceof Error ? error : new Error( String( error )),
-                operation,
-                duration
-            },
-            this.#events,
-            this.#models,
-            this[GET_OBSERVABILITY_OPTIONS]()
-        );
-    }
-
-    #invalidateCache( ids: Array<any> ): void
-    {
-        if( !this.#cache || !ids.length ){ return }
-
-        const normalizedIds = ids.map( id => String( this.dtoID( id )));
-        const evicted = this.#cache.invalidateIds( normalizedIds );
-
-        if( evicted.length > 0 )
-        {
-            this.#emitCache( 'invalidate', { ids: normalizedIds });
-        }
-    }
-
-    protected id(): DTO['id'] | Promise<DTO['id']>
-    {
-        return new ObjectId().toString() as DTO['id'];
-    }
-
-    public dbeID( id: DTO['id'] | DBE['id'] ): DBE['id']
+    public override dbeID( id: DTO['id'] | DBE['id'] ): DBE['id']
     {
         return id as DBE['id'];
     }
 
-    public dtoID( dbeID: DBE['id'] | DTO['id'] ): DTO['id']
+    public override dtoID( dbeID: DBE['id'] | DTO['id'] ): DTO['id']
     {
         return dbeID as DTO['id'];
     }
 
-    protected ensureOpen(): void
-    {
-        this.#models.assertOpen();
-    }
-
-    protected trackOperation(): () => void
-    {
-        return this.#models.trackOperation();
-    }
-
-    protected async runOperation<T>( operation: () => Promise<T> ): Promise<T>
-    {
-        const release = this.trackOperation();
-
-        try
-        {
-            return await operation();
-        }
-        finally
-        {
-            release();
-        }
-    }
-
-    protected async pipeline<K extends keyof Extensions['converters']>(
+    protected override async pipeline<K extends keyof Extensions['converters']>(
         options: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>> = {},
         conversion?: K,
         method: string = 'list'
     ): Promise<Document[]>
     {
+        const preResolvedAccess = ( options as any )?.[RESOLVED_ACCESS] as { denied: boolean, filter?: Filter<DBE> } | undefined;
         const { computedProperties } = this.converters[conversion ?? 'dto'];
         let { filter = {} as PropertyModelFilter<RootDBE, DBE>, sort = { id: -1 }, ...rest } = resolveBSONObject( options );
 
@@ -455,7 +205,7 @@ export abstract class AbstractPropertyModel
             }, { filter: {} as Filter<DBE>, pipeline: [] as Document[] });
         const needRoot = getUsedFields( gatheredFilters?.pipeline ?? [] ).used.some( el => el.startsWith( '_root.' ));
 
-        const stages = await this.#filterStages( options, method );
+        const stages = await this.#filterStages( options, method, preResolvedAccess );
         const subPaths = getSubPaths( this.#paths );
 
         for( let i = 0; i <= subPaths.length; i++ )
@@ -470,7 +220,7 @@ export abstract class AbstractPropertyModel
             const tmpPrefix = prefix.replace( /^\$/, '' );
 
             needRoot && last && pipeline.push({ $addFields: { _root: '$$ROOT' }});
-            pipeline.push( ...await this.#pipelineBuilder.pipeline(
+            pipeline.push( ...await this._pipelineBuilder.pipeline(
             {
                 filter              : stages[i],
                 smartFilter         : smartFilter?.[tmpPrefix] ? smartFilter?.[tmpPrefix] as { filter?: Filter<RootDBE>, pipeline: Document[] } : undefined,
@@ -514,7 +264,7 @@ export abstract class AbstractPropertyModel
 
         const prev = options.cursor?.startsWith( 'prev:' );
 
-        pipeline.push( ...await this.#pipelineBuilder.pipeline(
+        pipeline.push( ...await this._pipelineBuilder.pipeline(
         {
             sort        : prev ? reverseSort( sort ) : sort,
             skip        : rest.skip,
@@ -531,7 +281,7 @@ export abstract class AbstractPropertyModel
 
         try
         {
-            const access = await this.#access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
+            const access = await this._access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
 
             if( access.denied )
             {
@@ -539,7 +289,7 @@ export abstract class AbstractPropertyModel
             }
 
             const _id: DTO['id'] = id ?? await this.id();
-            const parentModel = this.#models[GET_PARENT]( this.collection.collectionName, this.#prefix );
+            const parentModel = this._models[GET_PARENT]( this.collection.collectionName, this.#prefix );
             const parent = parentModel ? await parentModel.get( parentID ) : null;
 
             if( !parent || !parentModel )
@@ -557,7 +307,7 @@ export abstract class AbstractPropertyModel
                 resolveBSONObject({ arrayFilters })
             );
 
-            this.#emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
+            this._emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
 
             return _id;
         }
@@ -589,11 +339,11 @@ export abstract class AbstractPropertyModel
 
             try
             {
-                dbe = await this.#converters.convertFrom( data, fromKey ) as unknown as Omit<DBE, 'id'> & { id?: DBE['id'] };
+                dbe = await this._converters.convertFrom( data, fromKey ) as unknown as Omit<DBE, 'id'> & { id?: DBE['id'] };
             }
             catch( e )
             {
-                this.#emitError( e, 'createFrom', Date.now() - start );
+                this._emitError( e, 'createFrom', Date.now() - start );
 
                 throw e;
             }
@@ -601,7 +351,7 @@ export abstract class AbstractPropertyModel
             const resolvedId = explicitId ?? ( dbe.id !== undefined ? this.dtoID( dbe.id ) as DTO['id'] : undefined );
             const createdId = await this.create( parentID, dbe, resolvedId, resolvedOptions );
 
-            this.#emitMutation( 'createFrom', Date.now() - start, { insertedCount: 1, ids: [ createdId ] });
+            this._emitMutation( 'createFrom', Date.now() - start, { insertedCount: 1, ids: [ createdId ] });
 
             return createdId;
         });
@@ -619,14 +369,14 @@ export abstract class AbstractPropertyModel
             const explicitIds = Array.isArray( idsOrOptions ) ? idsOrOptions : undefined;
             const resolvedOptions = Array.isArray( idsOrOptions ) ? options : idsOrOptions;
 
-            const access = await this.#access.resolveOrDeny({ operation: 'create', method: 'createMany', access: resolvedOptions?.access });
+            const access = await this._access.resolveOrDeny({ operation: 'create', method: 'createMany', access: resolvedOptions?.access });
 
             if( access.denied )
             {
                 throw new ModelAccessDeniedError( this );
             }
 
-            const parentModel = this.#models[GET_PARENT]( this.collection.collectionName, this.#prefix );
+            const parentModel = this._models[GET_PARENT]( this.collection.collectionName, this.#prefix );
             const parent = parentModel ? await parentModel.get( parentID ) : null;
 
             if( !parent || !parentModel )
@@ -636,7 +386,7 @@ export abstract class AbstractPropertyModel
 
             if( items.length === 0 )
             {
-                this.#emitMutation( 'createMany', 0, { insertedCount: 0, ids: [] });
+                this._emitMutation( 'createMany', 0, { insertedCount: 0, ids: [] });
 
                 return [];
             }
@@ -669,13 +419,13 @@ export abstract class AbstractPropertyModel
                     resolveBSONObject({ arrayFilters })
                 );
 
-                this.#emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
+                this._emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
 
                 return ids;
             }
             catch( e: any )
             {
-                this.#emitError( e, 'createMany', Date.now() - start );
+                this._emitError( e, 'createMany', Date.now() - start );
 
                 throw e;
             }
@@ -689,7 +439,7 @@ export abstract class AbstractPropertyModel
         try
         {
             const path = this.#paths.map( p => p.path ).join( '.' ) + '.id';
-            const access = await this.#access.resolveOrDeny({ operation: 'update', method: 'update', access: options?.access });
+            const access = await this._access.resolveOrDeny({ operation: 'update', method: 'update', access: options?.access });
 
             if( access.denied )
             {
@@ -715,11 +465,11 @@ export abstract class AbstractPropertyModel
             );
             const duration = Date.now() - start;
 
-            this.#invalidateCache([ id ]);
+            this._invalidateCache([ id ]);
 
             const documentAfter = options?.documentAfter ? ( await this.get( id, { as: 'dbe' as any }) as DBE ) || undefined : undefined;
 
-            this.#emitMutation( 'update', duration,
+            this._emitMutation( 'update', duration,
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
@@ -750,14 +500,15 @@ export abstract class AbstractPropertyModel
 
         let pipeline = await this.pipeline(
         {
-            filter      : combinedFilter,
-            smartFilter : findOptions.smartFilter as any,
-            projection  : { id: 1 },
+            filter              : combinedFilter,
+            smartFilter         : findOptions.smartFilter as any,
+            projection          : { id: 1 },
             limit,
-            access      : findOptions.access
-        }, 'dbe' as any, 'find' );
+            access              : findOptions.access,
+            [RESOLVED_ACCESS]   : { denied: false, filter: undefined }
+        } as any, 'dbe' as any, 'find' );
 
-        pipeline = this.#optimizePipeline( pipeline );
+        pipeline = this._optimizePipeline( pipeline );
 
         const docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as Array<{ id: DBE['id'] }>;
 
@@ -796,7 +547,7 @@ export abstract class AbstractPropertyModel
         return this.runOperation( async() =>
         {
             const findOptions = normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( match, options?.access );
-            const access = await this.#access.resolveOrDeny({ operation: 'update', method: 'updateOne', access: findOptions.access });
+            const access = await this._access.resolveOrDeny({ operation: 'update', method: 'updateOne', access: findOptions.access });
 
             if( access.denied )
             {
@@ -825,10 +576,10 @@ export abstract class AbstractPropertyModel
             {
                 if( targetIds && targetIds.length > 0 )
                 {
-                    this.#invalidateCache( targetIds );
+                    this._invalidateCache( targetIds );
                 }
 
-                this.#emitMutation( 'updateOne', 0, { matchedCount: 0, modifiedCount: 0, ids: targetIds ?? undefined });
+                this._emitMutation( 'updateOne', 0, { matchedCount: 0, modifiedCount: 0, ids: targetIds ?? undefined });
 
                 return attachPropertyUpdateMetadata<DBE>({ matchedCount: 0, modifiedCount: 0 });
             }
@@ -837,7 +588,7 @@ export abstract class AbstractPropertyModel
 
             if( targetIds && targetIds.length > 0 )
             {
-                this.#invalidateCache( targetIds );
+                this._invalidateCache( targetIds );
             }
 
             return attachPropertyUpdateMetadata<DBE>(
@@ -865,7 +616,7 @@ export abstract class AbstractPropertyModel
             const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options?.access ) : undefined;
             const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
 
-            const access = await this.#access.resolveOrDeny({ operation: 'update', method: 'updateMany', access: effectiveAccess });
+            const access = await this._access.resolveOrDeny({ operation: 'update', method: 'updateMany', access: effectiveAccess });
 
             if( access.denied )
             {
@@ -878,10 +629,10 @@ export abstract class AbstractPropertyModel
             {
                 if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
                 {
-                    this.#invalidateCache( cacheIdsToInvalidate );
+                    this._invalidateCache( cacheIdsToInvalidate );
                 }
 
-                this.#emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: cacheIdsToInvalidate ?? undefined });
+                this._emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: cacheIdsToInvalidate ?? undefined });
 
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
@@ -906,10 +657,10 @@ export abstract class AbstractPropertyModel
 
             if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
             {
-                this.#invalidateCache( cacheIdsToInvalidate );
+                this._invalidateCache( cacheIdsToInvalidate );
             }
 
-            this.#emitMutation( 'updateMany', Date.now() - start,
+            this._emitMutation( 'updateMany', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
@@ -926,25 +677,25 @@ export abstract class AbstractPropertyModel
         }
     }
 
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         id: DTO['id'] | DBE['id'],
         options?: GetOptions<K> | K
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['id']>,
         conversion: K,
         filtered: true
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['id']>,
         options: GetManyOptions<K> & { filter: true }
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['id']>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>;
-    public async get<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
         idOrIds: DTO['id'] | DBE['id'] | Array<DTO['id'] | DBE['id']>,
         optionsOrConversion?: GetOptions<K> | GetManyOptions<K> | K,
         filtered?: boolean
@@ -954,214 +705,39 @@ export abstract class AbstractPropertyModel
         | Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
     >
     {
-        if( Array.isArray( idOrIds ) )
-        {
-            return this.getMany( idOrIds, normalizeGetManyOptions<K>( optionsOrConversion as GetManyOptions<K> | K, filtered ));
-        }
-
-        const release = this.trackOperation();
-
-        try
-        {
-            const options = normalizeGetOptions<K>( optionsOrConversion as GetOptions<K> | K );
-            const conversion = ( options.as ?? 'dto' ) as K;
-            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'get', access: options.access });
-
-            if( access.denied ){ return null }
-
-            const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
-            const dtoId = String( this.dtoID( idOrIds ));
-            const cacheKey = this.#cache ? buildCacheKey( String( conversion ), dtoId, scopeKey ) : undefined;
-
-            if( this.#cache && cacheKey )
-            {
-                const cached = this.#cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
-
-                if( cached !== undefined )
-                {
-                    this.#emitCache( 'hit', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-
-                    return cached;
-                }
-
-                this.#emitCache( 'miss', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-            }
-
-            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
-            const documents = await this.#findAggregator.execute( Arr( idOrIds ) as Array<DTO['id'] | DBE['id']>, conversion, { method: 'get', access: options.access, scopeKey } ) as Array<DBE | null>;
-
-            benchmark?.step( 'QUERY' );
-
-            const entries = await convertDocuments( this.#converters, documents, conversion );
-
-            benchmark?.step( 'CONVERTER' );
-
-            const result = ( entries[0] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
-
-            if( this.#cache && cacheKey && result !== null )
-            {
-                this.#cache.set( cacheKey, result, [ dtoId ]);
-                this.#emitCache( 'set', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-            }
-
-            return result;
-        }
-        finally
-        {
-            release();
-        }
+        return super.get( idOrIds, optionsOrConversion as any, filtered );
     }
 
-    public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['id']>,
         options: GetManyOptions<K> & { filter: true }
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['id']>,
         conversion: K,
         filtered: true
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['id']>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>;
-    public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
+    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
         ids: Array<DTO['id'] | DBE['id']>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>
     {
-        const release = this.trackOperation();
-
-        try
-        {
-            const options = normalizeGetManyOptions<K>( optionsOrConversion, filtered );
-            const conversion = ( options.as ?? 'dto' ) as K;
-            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'getMany', access: options.access });
-
-            if( access.denied )
-            {
-                return options.filter ? [] : ids.map(() => null );
-            }
-
-            const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
-            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
-
-            if( this.#cache )
-            {
-                const results: Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null> = new Array( ids.length ).fill( null );
-                const missing: Array<{ index: number, id: DTO['id'] | DBE['id'], dtoId: string, cacheKey: string }> = [];
-
-                for( let i = 0; i < ids.length; i++ )
-                {
-                    const id = ids[i];
-                    const dtoId = String( this.dtoID( id ));
-                    const cacheKey = buildCacheKey( String( conversion ), dtoId, scopeKey );
-                    const cached = this.#cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
-
-                    if( cached !== undefined )
-                    {
-                        results[i] = cached;
-                        this.#emitCache( 'hit', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-                    }
-                    else
-                    {
-                        this.#emitCache( 'miss', { key: cacheKey, ids: [ dtoId ], conversion: String( conversion ) });
-                        missing.push({ index: i, id, dtoId, cacheKey });
-                    }
-                }
-
-                if( missing.length > 0 )
-                {
-                    const documents = await this.#findAggregator.execute(
-                        missing.map( m => m.id ) as DTO['id'][],
-                        conversion,
-                        { method: 'getMany', access: options.access, scopeKey }
-                    ) as Array<DBE | null>;
-
-                    benchmark?.step( 'QUERY' );
-
-                    const converted = await convertDocuments( this.#converters, documents, conversion, false );
-
-                    benchmark?.step( 'CONVERTER' );
-
-                    for( let j = 0; j < missing.length; j++ )
-                    {
-                        const entry = ( converted[j] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
-                        const target = missing[j];
-
-                        results[target.index] = entry;
-
-                        if( entry !== null )
-                        {
-                            this.#cache.set( target.cacheKey, entry, [ target.dtoId ]);
-                            this.#emitCache( 'set', { key: target.cacheKey, ids: [ target.dtoId ], conversion: String( conversion ) });
-                        }
-                    }
-                }
-
-                return options.filter ? results.filter( Boolean ) : results;
-            }
-
-            const documents = await this.#findAggregator.execute( ids as DTO['id'][], conversion, { method: 'getMany', access: options.access, scopeKey } ) as Array<DBE | null>;
-
-            benchmark?.step( 'QUERY' );
-
-            const entries = await convertDocuments( this.#converters, documents, conversion, options.filter === true );
-
-            benchmark?.step( 'CONVERTER' );
-
-            return entries as Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
-        }
-        finally
-        {
-            release();
-        }
+        return super.getMany( ids, optionsOrConversion as any, filtered );
     }
 
-    public async find<K extends keyof Extensions['converters']>(
+    public override async find<K extends keyof Extensions['converters']>(
         options: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
         conversion: K = 'dto' as K,
         sort?: FindOptions['sort']
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
     {
-        return this.runOperation( async() =>
-        {
-            const { projection } = this.converters[conversion];
-            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':find(' + String( conversion ) + ')' ) : undefined;
-
-            let pipeline = await this.pipeline({ filter: options.filter, smartFilter: options.smartFilter, projection, sort, limit: 1, access: options.access }, conversion, 'find' );
-
-            pipeline = this.#optimizePipeline( pipeline );
-
-            flowGet( 'log' ) && DUMP( pipeline );
-
-            const start = Date.now();
-            const dbe = ( await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray())[0];
-            const duration = Date.now() - start;
-
-            LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-            LOG_FILE( `TIME: ${duration} ms` );
-            LOG_FILE( pipeline, true );
-
-            benchmark?.step( 'QUERY' );
-
-            const convStart = Date.now();
-            const data = dbe ? await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> : null;
-            const converterDuration = Date.now() - convStart;
-
-            this.#emitQuery( 'find', pipeline, duration,
-            {
-                converterDuration,
-                resultCount : data ? 1 : 0,
-                conversion  : String( conversion )
-            });
-
-            benchmark?.step( 'CONVERTER' );
-
-            return data;
-        }) as Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
+        return super.find( options, conversion, sort );
     }
 
     public async list<K extends keyof Extensions['converters']>(
@@ -1173,106 +749,109 @@ export abstract class AbstractPropertyModel
 
         try
         {
-        const { projection } = this.converters[conversion];
-        const prev = options.cursor?.startsWith( 'prev:' );
-        const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
+            const { projection } = this.converters[conversion];
+            const prev = options.cursor?.startsWith( 'prev:' );
+            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
 
-        try
-        {
-            await this.#access.resolve({ operation: 'read', method: 'list', access: options.access });
-        }
-        catch( e )
-        {
-            if( e instanceof ModelAccessDeniedError )
+            let accessFilter: Filter<DBE> | undefined;
+
+            try
             {
-                return attachListMetadata([], options.count ? 0 : undefined, {});
+                accessFilter = await this._access.resolve({ operation: 'read', method: 'list', access: options.access });
+            }
+            catch( e )
+            {
+                if( e instanceof ModelAccessDeniedError )
+                {
+                    return attachListMetadata([], options.count ? 0 : undefined, {});
+                }
+
+                throw e;
             }
 
-            throw e;
-        }
+            const resolvedList = resolveBSONObject( options );
+            // Strip cursor/count from the count path — count is not page-scoped, and must not
+            // re-apply cursor against a different default sort than the list pipeline.
+            let { sort = { id: 1 }, countLimit, cursor: _cursor, count: _count, ...countRest } = resolvedList;
 
-        const resolvedList = resolveBSONObject( options );
-        // Strip cursor/count from the count path — count is not page-scoped, and must not
-        // re-apply cursor against a different default sort than the list pipeline.
-        let { sort = { id: 1 }, countLimit, cursor: _cursor, count: _count, ...countRest } = resolvedList;
-
-        if( !sort.id )
-        {
-            sort = { ...sort, id: 1 };
-        }
-
-        let pipeline = await this.pipeline({ ...resolvedList, sort, projection }, conversion, 'list' );
-        let countPipeline = resolvedList.count
-            ? this.#pipelineBuilder.buildCountPipeline(
-                await this.pipeline({ ...countRest, sort, projection }, undefined, 'list' ),
-                countLimit
-            )
-            : undefined;
-
-        pipeline = this.#optimizePipeline( pipeline );
-        countPipeline && ( countPipeline = this.#optimizePipeline( countPipeline ));
-
-        const start = Date.now();
-        let queryDuration = 0;
-        const [ entries, total ] = await Promise.all(
-        [
-            this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+            if( !sort.id )
             {
-                queryDuration = Date.now() - start;
+                sort = { ...sort, id: 1 };
+            }
 
-                LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-                LOG_FILE( `TIME: ${queryDuration} ms` );
-                LOG_FILE( pipeline, true );
+            const resolvedAccess = { denied: false, filter: accessFilter };
+            let pipeline = await this.pipeline({ ...resolvedList, sort, projection, [RESOLVED_ACCESS]: resolvedAccess } as any, conversion, 'list' );
+            let countPipeline = resolvedList.count
+                ? this._pipelineBuilder.buildCountPipeline(
+                    await this.pipeline({ ...countRest, sort, projection, [RESOLVED_ACCESS]: resolvedAccess } as any, conversion, 'list' ),
+                    countLimit
+                )
+                : undefined;
 
-                return r;
-            }),
-            countPipeline
-                ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+            pipeline = this._optimizePipeline( pipeline );
+            countPipeline && ( countPipeline = this._optimizePipeline( countPipeline ));
+
+            const start = Date.now();
+            let queryDuration = 0;
+            const [ entries, total ] = await Promise.all(
+            [
+                this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
                 {
-                    const duration = Date.now() - start;
+                    queryDuration = Date.now() - start;
 
                     LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-                    LOG_FILE( `TIME: ${duration} ms` );
-                    LOG_FILE( countPipeline, true );
-                    this.#emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
+                    LOG_FILE( `TIME: ${queryDuration} ms` );
+                    LOG_FILE( pipeline, true );
 
-                    return r[0]?.count ?? 0;
-                })
-                : undefined
-        ]);
+                    return r;
+                }),
+                countPipeline
+                    ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+                    {
+                        const duration = Date.now() - start;
 
-        benchmark?.step( 'QUERY' );
+                        LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
+                        LOG_FILE( `TIME: ${duration} ms` );
+                        LOG_FILE( countPipeline, true );
+                        this._emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
 
-        const orderedEntries = prev ? [ ...entries ].reverse() : entries;
-        const convStart = Date.now();
-        const items = await Promise.all( orderedEntries.map( async( dbe ) =>
-        {
-            const dto = await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
+                        return r[0]?.count ?? 0;
+                    })
+                    : undefined
+            ]);
 
-            return attachCursorToItem( dto, dbe, sort );
-        }));
-        const converterDuration = Date.now() - convStart;
+            benchmark?.step( 'QUERY' );
 
-        this.#emitQuery( 'list', pipeline, queryDuration,
-        {
-            converterDuration,
-            resultCount : items.length,
-            conversion  : String( conversion )
-        });
-
-        benchmark?.step( 'CONVERTER' );
-
-        const first = orderedEntries[0];
-        const last = orderedEntries[orderedEntries.length - 1];
-
-        return attachListMetadata(
-            items,
-            resolvedList.count ? total : undefined,
+            const orderedEntries = prev ? [ ...entries ].reverse() : entries;
+            const convStart = Date.now();
+            const items = await Promise.all( orderedEntries.map( async( dbe ) =>
             {
-                prev    : first ? getCursor( first, sort ) : undefined,
-                next    : last ? getCursor( last, sort ) : undefined
-            }
-        );
+                const dto = await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
+
+                return attachCursorToItem( dto, dbe, sort );
+            }));
+            const converterDuration = Date.now() - convStart;
+
+            this._emitQuery( 'list', pipeline, queryDuration,
+            {
+                converterDuration,
+                resultCount : items.length,
+                conversion  : String( conversion )
+            });
+
+            benchmark?.step( 'CONVERTER' );
+
+            const first = orderedEntries[0];
+            const last = orderedEntries[orderedEntries.length - 1];
+
+            return attachListMetadata(
+                items,
+                resolvedList.count ? total : undefined,
+                {
+                    prev    : first ? getCursor( first, sort ) : undefined,
+                    next    : last ? getCursor( last, sort ) : undefined
+                }
+            );
         }
         finally
         {
@@ -1289,78 +868,80 @@ export abstract class AbstractPropertyModel
 
         try
         {
-        const { projection } = this.converters[conversion];
-        const prev = options.cursor?.startsWith( 'prev:' );
+            const { projection } = this.converters[conversion];
+            const prev = options.cursor?.startsWith( 'prev:' );
 
-        try
-        {
-            await this.#access.resolve({ operation: 'read', method: 'stream', access: options.access });
-        }
-        catch( e )
-        {
-            if( e instanceof ModelAccessDeniedError )
+            let accessFilter: Filter<DBE> | undefined;
+
+            try
             {
-                return;
+                accessFilter = await this._access.resolve({ operation: 'read', method: 'stream', access: options.access });
+            }
+            catch( e )
+            {
+                if( e instanceof ModelAccessDeniedError )
+                {
+                    return;
+                }
+
+                throw e;
             }
 
-            throw e;
-        }
+            const resolvedList = resolveBSONObject( options );
+            let { sort = { id: 1 } } = resolvedList;
 
-        const resolvedList = resolveBSONObject( options );
-        let { sort = { id: 1 } } = resolvedList;
-
-        if( !sort.id )
-        {
-            sort = { ...sort, id: 1 };
-        }
-
-        let pipeline = await this.pipeline({ ...resolvedList, sort, projection }, conversion, 'stream' );
-
-        pipeline = this.#optimizePipeline( pipeline );
-
-        const start = Date.now();
-        const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
-
-        if( prev )
-        {
-            const entries = await cursorDocs.toArray();
-            const duration = Date.now() - start;
-
-            LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-            LOG_FILE( `TIME: ${duration} ms` );
-            LOG_FILE( pipeline, true );
-            this.#emitQuery( 'stream', pipeline, duration );
-
-            for( const dbe of entries.reverse() )
+            if( !sort.id )
             {
-                yield await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                sort = { ...sort, id: 1 };
             }
 
-            return;
-        }
+            let pipeline = await this.pipeline({ ...resolvedList, sort, projection, [RESOLVED_ACCESS]: { denied: false, filter: accessFilter } } as any, conversion, 'stream' );
 
-        let emitted = false;
+            pipeline = this._optimizePipeline( pipeline );
 
-        for await( const dbe of cursorDocs )
-        {
-            if( !emitted )
+            const start = Date.now();
+            const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
+
+            if( prev )
             {
-                emitted = true;
+                const entries = await cursorDocs.toArray();
                 const duration = Date.now() - start;
 
                 LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
                 LOG_FILE( `TIME: ${duration} ms` );
                 LOG_FILE( pipeline, true );
-                this.#emitQuery( 'stream', pipeline, duration );
+                this._emitQuery( 'stream', pipeline, duration );
+
+                for( const dbe of entries.reverse() )
+                {
+                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                }
+
+                return;
             }
 
-            yield await this.#converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-        }
+            let emitted = false;
 
-        if( !emitted )
-        {
-            this.#emitQuery( 'stream', pipeline, Date.now() - start );
-        }
+            for await( const dbe of cursorDocs )
+            {
+                if( !emitted )
+                {
+                    emitted = true;
+                    const duration = Date.now() - start;
+
+                    LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
+                    LOG_FILE( `TIME: ${duration} ms` );
+                    LOG_FILE( pipeline, true );
+                    this._emitQuery( 'stream', pipeline, duration );
+                }
+
+                yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+            }
+
+            if( !emitted )
+            {
+                this._emitQuery( 'stream', pipeline, Date.now() - start );
+            }
         }
         finally
         {
@@ -1368,129 +949,54 @@ export abstract class AbstractPropertyModel
         }
     }
 
-    public async aggregate<T>(
+    public override async aggregate<T>(
         pipeline: Document[],
         options?: PropertyModelAggregateOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
     ): Promise<T[]>
     {
-        const release = this.trackOperation();
-
-        try
-        {
-        let aggregationPipeline: Document[];
-
-        if( isSet( options ))
-        {
-            aggregationPipeline = [ ...await this.pipeline( options!, 'dbe', 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
-        }
-        else
-        {
-            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'aggregate' });
-
-            if( access.denied ){ return [] }
-
-            aggregationPipeline = [ ...await this.pipeline({}, 'dbe', 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
-        }
-
-        aggregationPipeline = this.#optimizePipeline( aggregationPipeline );
-
-        flowGet( 'log' ) && DUMP( aggregationPipeline );
-
-        const start = Date.now();
-        const res = await this.collection.aggregate( aggregationPipeline, { collation: { locale: 'en' } }).toArray() as T[];
-        const duration = Date.now() - start;
-
-        LOG_FILE( `Collection: ${this.collection.collectionName}.${this.#paths.map( el => el.path ).join( '.' )}` );
-        LOG_FILE( `TIME: ${duration} ms` );
-        LOG_FILE( aggregationPipeline, true );
-        this.#emitQuery( 'aggregate', aggregationPipeline, duration );
-
-        return res;
-        }
-        finally
-        {
-            release();
-        }
+        return super.aggregate<T>( pipeline, options );
     }
 
-    public async count(
+    public override async count(
         options?: PropertyModelAggregateOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
     ): Promise<number>;
-    public async count(
+    public override async count(
         pipeline: Document[],
         options?: PropertyModelAggregateOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
     ): Promise<number>;
-    public async count(
+    public override async count(
         pipelineOrOptions?: Document[] | PropertyModelAggregateOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
         options?: PropertyModelAggregateOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
     ): Promise<number>
     {
-        if( Array.isArray( pipelineOrOptions ) )
-        {
-            const countPipeline = [ ...pipelineOrOptions, { $count: 'count' }];
-
-            return await this.aggregate<{ count: number }>( countPipeline, options ).then( r => r[0]?.count ?? 0 );
-        }
-
-        return await this.aggregate<{ count: number }>([{ $count: 'count' }], pipelineOrOptions ).then( r => r[0]?.count ?? 0 );
+        return super.count( pipelineOrOptions as any, options );
     }
 
-    public async exists(
+    public override async exists(
         idOrFilter?: DTO['id'] | DBE['id'] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
         options?: { access?: string }
     ): Promise<boolean>
     {
-        return this.runOperation( async() =>
-        {
-            const findOptions = normalizeExistsOptions<PropertyModelFilter<RootDBE, DBE>>(
-                idOrFilter,
-                'id',
-                id => this.dbeID( id ),
-                options?.access
-            );
-
-            const access = await this.#access.resolveOrDeny({ operation: 'read', method: 'exists', access: findOptions.access });
-
-            if( access.denied ){ return false }
-
-            let pipeline = await this.pipeline(
-            {
-                filter      : findOptions.filter,
-                smartFilter : findOptions.smartFilter as any,
-                projection  : { id: 1 },
-                limit       : 1,
-                access      : findOptions.access
-            }, 'dbe' as any, 'exists' );
-
-            pipeline = this.#optimizePipeline( pipeline );
-
-            const start = Date.now();
-            const res = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray();
-            const duration = Date.now() - start;
-
-            this.#emitQuery( 'exists', pipeline, duration, { resultCount: res.length });
-
-            return res.length > 0;
-        });
+        return super.exists( idOrFilter, options );
     }
 
-    protected async accessFilter( _name: string ): Promise<AccessFilterResult<PropertyModelFilter<RootDBE, DBE>>> {}
+    protected override async accessFilter( _name: string ): Promise<AccessFilterResult<PropertyModelFilter<RootDBE, DBE>>> {}
 
-    public async resolveSmartFilter( smartFilter: Record<string, any> )
+    public override async resolveSmartFilter( smartFilter: Record<string, any> )
     {
-        return this.#smartFilters.resolve( smartFilter );
+        return this._smartFilters.resolve( smartFilter );
     }
 
-    public async resolveComputedProperties( properties?: ComputedPropertiesParam<any> ): Promise<{ [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> }>
+    public override async resolveComputedProperties( properties?: ComputedPropertiesParam<any> ): Promise<{ [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> }>
     {
-        return this.#computedProperties.resolve( properties ) as Promise<{ [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> }>;
+        return this._computedProperties.resolve( properties ) as Promise<{ [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> }>;
     }
 
     public async delete( id: DTO['id'] | DBE['id'], options?: ModelDeleteOptions ): Promise<boolean>
     {
         return this.runOperation( async() =>
         {
-            const access = await this.#access.resolveOrDeny({ operation: 'delete', method: 'delete', access: options?.access });
+            const access = await this._access.resolveOrDeny({ operation: 'delete', method: 'delete', access: options?.access });
 
             if( access.denied )
             {
@@ -1512,8 +1018,8 @@ export abstract class AbstractPropertyModel
                 resolveBSONObject( updateOptions )
             );
 
-            this.#invalidateCache([ id ]);
-            this.#emitMutation( 'delete', Date.now() - start,
+            this._invalidateCache([ id ]);
+            this._emitMutation( 'delete', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
@@ -1536,7 +1042,7 @@ export abstract class AbstractPropertyModel
             const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options?.access ) : undefined;
             const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
 
-            const access = await this.#access.resolveOrDeny({ operation: 'delete', method: 'deleteMany', access: effectiveAccess });
+            const access = await this._access.resolveOrDeny({ operation: 'delete', method: 'deleteMany', access: effectiveAccess });
 
             if( access.denied )
             {
@@ -1549,10 +1055,10 @@ export abstract class AbstractPropertyModel
             {
                 if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
                 {
-                    this.#invalidateCache( cacheIdsToInvalidate );
+                    this._invalidateCache( cacheIdsToInvalidate );
                 }
 
-                this.#emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: cacheIdsToInvalidate ?? undefined });
+                this._emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: cacheIdsToInvalidate ?? undefined });
 
                 return 0;
             }
@@ -1574,10 +1080,10 @@ export abstract class AbstractPropertyModel
 
             if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
             {
-                this.#invalidateCache( cacheIdsToInvalidate );
+                this._invalidateCache( cacheIdsToInvalidate );
             }
 
-            this.#emitMutation( 'deleteMany', Date.now() - start,
+            this._emitMutation( 'deleteMany', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
@@ -1589,10 +1095,14 @@ export abstract class AbstractPropertyModel
         });
     }
 
-    async #filterStages( list: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>, method: string = 'list' )
+    async #filterStages(
+        list: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
+        method: string = 'list',
+        preResolvedAccess?: { denied: boolean, filter?: Filter<DBE> }
+    )
     {
         const sort = list.sort ?? { id: -1 };
-        const access = await this.#access.resolveOrDeny({ operation: 'read', method, access: list.access });
+        const access = preResolvedAccess ?? await this._access.resolveOrDeny({ operation: 'read', method, access: list.access });
         const accessFilter = access.denied ? { '_root._id': { $exists: false }, id: { $exists: false } } : access.filter;
         const cursorFilter = list.cursor ? generateCursorCondition( list.cursor, sort ) : undefined;
         const stageFilter = optimizeMatch( resolveBSONObject(

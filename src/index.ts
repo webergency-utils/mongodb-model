@@ -5,6 +5,7 @@ export * from './types/definition.js';
 export * from './errors.js';
 export * from './cache.js';
 export * from './helpers/object.js';
+export * from './base-model.js';
 export * from './model.js';
 export * from './property-model.js';
 export * from './models.js';

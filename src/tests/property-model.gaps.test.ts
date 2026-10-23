@@ -283,4 +283,56 @@ describe( 'AbstractPropertyModel gaps', () =>
 
         expect( JSON.stringify( countMatches ) ).not.toContain( 'Grace' );
     });
+
+    test( 'list with count passes conversion to count pipeline and strips $replaceWith (R12)', async() =>
+    {
+        const models = new TestModels();
+        const pipelines: any[][] = [];
+        const aggregate = vi.fn(( pipeline: any[] ) =>
+        {
+            pipelines.push( pipeline );
+
+            return {
+                toArray: async() => [{ id: 'a1', status: 'new', name: 'Ada', count: 1 }]
+            };
+        });
+
+        class ComputedProps
+        {
+            summaryOnly()
+            {
+                return { fields: { extraFlag: true }, pipeline: null };
+            }
+        }
+
+        class SummaryAppModel extends AbstractPropertyModel<JobDBE, ApplicationDBE, ApplicationDTO, any>
+        {
+            constructor()
+            {
+                super( models, { collectionName: 'jobs', aggregate } as any, 'applications[]',
+                {
+                    converters:
+                    {
+                        dto     : { converter: ( dbe: any ) => dbe },
+                        summary : { converter: ( dbe: any ) => dbe, computedProperties: { summaryOnly: true } },
+                        dbe     : { converter: ( dbe: any ) => dbe }
+                    },
+                    computedProperties: new ComputedProps()
+                } as any );
+            }
+        }
+
+        const model = new SummaryAppModel();
+        const pipelineSpy = vi.spyOn( model as any, 'pipeline' );
+
+        await model.list({ count: true }, 'summary' );
+
+        expect( pipelineSpy ).toHaveBeenCalledTimes( 2 );
+        expect( pipelineSpy.mock.calls[0][1] ).toBe( 'summary' );
+        expect( pipelineSpy.mock.calls[1][1] ).toBe( 'summary' );
+
+        const countStages = pipelines[1];
+
+        expect( countStages.some( ( stage: any ) => stage.$replaceWith !== undefined ) ).toBe( false );
+    });
 });
