@@ -18,7 +18,17 @@ from './internal.js';
 
 export type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
 export type { ModelCacheConfig, ModelCacheInstance, ModelCacheOptions } from '../cache.js';
-export type { ObservabilityConfig, ObservabilityLogger, ObservabilityOptions } from '../events.js';
+export type
+{
+    ModelQueryContext,
+    ObservabilityConfig,
+    ObservabilityContextResolver,
+    ObservabilityLogger,
+    ObservabilityOperationCategory,
+    ObservabilityOperationFilter,
+    ObservabilityOptions
+}
+from '../events.js';
 export type CacheOptions = ModelCacheConfig;
 export type OptimizerConfig = boolean | OptimizerOptions;
 
@@ -28,9 +38,37 @@ export type ModelsOptions = MongoClientOptions &
     observability?  : ObservabilityConfig
 };
 
-export type ModelCreateOptions = { duplicateIgnore?: boolean, access?: string };
-export type ModelUpdateOptions = { documentBefore?: boolean, documentAfter?: boolean, access?: string };
-export type ModelDeleteOptions = { access?: string };
+export type ModelCreateOptions =
+{
+    duplicateIgnore?    : boolean
+    access?             : string
+    context?            : Record<string, unknown>
+    traceID?            : string
+};
+
+export type ModelUpdateOptions =
+{
+    documentBefore? : boolean
+    documentAfter?  : boolean
+    access?         : string
+    context?        : Record<string, unknown>
+    traceID?        : string
+};
+
+export type ModelDeleteOptions =
+{
+    access?     : string
+    context?    : Record<string, unknown>
+    traceID?    : string
+};
+
+export type ModelExistsOptions =
+{
+    access?     : string
+    context?    : Record<string, unknown>
+    traceID?    : string
+};
+
 export type MongoRootDocument = Document & { _id: any };
 export type MongoPropertyDocument = Document & { id: any };
 
@@ -47,15 +85,19 @@ export type WithTotal<T> = T extends Array<infer U>
 
 export type GetOptions<K extends string | number | symbol = 'dto'> =
 {
-    as?     : K
-    access? : string
+    as?         : K
+    access?     : string
+    context?    : Record<string, unknown>
+    traceID?    : string
 }
 
 export type GetManyOptions<K extends string | number | symbol = 'dto'> =
 {
-    as?     : K
-    filter? : boolean
-    access? : string
+    as?         : K
+    filter?     : boolean
+    access?     : string
+    context?    : Record<string, unknown>
+    traceID?    : string
 }
 
 export type ModelSmartFilter<T> = { [K in PublicMethodNames<T>]?: FirstParameter<T[K]> }
@@ -73,6 +115,8 @@ export type ModelListOptions<DBE extends Document, Filters = never, Properties =
     sample?             : number
     countLimit?         : number
     access?             : string
+    context?            : Record<string, unknown>
+    traceID?            : string
 };
 
 export type ModelStreamOptions<DBE extends Document, Filters = never, Properties = never> =
@@ -97,6 +141,8 @@ export type PropertyModelListOptions
     sample?             : number
     countLimit?         : number
     access?             : string
+    context?            : Record<string, unknown>
+    traceID?            : string
 };
 
 export type PropertyModelStreamOptions
@@ -113,6 +159,8 @@ export type ModelFindOptions<DBE extends Document, Filters = never> =
     filter?      : Filter<DBE>
     smartFilter? : ModelSmartFilter<Filters>
     access?      : string
+    context?     : Record<string, unknown>
+    traceID?     : string
 }
 
 export type PropertyModelFindOptions
@@ -126,6 +174,8 @@ export type PropertyModelFindOptions
     filter?      : PropertyModelFilter<RootDBE, DBE>
     smartFilter? : ModelSmartFilter<SecondType<Filters>>
     access?      : string
+    context?     : Record<string, unknown>
+    traceID?     : string
 }
 
 export type ModelAggregateOptions
@@ -145,6 +195,8 @@ export type ModelAggregateOptions
     skip?               : number
     pipeline?           : Document[]
     access?             : string
+    context?            : Record<string, unknown>
+    traceID?            : string
 };
 
 export type PropertyModelAggregateOptions
@@ -165,6 +217,8 @@ export type PropertyModelAggregateOptions
     skip?               : number
     pipeline?           : Document[]
     access?             : string
+    context?            : Record<string, unknown>
+    traceID?            : string
 };
 
 export type FirstType<T> = T extends [ infer U, ...unknown[] ] ? U : undefined;

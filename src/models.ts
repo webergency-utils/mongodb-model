@@ -6,7 +6,6 @@ import
     ModelEventHandler,
     ModelEventName,
     ModelEventsMap,
-    ObservabilityConfig,
     ObservabilityOptions,
     resolveObservabilityOptions
 }
@@ -19,6 +18,7 @@ import
     GET_OBSERVABILITY_OPTIONS,
     GET_OPTIMIZER_OPTIONS,
     GET_PARENT,
+    HAS_OBSERVABILITY_LISTENERS,
     INVALIDATE_COLLECTION_CACHE,
     REGISTER_MODEL
 }
@@ -66,7 +66,7 @@ export class AbstractModels
     #models = new Map<string, ModelInstance>();
     #collectionModels = new Map<string, Set<ModelInstance>>();
     #optimizer: OptimizerConfig = true;
-    #observability?: ObservabilityConfig;
+    #resolvedObservability?: ObservabilityOptions;
     #events = new ModelEventEmitter();
 
     public readonly scope = Object.freeze(
@@ -84,7 +84,7 @@ export class AbstractModels
 
         this.#connectionString = connectionString;
         this.#optimizer = optimizer;
-        this.#observability = observability;
+        this.#resolvedObservability = resolveObservabilityOptions( observability );
 
         if( Clients.has( connectionString ) )
         {
@@ -260,7 +260,12 @@ export class AbstractModels
 
     [GET_OBSERVABILITY_OPTIONS](): ObservabilityOptions | undefined
     {
-        return resolveObservabilityOptions( this.#observability );
+        return this.#resolvedObservability;
+    }
+
+    [HAS_OBSERVABILITY_LISTENERS]( event?: ModelEventName ): boolean
+    {
+        return this.#events.hasListeners( event );
     }
 
     [EMIT_OBSERVABILITY_EVENT]<E extends ModelEventName>( event: E, payload: ModelEventsMap[E] ): void

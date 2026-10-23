@@ -35,6 +35,8 @@ export function attachCursorToItem<T>( dto: T, dbe: Document, sort: Document ): 
     return dto as T & { $cursor?: string };
 }
 
+const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'access', 'context', 'traceID' ]);
+
 export function isCreateOptionsObject( v: unknown ): v is ModelCreateOptions
 {
     return typeof v === 'object'
@@ -42,7 +44,7 @@ export function isCreateOptionsObject( v: unknown ): v is ModelCreateOptions
         && !Array.isArray( v )
         && !isLibraryObjectId( v )
         && !isForeignObjectIdLike( v )
-        && ( 'duplicateIgnore' in v || 'access' in v );
+        && ( 'duplicateIgnore' in v || 'access' in v || 'context' in v || 'traceID' in v );
 }
 
 export function resolveCreateFromArgs<ID>(
@@ -85,7 +87,7 @@ export function resolveCreateFromArgs<ID>(
     };
 }
 
-export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, access?: string }
+export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, access?: string, context?: Record<string, unknown>, traceID?: string }
 {
     return Boolean(
         match
@@ -96,28 +98,39 @@ export function isFindOptionsObject( match: unknown ): match is { filter?: unkno
         && (
             'filter' in match
             || 'smartFilter' in match
-            || ( 'access' in match && Object.keys( match ).every( k => k === 'filter' || k === 'smartFilter' || k === 'access' ))
+            || (( 'access' in match || 'context' in match || 'traceID' in match ) && Object.keys( match ).every( k => FIND_OPTION_KEYS.has( k ) ))
         )
     );
 }
 
 export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilterType = any>(
-    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, access?: string },
-    optionsAccess?: string
-): { filter: FilterType, smartFilter?: SmartFilterType, access?: string }
+    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, access?: string, context?: Record<string, unknown>, traceID?: string },
+    optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string }
+): { filter: FilterType, smartFilter?: SmartFilterType, access?: string, context?: Record<string, unknown>, traceID?: string }
 {
+    const opts = typeof optionsOrAccess === 'string' ? { access: optionsOrAccess } : optionsOrAccess;
+
     if( isFindOptionsObject( match ) )
     {
+        const context = opts?.context && match.context
+            ? { ...match.context, ...opts.context }
+            : ( opts?.context ?? match.context );
+        const traceID = opts?.traceID ?? match.traceID;
+
         return {
             filter      : ( match.filter ?? {} ) as FilterType,
             smartFilter : match.smartFilter as SmartFilterType | undefined,
-            access      : optionsAccess ?? match.access
+            access      : opts?.access ?? match.access,
+            ...( context !== undefined ? { context } : {} ),
+            ...( traceID !== undefined ? { traceID } : {} )
         };
     }
 
     return {
         filter : ( match ?? {} ) as FilterType,
-        access : optionsAccess
+        access : opts?.access,
+        ...( opts?.context !== undefined ? { context: opts.context } : {} ),
+        ...( opts?.traceID !== undefined ? { traceID: opts.traceID } : {} )
     };
 }
 
@@ -125,12 +138,19 @@ export function normalizeExistsOptions<FilterType = Record<string, any>, SmartFi
     idOrFilter: unknown,
     idKey: '_id' | 'id',
     dbeID: ( id: any ) => any,
-    optionsAccess?: string
-): { filter: FilterType, smartFilter?: SmartFilterType, access?: string }
+    optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string }
+): { filter: FilterType, smartFilter?: SmartFilterType, access?: string, context?: Record<string, unknown>, traceID?: string }
 {
+    const opts = typeof optionsOrAccess === 'string' ? { access: optionsOrAccess } : optionsOrAccess;
+
     if( idOrFilter === undefined || idOrFilter === null )
     {
-        return { filter: {} as FilterType, access: optionsAccess };
+        return {
+            filter : {} as FilterType,
+            access : opts?.access,
+            ...( opts?.context !== undefined ? { context: opts.context } : {} ),
+            ...( opts?.traceID !== undefined ? { traceID: opts.traceID } : {} )
+        };
     }
 
     if(
@@ -142,11 +162,13 @@ export function normalizeExistsOptions<FilterType = Record<string, any>, SmartFi
     {
         return {
             filter : { [idKey]: dbeID( idOrFilter ) } as unknown as FilterType,
-            access : optionsAccess
+            access : opts?.access,
+            ...( opts?.context !== undefined ? { context: opts.context } : {} ),
+            ...( opts?.traceID !== undefined ? { traceID: opts.traceID } : {} )
         };
     }
 
-    return normalizeFindMatch<FilterType, SmartFilterType>( idOrFilter as any, optionsAccess );
+    return normalizeFindMatch<FilterType, SmartFilterType>( idOrFilter as any, optionsOrAccess );
 }
 
 export function normalizeGetOptions<K extends string | number | symbol = 'dto'>( optionsOrConversion?: GetOptions<K> | K ): GetOptions<K>
