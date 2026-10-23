@@ -31,7 +31,8 @@ function buildPropertyExtensions<DBE extends MongoPropertyDocument>(
         softDelete          : config.softDelete,
         versioning          : config.versioning,
         relations           : config.relations,
-        hooks               : config.hooks
+        hooks               : config.hooks,
+        id                  : config.id
     };
 }
 
@@ -68,6 +69,7 @@ export function PropertyModel
 {
     const { path, ...rest } = config;
     const dtoIDOverride = rest.dtoID;
+    const dbeIDOverride = rest.dbeID;
 
     return class PropertyModelBase extends AbstractPropertyModel<RootDBE, DBE, DTO, InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
     {
@@ -78,6 +80,9 @@ export function PropertyModel
 
             super( models, collection, path, extensions );
             bindInstanceDtoID( dtoIDRef, this, dtoIDOverride );
+
+            if( dtoIDOverride ){ this.dtoID = dtoIDOverride as any }
+            if( dbeIDOverride ){ this.dbeID = dbeIDOverride as any }
         }
     };
 }

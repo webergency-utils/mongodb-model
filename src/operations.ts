@@ -1,7 +1,8 @@
+import { randomBytes, randomUUID } from 'node:crypto';
 import { ClientSession, Document, Filter, ObjectId, UpdateFilter, UpdateOptions } from 'mongodb';
 import { getCursor, isForeignObjectIdLike, isLibraryObjectId, isUpdateOperator, propertyModelTargetUpdateParams } from './helpers/mongo.js';
 import { ConverterManager } from './converters.js';
-import { ModelValidationError } from './errors.js';
+import { ModelError, ModelValidationError } from './errors.js';
 import
 {
     GetManyOptions,
@@ -11,6 +12,13 @@ import
     ModelChangeStream,
     ModelCreateOptions,
     ModelExplainResult,
+    ModelIdCollisionRiskLevel,
+    ModelIdCollisionRiskOptions,
+    ModelIdCollisionRiskResult,
+    ModelIdConfig,
+    ModelIdGeneratorContext,
+    ModelIdGeneratorOptions,
+    ModelIdStrategy,
     ModelIndexDefinition,
     ModelIndexSpecification,
     ModelSoftDeleteConfig,
@@ -1093,5 +1101,377 @@ export function normalizeModelIndexes(
         };
     });
 }
+
+export const DEFAULT_ID_MAX_RETRIES = 5;
+
+const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+const NANOID_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz-';
+const CROCKFORD_BASE32_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+export type ResolvedIdConfig<IdType = any> =
+{
+    strategy?           : ModelIdStrategy
+    generator           : ( context?: ModelIdGeneratorContext ) => IdType | Promise<IdType>
+    maxRetries          : number
+    verifyUniqueness    : boolean
+    risk                : ModelIdCollisionRiskResult
+};
+
+function generateCryptoObjectIdHex(): string
+{
+    const buf = Buffer.allocUnsafe( 12 );
+
+    buf.writeUInt32BE( Math.floor( Date.now() / 1000 ) >>> 0, 0 );
+    randomBytes( 8 ).copy( buf, 4 );
+
+    return buf.toString( 'hex' );
+}
+
+function generateUlidString( now: number = Date.now() ): string
+{
+    let time = Math.max( 0, Math.floor( now ));
+    const chars = new Array<string>( 26 );
+
+    for( let i = 9; i >= 0; i-- )
+    {
+        const mod = time % 32;
+
+        chars[i] = CROCKFORD_BASE32_ALPHABET[mod];
+        time = ( time - mod ) / 32;
+    }
+
+    const rand = randomBytes( 10 );
+    let hi = ( rand[0] * 0x100000000 ) + (( rand[1] << 24 ) >>> 0 ) + ( rand[2] << 16 ) + ( rand[3] << 8 ) + rand[4];
+    let lo = ( rand[5] * 0x100000000 ) + (( rand[6] << 24 ) >>> 0 ) + ( rand[7] << 16 ) + ( rand[8] << 8 ) + rand[9];
+
+    for( let i = 7; i >= 0; i-- )
+    {
+        const modHi = hi % 32;
+
+        chars[10 + i] = CROCKFORD_BASE32_ALPHABET[modHi];
+        hi = ( hi - modHi ) / 32;
+
+        const modLo = lo % 32;
+
+        chars[18 + i] = CROCKFORD_BASE32_ALPHABET[modLo];
+        lo = ( lo - modLo ) / 32;
+    }
+
+    return chars.join( '' );
+}
+
+function generateCustomAlphabetString( alphabet: string, length: number ): string
+{
+    const safeLen = Math.max( 1, Math.floor( length ));
+    const alphaLen = alphabet.length;
+
+    if( alphaLen < 2 || alphaLen > 256 )
+    {
+        throw new RangeError( 'ID alphabet must contain between 2 and 256 characters' );
+    }
+
+    const mask = ( 2 << Math.floor( Math.log2( alphaLen - 1 ))) - 1;
+    const step = Math.max( safeLen, Math.ceil(( 1.6 * mask * safeLen ) / alphaLen ));
+    const out: string[] = [];
+
+    while( out.length < safeLen )
+    {
+        const bytes = randomBytes( step );
+
+        for( let i = 0; i < bytes.length && out.length < safeLen; i++ )
+        {
+            const idx = bytes[i] & mask;
+
+            if( idx < alphaLen )
+            {
+                out.push( alphabet[idx] );
+            }
+        }
+    }
+
+    return out.join( '' );
+}
+
+export function generateRandomId( options?: ModelIdStrategy | ModelIdGeneratorOptions<string> ): string
+{
+    const opts: ModelIdGeneratorOptions<string> = typeof options === 'string'
+        ? { strategy: options }
+        : ( options ?? {} );
+    const prefix = opts.prefix ?? '';
+
+    if( opts.alphabet )
+    {
+        const defaultLen = opts.strategy === 'base62' ? 22 : ( opts.strategy === 'nanoid' ? 21 : 21 );
+
+        return `${prefix}${generateCustomAlphabetString( opts.alphabet, opts.length ?? defaultLen )}`;
+    }
+
+    const strategy: ModelIdStrategy = opts.strategy ?? ( opts.length !== undefined ? 'cryptoHex' : 'objectId' );
+
+    switch( strategy )
+    {
+        case 'objectId':
+        {
+            if( opts.length !== undefined && opts.length !== 24 )
+            {
+                const byteCount = Math.ceil( Math.max( 1, opts.length ) / 2 );
+
+                return `${prefix}${randomBytes( byteCount ).toString( 'hex' ).slice( 0, Math.max( 1, opts.length ))}`;
+            }
+
+            return `${prefix}${generateCryptoObjectIdHex()}`;
+        }
+
+        case 'cryptoHex':
+        {
+            const len = Math.max( 1, Math.floor( opts.length ?? 24 ));
+            const byteCount = Math.ceil( len / 2 );
+
+            return `${prefix}${randomBytes( byteCount ).toString( 'hex' ).slice( 0, len )}`;
+        }
+
+        case 'uuid':
+            return `${prefix}${randomUUID()}`;
+
+        case 'ulid':
+            return `${prefix}${generateUlidString()}`;
+
+        case 'nanoid':
+            return `${prefix}${generateCustomAlphabetString( NANOID_ALPHABET, opts.length ?? 21 )}`;
+
+        case 'base62':
+            return `${prefix}${generateCustomAlphabetString( BASE62_ALPHABET, opts.length ?? 22 )}`;
+    }
+}
+
+export function estimateIdCollisionRisk( options?: ModelIdStrategy | ModelIdCollisionRiskOptions ): ModelIdCollisionRiskResult
+{
+    const opts: ModelIdCollisionRiskOptions = typeof options === 'string'
+        ? { strategy: options }
+        : ( options ?? {} );
+    const expectedCount = Math.max( 0, Math.floor( opts.expectedCount ?? 1_000_000 ));
+    const strategy: ModelIdStrategy | undefined = opts.strategy ?? ( opts.alphabet || opts.alphabetSize || opts.entropyBits !== undefined ? undefined : 'objectId' );
+    let alphabetSize: number;
+    let length: number;
+    let entropyBits: number;
+
+    if( opts.entropyBits !== undefined )
+    {
+        entropyBits = Math.max( 1, opts.entropyBits );
+        alphabetSize = opts.alphabetSize ?? ( opts.alphabet ? new Set( opts.alphabet ).size : 16 );
+        length = opts.length ?? Math.ceil( entropyBits / Math.log2( Math.max( 2, alphabetSize )));
+    }
+    else if( opts.alphabet || opts.alphabetSize !== undefined )
+    {
+        alphabetSize = Math.max( 2, opts.alphabetSize ?? new Set( opts.alphabet ).size );
+        length = Math.max( 1, Math.floor( opts.length ?? 21 ));
+        entropyBits = length * Math.log2( alphabetSize );
+    }
+    else
+    {
+        switch( strategy ?? 'objectId' )
+        {
+            case 'uuid':
+                alphabetSize = 16;
+                length = 32;
+                entropyBits = 122;
+                break;
+
+            case 'ulid':
+                alphabetSize = 32;
+                length = 26;
+                entropyBits = 80;
+                break;
+
+            case 'nanoid':
+                alphabetSize = 64;
+                length = Math.max( 1, Math.floor( opts.length ?? 21 ));
+                entropyBits = length * 6;
+                break;
+
+            case 'base62':
+                alphabetSize = 62;
+                length = Math.max( 1, Math.floor( opts.length ?? 22 ));
+                entropyBits = length * Math.log2( 62 );
+                break;
+
+            case 'cryptoHex':
+                alphabetSize = 16;
+                length = Math.max( 1, Math.floor( opts.length ?? 24 ));
+                entropyBits = length * 4;
+                break;
+
+            case 'objectId':
+            default:
+                alphabetSize = 16;
+                length = Math.max( 1, Math.floor( opts.length ?? 24 ));
+                entropyBits = opts.length !== undefined && opts.length !== 24 ? length * 4 : 64;
+                break;
+        }
+    }
+
+    const spaceSize = Math.pow( 2, entropyBits );
+    const pairs = expectedCount > 1 ? ( expectedCount * ( expectedCount - 1 )) / 2 : 0;
+    const collisionProbability = pairs > 0
+        ? Math.min( 1, Math.max( 0, -Math.expm1( -pairs / spaceSize )))
+        : 0;
+    const maxCountForProbability = ( targetProb: number ): number =>
+    {
+        const target = -Math.log1p( -targetProb );
+
+        return Math.max( 1, Math.floor( Math.sqrt( 2 * spaceSize * target )));
+    };
+
+    let riskLevel: ModelIdCollisionRiskLevel;
+
+    if( collisionProbability < 1e-9 )
+    {
+        riskLevel = 'negligible';
+    }
+    else if( collisionProbability < 1e-6 )
+    {
+        riskLevel = 'low';
+    }
+    else if( collisionProbability < 1e-3 )
+    {
+        riskLevel = 'moderate';
+    }
+    else if( collisionProbability < 1e-1 )
+    {
+        riskLevel = 'high';
+    }
+    else
+    {
+        riskLevel = 'critical';
+    }
+
+    return {
+        strategy,
+        alphabetSize,
+        length,
+        entropyBits             : Number( entropyBits.toFixed( 2 )),
+        expectedCount,
+        collisionProbability,
+        maxCountForOneInBillion : maxCountForProbability( 1e-9 ),
+        maxCountForOneInMillion : maxCountForProbability( 1e-6 ),
+        maxCountForOneInThousand: maxCountForProbability( 1e-3 ),
+        riskLevel
+    };
+}
+
+export function resolveIdConfig<IdType = any>( config?: ModelIdConfig<IdType>, model?: object ): ResolvedIdConfig<IdType>
+{
+    if( !config )
+    {
+        return {
+            strategy            : 'objectId',
+            generator           : () => generateRandomId( 'objectId' ) as unknown as IdType,
+            maxRetries          : DEFAULT_ID_MAX_RETRIES,
+            verifyUniqueness    : false,
+            risk                : estimateIdCollisionRisk( 'objectId' )
+        };
+    }
+
+    if( typeof config === 'function' )
+    {
+        return {
+            generator           : ( ctx ) => config( ctx ),
+            maxRetries          : DEFAULT_ID_MAX_RETRIES,
+            verifyUniqueness    : false,
+            risk                : estimateIdCollisionRisk( 'objectId' )
+        };
+    }
+
+    if( typeof config === 'string' )
+    {
+        return {
+            strategy            : config,
+            generator           : () => generateRandomId( config ) as unknown as IdType,
+            maxRetries          : DEFAULT_ID_MAX_RETRIES,
+            verifyUniqueness    : false,
+            risk                : estimateIdCollisionRisk( config )
+        };
+    }
+
+    const risk = estimateIdCollisionRisk(
+    {
+        strategy        : config.strategy ?? ( config.alphabet ? undefined : ( config.length !== undefined ? 'cryptoHex' : 'objectId' )),
+        length          : config.length,
+        alphabet        : config.alphabet,
+        expectedCount   : config.expectedCount
+    });
+
+    if( config.minEntropyBits !== undefined && risk.entropyBits < config.minEntropyBits )
+    {
+        throw new ModelError(
+            'MODEL_ID_CONFIG',
+            model ?? {},
+            `Configured ID generator provides ${risk.entropyBits} bits of entropy, below required minEntropyBits (${config.minEntropyBits})`
+        );
+    }
+
+    if( config.maxCollisionRisk !== undefined && risk.collisionProbability > config.maxCollisionRisk )
+    {
+        throw new ModelError(
+            'MODEL_ID_CONFIG',
+            model ?? {},
+            `Configured ID generator has collision probability ${risk.collisionProbability} at expectedCount=${risk.expectedCount}, exceeding maxCollisionRisk (${config.maxCollisionRisk})`
+        );
+    }
+
+    const maxRetries = config.maxRetries !== undefined ? Math.max( 0, Math.floor( config.maxRetries )) : DEFAULT_ID_MAX_RETRIES;
+    const verifyUniqueness = Boolean( config.verifyUniqueness );
+    const generator = config.generator
+        ? ( ctx?: ModelIdGeneratorContext ) => config.generator!( ctx )
+        : () => generateRandomId( config as ModelIdGeneratorOptions<string> ) as unknown as IdType;
+
+    return {
+        strategy : config.strategy ?? risk.strategy,
+        generator,
+        maxRetries,
+        verifyUniqueness,
+        risk
+    };
+}
+
+export function createIdGenerator<IdType = string>(
+    config?: ModelIdConfig<IdType>,
+    model?: object
+): ( context?: ModelIdGeneratorContext ) => IdType | Promise<IdType>
+{
+    const resolved = resolveIdConfig( config, model );
+
+    return ( context?: ModelIdGeneratorContext ) => resolved.generator( context );
+}
+
+export function isIdDuplicateKeyError( err: any, idField: '_id' | 'id' = '_id' ): boolean
+{
+    if( !err || ( err.code !== 11000 && err.code !== 11001 ) )
+    {
+        return false;
+    }
+
+    const keyPattern = err.keyPattern && typeof err.keyPattern === 'object' ? err.keyPattern : undefined;
+
+    if( keyPattern && Object.keys( keyPattern ).length > 0 )
+    {
+        return idField in keyPattern || Object.keys( keyPattern ).some( k => k.endsWith( `.${idField}` ));
+    }
+
+    const keyValue = err.keyValue && typeof err.keyValue === 'object' ? err.keyValue : undefined;
+
+    if( keyValue && Object.keys( keyValue ).length > 0 )
+    {
+        return idField in keyValue || Object.keys( keyValue ).some( k => k.endsWith( `.${idField}` ));
+    }
+
+    if( typeof err.message === 'string' && err.message.includes( 'index:' ) )
+    {
+        return err.message.includes( '_id_' ) || err.message.includes( `${idField}_` ) || err.message.includes( `.${idField}_` );
+    }
+
+    return true;
+}
+
 
 

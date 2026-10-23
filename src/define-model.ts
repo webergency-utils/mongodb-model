@@ -25,7 +25,8 @@ function buildExtensions<DBE extends MongoRootDocument>(
         softDelete          : config.softDelete,
         versioning          : config.versioning,
         relations           : config.relations,
-        hooks               : config.hooks
+        hooks               : config.hooks,
+        id                  : config.id
     };
 }
 
@@ -59,6 +60,7 @@ export function Model
 ): new ( models: AbstractModels, collection: Collection<DBE> ) => AbstractModel<DBE, DTO, InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
 {
     const dtoIDOverride = config.dtoID;
+    const dbeIDOverride = config.dbeID;
 
     return class ModelBase extends AbstractModel<DBE, DTO, InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
     {
@@ -69,6 +71,9 @@ export function Model
 
             super( models, collection, extensions );
             bindInstanceDtoID( dtoIDRef, this, dtoIDOverride );
+
+            if( dtoIDOverride ){ this.dtoID = dtoIDOverride as any }
+            if( dbeIDOverride ){ this.dbeID = dbeIDOverride as any }
         }
     };
 }

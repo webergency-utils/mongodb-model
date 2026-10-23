@@ -99,3 +99,24 @@ export class ModelVersionConflictError extends ModelError
         Error.captureStackTrace( this, this.constructor );
     }
 }
+
+export class ModelIdCollisionError extends ModelError
+{
+    public readonly id?: unknown;
+    public readonly attempts: number;
+
+    constructor( model: object, id: unknown, attempts: number, message?: string, cause?: Error )
+    {
+        super(
+            'MODEL_ID_COLLISION',
+            model,
+            message ?? `ID collision after ${attempts} attempt${attempts === 1 ? '' : 's'}${id !== undefined ? ` (last candidate: ${String( id )})` : ''}`,
+            cause
+        );
+
+        this.id = id;
+        this.attempts = attempts;
+
+        Error.captureStackTrace( this, cause ? cause.constructor : this.constructor );
+    }
+}

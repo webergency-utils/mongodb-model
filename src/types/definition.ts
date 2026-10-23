@@ -9,6 +9,7 @@ import
     ModelCacheConfig,
     ModelExtensions,
     ModelHooksConfig,
+    ModelIdConfig,
     ModelIndexDefinition,
     ModelRelationsConfig,
     ModelSoftDeleteConfig,
@@ -115,7 +116,9 @@ export type RootModelDefinition
     versioning?          : ModelVersioningConfig
     relations?           : ModelRelationsConfig<DBE>
     hooks?               : ModelHooksConfig<DBE>
+    id?                  : ModelIdConfig
     dtoID?               : ( id: unknown ) => string
+    dbeID?               : ( id: any ) => any
 }
 
 export type PropertyModelDefinition
@@ -142,7 +145,9 @@ export type PropertyModelDefinition
     versioning?          : ModelVersioningConfig
     relations?           : ModelRelationsConfig<DBE>
     hooks?               : ModelHooksConfig<DBE>
+    id?                  : ModelIdConfig
     dtoID?               : ( id: unknown ) => string
+    dbeID?               : ( id: any ) => any
 }
 
 export type InferCustomConverterReturn<T> =

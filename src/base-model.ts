@@ -4,8 +4,7 @@ import
     Collection,
     Document,
     Filter,
-    FindOptions,
-    ObjectId
+    FindOptions
 }
 from 'mongodb';
 import Aggregator from '@webergency-utils/aggregator';
@@ -13,7 +12,7 @@ import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
 import { AccessControl } from './access-control.js';
 import { ModelCache, ModelCacheConfig, ModelCacheStats, buildCacheKey } from './cache.js';
 import { ConverterManager } from './converters.js';
-import { ModelConverterError, ModelError } from './errors.js';
+import { ModelConverterError, ModelError, ModelIdCollisionError } from './errors.js';
 import
 {
     ModelCacheEvent,
@@ -51,6 +50,7 @@ from './helpers/index.js';
 import { AbstractModels } from './models.js';
 import
 {
+    ResolvedIdConfig,
     ResolvedSoftDeleteConfig,
     ResolvedTimestampsConfig,
     ResolvedVersioningConfig,
@@ -64,6 +64,7 @@ import
     combineMongoFilters,
     convertDocuments,
     createChangeStreamController,
+    estimateIdCollisionRisk,
     executeModelValidator,
     extractExplainSummary,
     normalizeCursorOption,
@@ -73,6 +74,7 @@ import
     normalizeGetOptions,
     normalizeModelIndexes,
     normalizePopulateSpecs,
+    resolveIdConfig,
     resolveSoftDeleteConfig,
     resolveTimestampsConfig,
     resolveVersioningConfig
@@ -111,6 +113,10 @@ import
     ModelExplainVerbosity,
     ModelHookContext,
     ModelHooksConfig,
+    ModelIdCollisionRiskOptions,
+    ModelIdCollisionRiskResult,
+    ModelIdConfig,
+    ModelIdGeneratorContext,
     ModelIndexDefinition,
     ModelRelationsConfig,
     ModelSoftDeleteConfig,
@@ -157,6 +163,7 @@ export type BaseModelParams<DBE extends Document> =
     versioning?             : ModelVersioningConfig
     relations?              : ModelRelationsConfig<DBE>
     hooks?                  : ModelHooksConfig<DBE>
+    id?                     : ModelIdConfig
     idField                 : '_id' | 'id'
     prefix?                 : string
     smartFilterOptions?     : SmartFilterResolverOptions
@@ -202,6 +209,7 @@ export abstract class AbstractBaseModel
     protected _versioning?: ResolvedVersioningConfig;
     protected _relations?: ModelRelationsConfig<DBE>;
     protected _hooks?: ModelHooksConfig<DBE>;
+    protected _idConfig: ResolvedIdConfig<DTO['id']>;
     protected _idField: '_id' | 'id';
     protected _prefix?: string;
 
@@ -231,6 +239,7 @@ export abstract class AbstractBaseModel
         this._versioning = resolveVersioningConfig( params.versioning );
         this._relations = params.relations;
         this._hooks = params.hooks;
+        this._idConfig = resolveIdConfig( params.id, this );
         this._pipelineBuilder = new PipelineBuilder<CollectionDoc>();
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this._converters = new ConverterManager( this, this.converters, ( err, op ) => this._emitError( err, op ));
@@ -1444,9 +1453,107 @@ export abstract class AbstractBaseModel
         }
     }
 
-    protected id(): DTO['id'] | Promise<DTO['id']>
+    protected id( context?: ModelIdGeneratorContext ): DTO['id'] | Promise<DTO['id']>
     {
-        return new ObjectId().toString() as DTO['id'];
+        return this._idConfig.generator({ attempt: context?.attempt ?? 0, model: this });
+    }
+
+    protected _resolveIdRetryOptions( options?: { maxRetries?: number, verifyUniqueness?: boolean } ): { maxRetries: number, verifyUniqueness: boolean }
+    {
+        return {
+            maxRetries          : options?.maxRetries !== undefined ? Math.max( 0, Math.floor( options.maxRetries )) : this._idConfig.maxRetries,
+            verifyUniqueness    : options?.verifyUniqueness ?? this._idConfig.verifyUniqueness
+        };
+    }
+
+    protected async _tryGenerateUniqueId(
+        usedIds: Set<string> | undefined,
+        maxRetries: number,
+        verifyUniqueness: boolean,
+        session?: ClientSession
+    ): Promise<{ id: DTO['id'], collided: boolean }>
+    {
+        let lastCandidate: DTO['id'] | undefined;
+
+        for( let attempt = 0; attempt <= maxRetries; attempt++ )
+        {
+            const rawCandidate = await this.id({ attempt, model: this });
+            const candidate = this.dtoID( rawCandidate ) as DTO['id'];
+            const key = String( candidate );
+
+            lastCandidate = candidate;
+
+            if( usedIds?.has( key ) )
+            {
+                continue;
+            }
+
+            if( verifyUniqueness )
+            {
+                const alreadyExists = await this.exists( candidate as any, { includeDeleted: true, session });
+
+                if( alreadyExists )
+                {
+                    usedIds?.add( key );
+
+                    continue;
+                }
+            }
+
+            usedIds?.add( key );
+
+            return { id: candidate, collided: false };
+        }
+
+        return { id: lastCandidate as DTO['id'], collided: true };
+    }
+
+    protected async _generateUniqueId(
+        usedIds: Set<string> | undefined,
+        maxRetries: number,
+        verifyUniqueness: boolean,
+        session?: ClientSession
+    ): Promise<DTO['id']>
+    {
+        const { id, collided } = await this._tryGenerateUniqueId( usedIds, maxRetries, verifyUniqueness, session );
+
+        if( collided )
+        {
+            throw new ModelIdCollisionError( this, id, maxRetries + 1 );
+        }
+
+        return id;
+    }
+
+    public async generateId( options?: { verifyUniqueness?: boolean, maxRetries?: number, session?: ClientSession } ): Promise<DTO['id']>
+    {
+        const { maxRetries, verifyUniqueness } = this._resolveIdRetryOptions( options );
+
+        return this._generateUniqueId( new Set<string>(), maxRetries, verifyUniqueness, options?.session );
+    }
+
+    public idCollisionRisk( options?: ModelIdCollisionRiskOptions | number ): ModelIdCollisionRiskResult
+    {
+        if( options === undefined )
+        {
+            return this._idConfig.risk;
+        }
+
+        const opts: ModelIdCollisionRiskOptions = typeof options === 'number'
+            ? { expectedCount: options }
+            : options;
+
+        const hasCustomShape = Boolean( opts.strategy || opts.length !== undefined || opts.alphabet || opts.alphabetSize !== undefined || opts.entropyBits !== undefined );
+
+        return estimateIdCollisionRisk(
+        {
+            strategy        : opts.strategy ?? ( hasCustomShape ? undefined : this._idConfig.strategy ),
+            length          : opts.length ?? ( hasCustomShape ? undefined : this._idConfig.risk.length ),
+            alphabet        : opts.alphabet,
+            alphabetSize    : opts.alphabetSize ?? ( hasCustomShape ? undefined : this._idConfig.risk.alphabetSize ),
+            entropyBits     : opts.entropyBits ?? ( hasCustomShape ? undefined : this._idConfig.risk.entropyBits ),
+            expectedCount   : opts.expectedCount ?? this._idConfig.risk.expectedCount
+        });
     }
 
     public dbeID( id: any ): any

@@ -213,14 +213,19 @@ Configure `observability` on `AbstractModels`, `AbstractModel`, or `AbstractProp
 - **Async / Distributed L2 Cache Adapter (`ModelExternalCacheStore`, `invalidateCache`, `primeCache`):**
   - Pass `store: ModelExternalCacheStore` (`get`, `getMany`, `set`, `setMany`, `delete`, `clear`) in `cache` options for a two-tier L1 (in-memory) + L2 (Redis / Valkey / custom) cache with automatic L1 backfill on L2 hits.
   - `model.invalidateCache(idOrIds?)` and `model.primeCache(id, value, options?)` provide public cache invalidation and warming hooks.
+- **Safe Cryptographic ID Generation & Collision Protection (`id`, `generateRandomId`, `estimateIdCollisionRisk`, `ModelIdCollisionError`):**
+  - Default `id()` uses Node's `node:crypto` (`randomBytes`) to generate a 24-hex ObjectId-compatible string (4-byte Unix epoch timestamp + 8-byte per-call CSPRNG entropy), eliminating static process-random/counter collisions across serverless workers.
+  - Configure `id` in `defineModel` / `definePropertyModel` (or constructor extensions) using built-in strategies (`'objectId' | 'cryptoHex' | 'uuid' | 'ulid' | 'nanoid' | 'base62'`), custom `{ strategy, length, alphabet, prefix, maxRetries, verifyUniqueness, expectedCount, minEntropyBits, maxCollisionRisk }`, or a custom generator function `(ctx) => ...`.
+  - Automatic collision retry: `create`, `createMany`, and `bulkWrite` guarantee intra-batch uniqueness, check existing parent subdocuments on `PropertyModel`, and automatically regenerate and retry auto-generated IDs on `E11000` `_id` / `id` collisions up to `maxRetries` (default `5`), throwing `ModelIdCollisionError` (`MODEL_ID_COLLISION`) if exhausted.
+  - Birthday-paradox collision risk calculator: `estimateIdCollisionRisk(options)` and `model.idCollisionRisk(expectedCountOrOptions?)` return `{ entropyBits, alphabetSize, length, expectedCount, collisionProbability, maxCountForOneInBillion, maxCountForOneInMillion, maxCountForOneInThousand, riskLevel }`.
 
 ### Helpers (selected)
 
-Re-exported object helpers include `objectHash`, `objectFlatten`, `deleteNullishProperties`, `i18n`, and related utilities. Pipeline/access internals (`PipelineBuilder`, `AccessControl`) are available for advanced composition.
+Re-exported object helpers include `objectHash`, `objectFlatten`, `deleteNullishProperties`, `i18n`, `generateRandomId`, `createIdGenerator`, `estimateIdCollisionRisk`, and related utilities. Pipeline/access internals (`PipelineBuilder`, `AccessControl`) are available for advanced composition.
 
 ### Errors
 
-- `ModelError`, `ModelQueryError`, `ModelConverterError`, `ModelAccessDeniedError`, `ModelAccessConfigError`, `ModelValidationError`, `ModelVersionConflictError`, `ConverterRecipeError`
+- `ModelError`, `ModelQueryError`, `ModelConverterError`, `ModelAccessDeniedError`, `ModelAccessConfigError`, `ModelValidationError`, `ModelVersionConflictError`, `ModelIdCollisionError`, `ConverterRecipeError`
 
 ## Troubleshooting
 

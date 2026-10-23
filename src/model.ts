@@ -11,7 +11,7 @@ import
 from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { ModelCacheConfig, extractTargetIdsFromFilter } from './cache.js';
-import { ModelAccessDeniedError, ModelVersionConflictError } from './errors.js';
+import { ModelAccessDeniedError, ModelIdCollisionError, ModelVersionConflictError } from './errors.js';
 import { ModelMutationOperation, ObservabilityConfig } from './events.js';
 import
 {
@@ -28,6 +28,7 @@ import
     buildRestoreUpdate,
     buildSoftDeleteUpdate,
     combineMongoFilters,
+    isIdDuplicateKeyError,
     normalizeCursorOption,
     normalizeFindMatch,
     resolveCreateFromArgs
@@ -49,6 +50,7 @@ import
     ModelFindOneAndUpdateOptions,
     ModelFindOptions,
     ModelHooksConfig,
+    ModelIdConfig,
     ModelIndexDefinition,
     ModelListOptions,
     ModelRelationsConfig,
@@ -107,6 +109,7 @@ extends AbstractBaseModel<
             versioning?     : ModelVersioningConfig
             relations?      : ModelRelationsConfig<DBE>
             hooks?          : ModelHooksConfig<DBE>
+            id?             : ModelIdConfig
         }
     )
     {
@@ -126,6 +129,7 @@ extends AbstractBaseModel<
             versioning          : params.versioning,
             relations           : params.relations,
             hooks               : params.hooks,
+            id                  : params.id,
             idField             : '_id'
         });
 
@@ -245,8 +249,15 @@ extends AbstractBaseModel<
                 throw new ModelAccessDeniedError( this );
             }
 
-            const _id: DTO['id'] = id ?? await this.id();
             const start = Date.now();
+            const isAutoId = id === undefined;
+            const { maxRetries, verifyUniqueness } = this._resolveIdRetryOptions( options );
+            const usedIds = isAutoId ? new Set<string>() : undefined;
+            const generated = isAutoId
+                ? await this._tryGenerateUniqueId( usedIds, maxRetries, verifyUniqueness, options?.session )
+                : { id: id as DTO['id'], collided: false };
+            let _id: DTO['id'] = generated.id;
+
             const session = this._resolveSession( options?.session );
             const pendingAfterCommit: Array<() => void | Promise<void>> = [];
             let initialDoc = this._applyCreateTimestamps({ ...dbe, _id: this.dbeID( _id ) }) as Partial<DBE>;
@@ -276,17 +287,51 @@ extends AbstractBaseModel<
 
             try
             {
-                await this.collection.insertOne(
-                    resolveBSONObject({ ...validated, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE>,
-                    ...this._sessionArg( options?.session )
-                );
+                if( generated.collided )
+                {
+                    throw new ModelIdCollisionError( this, _id, maxRetries + 1 );
+                }
+                for( let attempt = 0; ; attempt++ )
+                {
+                    try
+                    {
+                        await this.collection.insertOne(
+                            resolveBSONObject({ ...validated, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE>,
+                            ...this._sessionArg( options?.session )
+                        );
+
+                        break;
+                    }
+                    catch( insertErr: any )
+                    {
+                        if( isAutoId && options?.duplicateIgnore !== true && isIdDuplicateKeyError( insertErr, '_id' ) )
+                        {
+                            if( attempt < maxRetries )
+                            {
+                                const nextGen = await this._tryGenerateUniqueId( usedIds, maxRetries - attempt - 1, verifyUniqueness, options?.session );
+
+                                _id = nextGen.id;
+
+                                if( !nextGen.collided )
+                                {
+                                    continue;
+                                }
+                            }
+
+                            throw new ModelIdCollisionError( this, _id, maxRetries + 1, undefined, insertErr instanceof Error ? insertErr : undefined );
+                        }
+
+                        throw insertErr;
+                    }
+                }
+
                 this._notifySiblingCacheInvalidation();
                 await this._runAfterHook( 'afterCreate',
                 {
                     operation       : 'create',
                     method          : 'create',
                     id              : _id,
-                    data            : validated,
+                    data            : { ...validated, _id: this.dbeID( _id ) } as Partial<DBE>,
                     insertedCount   : 1,
                     context         : options?.context,
                     traceID         : options?.traceID,
@@ -446,16 +491,43 @@ extends AbstractBaseModel<
 
             const ids: DTO['id'][] = [];
             const docs: OptionalUnlessRequiredId<DBE>[] = [];
+            const validatedDocs: Array<Partial<DBE>> = [];
+            const autoIndices: number[] = [];
+            const usedIds = new Set<string>();
+            const { maxRetries, verifyUniqueness } = this._resolveIdRetryOptions( resolvedOptions );
             const start = Date.now();
             const now = new Date();
             const session = this._resolveSession( resolvedOptions?.session );
             const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            let collidedId: DTO['id'] | undefined;
+            let hasCollision = false;
 
             for( let i = 0; i < items.length; i++ )
             {
                 const item = items[i];
-                const rawId = explicitIds?.[i] ?? ( item._id !== undefined ? this.dtoID( item._id ) : await this.id());
-                const dtoId = this.dtoID( rawId ) as DTO['id'];
+                const isAutoId = explicitIds?.[i] === undefined && item._id === undefined;
+                let dtoId: DTO['id'];
+
+                if( isAutoId )
+                {
+                    const generated = await this._tryGenerateUniqueId( usedIds, maxRetries, verifyUniqueness, resolvedOptions?.session );
+
+                    dtoId = generated.id;
+
+                    if( generated.collided && !hasCollision )
+                    {
+                        hasCollision = true;
+                        collidedId = dtoId;
+                    }
+
+                    autoIndices.push( i );
+                }
+                else
+                {
+                    dtoId = this.dtoID( explicitIds?.[i] ?? item._id ) as DTO['id'];
+                    usedIds.add( String( dtoId ));
+                }
+
                 let initialDoc = this._applyCreateTimestamps({ ...item, _id: this.dbeID( dtoId ) }, now ) as Partial<DBE>;
 
                 if( this._softDelete && ( initialDoc as any )[this._softDelete.field] === undefined )
@@ -482,12 +554,58 @@ extends AbstractBaseModel<
                 );
 
                 ids.push( dtoId );
+                validatedDocs.push( validated );
                 docs.push( resolveBSONObject({ ...validated, _id: this.dbeID( dtoId ) }) as OptionalUnlessRequiredId<DBE> );
             }
 
             try
             {
-                await this.collection.insertMany( docs, ...this._sessionArg( resolvedOptions?.session ));
+                if( hasCollision )
+                {
+                    throw new ModelIdCollisionError( this, collidedId, maxRetries + 1 );
+                }
+                for( let attempt = 0; ; attempt++ )
+                {
+                    try
+                    {
+                        await this.collection.insertMany( docs, ...this._sessionArg( resolvedOptions?.session ));
+
+                        break;
+                    }
+                    catch( insertErr: any )
+                    {
+                        if( autoIndices.length > 0 && isIdDuplicateKeyError( insertErr, '_id' ) )
+                        {
+                            if( attempt < maxRetries )
+                            {
+                                let retryCollided = false;
+
+                                for( const idx of autoIndices )
+                                {
+                                    const nextGen = await this._tryGenerateUniqueId( usedIds, maxRetries - attempt - 1, verifyUniqueness, resolvedOptions?.session );
+
+                                    ids[idx] = nextGen.id;
+                                    docs[idx] = resolveBSONObject({ ...validatedDocs[idx], _id: this.dbeID( nextGen.id ) }) as OptionalUnlessRequiredId<DBE>;
+
+                                    if( nextGen.collided )
+                                    {
+                                        retryCollided = true;
+                                    }
+                                }
+
+                                if( !retryCollided )
+                                {
+                                    continue;
+                                }
+                            }
+
+                            throw new ModelIdCollisionError( this, ids[autoIndices[0]], maxRetries + 1, undefined, insertErr instanceof Error ? insertErr : undefined );
+                        }
+
+                        throw insertErr;
+                    }
+                }
+
                 this._notifySiblingCacheInvalidation();
                 await this._runAfterHook( 'afterCreate',
                 {
@@ -2408,6 +2526,8 @@ extends AbstractBaseModel<
             const rawOps: AnyBulkWriteOperation<DBE>[] = [];
             const insertedIds: DTO['id'][] = [];
             const targetedIds: string[] = [];
+            const usedCreateIds = new Set<string>();
+            const { maxRetries, verifyUniqueness } = this._resolveIdRetryOptions();
             let hasBroadMutation = false;
             let versionedOpCount = 0;
             let firstVersionedCheck: { id?: unknown, expectedVersion: number } | undefined;
@@ -2427,7 +2547,19 @@ extends AbstractBaseModel<
                     const isWrappedCreate = 'create' in op && createPayload && typeof createPayload === 'object' && 'data' in createPayload && typeof createPayload.data === 'object';
                     const rawDoc: any = isWrappedCreate ? createPayload.data : createPayload;
                     const explicitId = 'create' in op ? ( ( op as any ).id ?? ( isWrappedCreate ? createPayload.id : undefined )) : undefined;
-                    const dtoId = ( explicitId ?? ( rawDoc._id !== undefined ? this.dtoID( rawDoc._id ) : await this.id())) as DTO['id'];
+                    const isAutoId = explicitId === undefined && rawDoc._id === undefined;
+                    let dtoId: DTO['id'];
+
+                    if( isAutoId )
+                    {
+                        dtoId = await this._generateUniqueId( usedCreateIds, maxRetries, verifyUniqueness, options?.session );
+                    }
+                    else
+                    {
+                        dtoId = ( explicitId ?? this.dtoID( rawDoc._id )) as DTO['id'];
+                        usedCreateIds.add( String( dtoId ));
+                    }
+
                     let initialDoc = this._applyCreateTimestamps({ ...rawDoc, _id: this.dbeID( dtoId ) }, now ) as Partial<DBE>;
 
                     if( this._softDelete && ( initialDoc as any )[this._softDelete.field] === undefined )

@@ -3,12 +3,20 @@ import { describe, expect, it, vi } from 'vitest';
 import
 {
     AbstractModels,
+    ModelError,
     ModelExternalCacheStore,
+    ModelIdCollisionError,
     ModelVersionConflictError,
+    ObjectId,
+    createIdGenerator,
     defineModel,
     definePropertyModel,
+    estimateIdCollisionRisk,
     extractExplainSummary,
+    generateRandomId,
+    isIdDuplicateKeyError,
     normalizePopulateSpecs,
+    resolveIdConfig,
     resolveVersioningConfig
 }
 from '../index.js';
@@ -1355,6 +1363,280 @@ describe( 'Advanced Next-Gen Features', () =>
             await delOnlyPosts.primeCache( 'p2', { id: 'p2', title: 'DelOnlySync' });
             ( delOnlyPosts as any )._cache.invalidateIds([ 'p2' ]);
             expect( deleteOnlyStore.delete ).toHaveBeenCalledWith([ 'dto:p2' ]);
+        });
+    });
+
+    describe( '8. Safe Cryptographic ID Generation & Collision Protection / Risk Analysis', () =>
+    {
+        it( 'generates cryptographic IDs across all strategies and estimates birthday-paradox collision risk', () =>
+        {
+            const oid = generateRandomId();
+            expect( oid ).toMatch( /^[0-9a-f]{24}$/ );
+            expect( ObjectId.isValid( oid ) ).toBe( true );
+
+            const shortOid = generateRandomId({ strategy: 'objectId', length: 16, prefix: 'obj_' });
+            expect( shortOid ).toMatch( /^obj_[0-9a-f]{16}$/ );
+
+            const hexId = generateRandomId({ strategy: 'cryptoHex', length: 32, prefix: 'hex_' });
+            expect( hexId ).toMatch( /^hex_[0-9a-f]{32}$/ );
+
+            const implicitHex = generateRandomId({ length: 12 });
+            expect( implicitHex ).toMatch( /^[0-9a-f]{12}$/ );
+
+            const uuid = generateRandomId( 'uuid' );
+            expect( uuid ).toMatch( /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i );
+
+            const ulid = generateRandomId( 'ulid' );
+            expect( ulid ).toMatch( /^[0-9A-HJKMNP-TV-Z]{26}$/ );
+
+            const nanoid = generateRandomId( 'nanoid' );
+            expect( nanoid ).toHaveLength( 21 );
+
+            const base62 = generateRandomId( 'base62' );
+            expect( base62 ).toMatch( /^[0-9A-Za-z]{22}$/ );
+
+            const customAlpha = generateRandomId({ alphabet: 'ABCDEF', length: 10, prefix: 'c_' });
+            expect( customAlpha ).toMatch( /^c_[A-F]{10}$/ );
+
+            expect(() => generateRandomId({ alphabet: 'A', length: 4 })).toThrow( RangeError );
+
+            const genFn = createIdGenerator({ strategy: 'base62', length: 16, prefix: 'u_' });
+            expect( genFn() ).toMatch( /^u_[0-9A-Za-z]{16}$/ );
+
+            // Risk calculations across all risk levels
+            const negRisk = estimateIdCollisionRisk({ strategy: 'uuid', expectedCount: 1000 });
+            expect( negRisk.entropyBits ).toBe( 122 );
+            expect( negRisk.riskLevel ).toBe( 'negligible' );
+
+            const ulidRisk = estimateIdCollisionRisk( 'ulid' );
+            expect( ulidRisk.entropyBits ).toBe( 80 );
+            expect( ulidRisk.riskLevel ).toBe( 'negligible' );
+
+            const nanoidRisk = estimateIdCollisionRisk( 'nanoid' );
+            expect( nanoidRisk.entropyBits ).toBe( 126 );
+
+            const base62Risk = estimateIdCollisionRisk( 'base62' );
+            expect( base62Risk.alphabetSize ).toBe( 62 );
+
+            const hexRisk = estimateIdCollisionRisk({ strategy: 'cryptoHex', length: 24 });
+            expect( hexRisk.entropyBits ).toBe( 96 );
+
+            const customLenOidRisk = estimateIdCollisionRisk({ strategy: 'objectId', length: 16 });
+            expect( customLenOidRisk.entropyBits ).toBe( 64 );
+
+            const lowRisk = estimateIdCollisionRisk({ entropyBits: 40, expectedCount: 1000 });
+            expect( lowRisk.riskLevel ).toBe( 'low' );
+
+            const modRisk = estimateIdCollisionRisk({ alphabet: '0123456789abcdef', length: 7, expectedCount: 500 });
+            expect( modRisk.riskLevel ).toBe( 'moderate' );
+
+            const highRisk = estimateIdCollisionRisk({ entropyBits: 20, expectedCount: 200 });
+            expect( highRisk.riskLevel ).toBe( 'high' );
+
+            const critRisk = estimateIdCollisionRisk({ entropyBits: 10, expectedCount: 50 });
+            expect( critRisk.riskLevel ).toBe( 'critical' );
+
+            const zeroCountRisk = estimateIdCollisionRisk({ entropyBits: 32, expectedCount: 1 });
+            expect( zeroCountRisk.collisionProbability ).toBe( 0 );
+
+            // Config validation errors on minEntropyBits & maxCollisionRisk
+            expect(() => resolveIdConfig({ strategy: 'cryptoHex', length: 4, minEntropyBits: 64 }))
+                .toThrow( ModelError );
+            expect(() => resolveIdConfig({ strategy: 'cryptoHex', length: 4, expectedCount: 1000, maxCollisionRisk: 1e-6 }))
+                .toThrow( ModelError );
+
+            // Duplicate key error discriminator
+            expect( isIdDuplicateKeyError( null ) ).toBe( false );
+            expect( isIdDuplicateKeyError({ code: 11000 }) ).toBe( true );
+            expect( isIdDuplicateKeyError({ code: 11000, keyPattern: { _id: 1 } }, '_id' ) ).toBe( true );
+            expect( isIdDuplicateKeyError({ code: 11000, keyPattern: { email: 1 } }, '_id' ) ).toBe( false );
+            expect( isIdDuplicateKeyError({ code: 11000, keyValue: { 'comments.id': 'c1' } }, 'id' ) ).toBe( true );
+            expect( isIdDuplicateKeyError({ code: 11000, keyValue: { email: 'a@b.c' } }, '_id' ) ).toBe( false );
+            expect( isIdDuplicateKeyError({ code: 11000, message: 'E11000 duplicate key error index: _id_' }, '_id' ) ).toBe( true );
+            expect( isIdDuplicateKeyError({ code: 11000, message: 'E11000 duplicate key error index: email_1' }, '_id' ) ).toBe( false );
+        });
+
+        it( 'automatically retries auto-generated ID collisions on Model create, createMany, bulkWrite, and generateId', async() =>
+        {
+            const models = new TestModels();
+            const mock = createRichCollectionMock( 'posts', [{ _id: 'dup1', title: 'Existing' }]);
+
+            let seq = 0;
+            const candidatePool = [ 'dup1', 'dup2', 'fresh1', 'dup_batch', 'dup_batch', 'fresh2', 'fresh3' ];
+            const posts = defineModel<PostDBE, PostDTO>( models, mock.collection,
+            {
+                id          :
+                {
+                    generator   : () => candidatePool[seq++] ?? generateRandomId( 'ulid' ),
+                    maxRetries  : 3
+                },
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title })
+                    }
+                }
+            });
+
+            expect( posts.idCollisionRisk().maxCountForOneInMillion ).toBeGreaterThan( 0 );
+            expect( posts.idCollisionRisk( 500_000 ).expectedCount ).toBe( 500_000 );
+            expect( posts.idCollisionRisk({ strategy: 'uuid', expectedCount: 100 }).entropyBits ).toBe( 122 );
+
+            // 1. create() retries on E11000 _id collision until insertOne succeeds with 'fresh1'
+            mock.spies.insertOne
+                .mockRejectedValueOnce( Object.assign( new Error( 'E11000 dup' ), { code: 11000, keyPattern: { _id: 1 } }))
+                .mockRejectedValueOnce( Object.assign( new Error( 'E11000 dup' ), { code: 11000, keyPattern: { _id: 1 } }))
+                .mockResolvedValueOnce({ insertedId: 'fresh1' });
+
+            const createdId = await posts.create({ title: 'Retry Success' });
+            expect( createdId ).toBe( 'fresh1' );
+            expect( mock.spies.insertOne ).toHaveBeenCalledTimes( 3 );
+
+            // 2. createMany() deduplicates intra-batch collisions ('dup_batch', 'dup_batch' -> 'dup_batch', 'fresh2')
+            // and retries insertMany on E11000 _id collision
+            mock.spies.insertMany
+                .mockRejectedValueOnce( Object.assign( new Error( 'E11000 batch dup' ), { code: 11000, keyPattern: { _id: 1 } }))
+                .mockResolvedValueOnce({ insertedCount: 2 });
+
+            const batchIds = await posts.createMany([{ title: 'B1' }, { title: 'B2' }]);
+            expect( batchIds ).toHaveLength( 2 );
+            expect( new Set( batchIds ).size ).toBe( 2 );
+
+            // 3. Exhausting maxRetries on create() throws ModelIdCollisionError
+            const alwaysColliding = defineModel<PostDBE, PostDTO>( models, mock.collection,
+            {
+                id          : () => 'always_same',
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title })
+                    }
+                }
+            });
+
+            mock.spies.insertOne.mockRejectedValue( Object.assign( new Error( 'E11000' ), { code: 11000, keyValue: { _id: 'always_same' } }));
+
+            let collisionErr: ModelIdCollisionError | undefined;
+            try
+            {
+                await alwaysColliding.create({ title: 'Fail' }, undefined, { maxRetries: 2 });
+            }
+            catch( e )
+            {
+                collisionErr = e as ModelIdCollisionError;
+            }
+
+            expect( collisionErr ).toBeInstanceOf( ModelIdCollisionError );
+            expect( collisionErr?.code ).toBe( 'MODEL_ID_COLLISION' );
+            expect( collisionErr?.id ).toBe( 'always_same' );
+            expect( collisionErr?.attempts ).toBe( 3 );
+
+            // Exhausting maxRetries on createMany intra-batch collision throws ModelIdCollisionError
+            await expect( alwaysColliding.createMany([{ title: 'A' }, { title: 'B' }], { maxRetries: 1 }) )
+                .rejects.toThrow( ModelIdCollisionError );
+
+            // Exhausting maxRetries on bulkWrite intra-batch collision throws ModelIdCollisionError
+            await expect( alwaysColliding.bulkWrite([{ create: { title: 'A' } }, { create: { title: 'B' } }]) )
+                .rejects.toThrow( ModelIdCollisionError );
+
+            // Non-_id duplicate key error (e.g. unique email index) is NOT retried as an ID collision
+            const nonIdErr = Object.assign( new Error( 'E11000 email' ), { code: 11000, keyPattern: { email: 1 } });
+            mock.spies.insertOne.mockReset();
+            mock.spies.insertOne.mockRejectedValueOnce( nonIdErr );
+            await expect( posts.create({ title: 'Email Dup' }) ).rejects.toThrow( 'E11000 email' );
+            expect( mock.spies.insertOne ).toHaveBeenCalledTimes( 1 );
+
+            // generateId({ verifyUniqueness: true }) checks exists() and retries or throws ModelIdCollisionError
+            vi.spyOn( posts, 'exists' )
+                .mockResolvedValueOnce( true )
+                .mockResolvedValueOnce( false );
+
+            const verifiedId = await posts.generateId({ verifyUniqueness: true, maxRetries: 2 });
+            expect( typeof verifiedId ).toBe( 'string' );
+
+            vi.spyOn( alwaysColliding, 'exists' ).mockResolvedValue( true );
+            await expect( alwaysColliding.generateId({ verifyUniqueness: true, maxRetries: 1 }) )
+                .rejects.toThrow( ModelIdCollisionError );
+            await expect( alwaysColliding.create({ title: 'VerifyFail' }, undefined, { verifyUniqueness: true, maxRetries: 1 }) )
+                .rejects.toThrow( ModelIdCollisionError );
+        });
+
+        it( 'protects PropertyModel create and createMany against parent subdocument and intra-batch ID collisions', async() =>
+        {
+            const models = new TestModels();
+            const mock = createRichCollectionMock( 'posts', [
+                {
+                    _id         : 'p1',
+                    title       : 'Post 1',
+                    comments    : [{ id: 'c_existing', text: 'Existing comment' }]
+                }
+            ]);
+
+            defineModel<PostDBE, PostDTO>( models, mock.collection,
+            {
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1, comments: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title, comments: dbe.comments as any })
+                    }
+                }
+            });
+
+            let cSeq = 0;
+            const cPool = [ 'c_existing', 'c_fresh1', 'c_dup', 'c_dup', 'c_fresh2', 'c_retry1', 'c_retry2' ];
+            const comments = definePropertyModel<PostDBE, CommentDBE, CommentDTO>( models, mock.collection,
+            {
+                path        : 'comments[]',
+                id          : () => cPool[cSeq++] ?? generateRandomId( 'base62' ),
+                dbeID       : id => String( id ),
+                dtoID       : id => String( id ),
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { id: 1, text: 1 },
+                        converter   : dbe => ({ id: dbe.id, text: dbe.text })
+                    }
+                }
+            });
+
+            // 1. create() skips 'c_existing' already present on parent.comments and uses 'c_fresh1'
+            const subId = await comments.create( 'p1', { text: 'New comment' });
+            expect( subId ).toBe( 'c_fresh1' );
+
+            // 2. createMany() deduplicates intra-batch 'c_dup' -> ['c_dup', 'c_fresh2'] and retries on E11000
+            mock.spies.updateOne
+                .mockRejectedValueOnce( Object.assign( new Error( 'E11000 subdoc' ), { code: 11000, keyValue: { 'comments.id': 'c_dup' } }))
+                .mockResolvedValueOnce({ matchedCount: 1, modifiedCount: 1 });
+
+            const subBatchIds = await comments.createMany( 'p1', [{ text: 'M1' }, { text: 'M2' }]);
+            expect( subBatchIds ).toEqual([ 'c_retry1', 'c_retry2' ]);
+
+            // 3. Exhausting maxRetries on PropertyModel create / createMany throws ModelIdCollisionError
+            const stuckComments = definePropertyModel<PostDBE, CommentDBE, CommentDTO>( models, mock.collection,
+            {
+                path        : 'comments[]',
+                id          : () => 'c_existing',
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { id: 1, text: 1 },
+                        converter   : dbe => ({ id: dbe.id, text: dbe.text })
+                    }
+                }
+            });
+
+            await expect( stuckComments.create( 'p1', { text: 'Collides with parent' }, undefined, { maxRetries: 1 }) )
+                .rejects.toThrow( ModelIdCollisionError );
+            await expect( stuckComments.createMany( 'p1', [{ text: 'Collides 1' }], { maxRetries: 1 }) )
+                .rejects.toThrow( ModelIdCollisionError );
         });
     });
 });

@@ -9,7 +9,7 @@ import
 from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { extractTargetIdsFromFilter } from './cache.js';
-import { ModelAccessDeniedError, ModelError, ModelVersionConflictError } from './errors.js';
+import { ModelAccessDeniedError, ModelError, ModelIdCollisionError, ModelVersionConflictError } from './errors.js';
 import { ModelMutationOperation } from './events.js';
 import { flowGet } from './flow.js';
 import
@@ -39,10 +39,11 @@ import { propertyModelTargetUpdateParams } from './helpers/mongo.js';
 import { AbstractModels } from './models.js';
 import
 {
-     attachPropertyUpdateMetadata,
+    attachPropertyUpdateMetadata,
     buildPropertyDeleteOperation,
     buildRestoreUpdate,
     buildSoftDeleteUpdate,
+    isIdDuplicateKeyError,
     normalizeCursorOption,
     normalizeFindMatch,
     resolveCreateFromArgs
@@ -136,6 +137,7 @@ extends AbstractBaseModel<
             versioning                  : params.versioning,
             relations                   : params.relations,
             hooks                       : params.hooks,
+            id                          : params.id,
             idField                     : 'id',
             prefix,
             smartFilterOptions          :
@@ -306,6 +308,36 @@ extends AbstractBaseModel<
         return pipeline;
     }
 
+    #collectParentSubdocIds( parent: any ): Set<string>
+    {
+        const used = new Set<string>();
+
+        if( !parent || typeof parent !== 'object' )
+        {
+            return used;
+        }
+
+        const leaf = this.#paths[this.#paths.length - 1];
+        const container = leaf ? ( parent as any )[leaf.path] : undefined;
+
+        if( Array.isArray( container ) )
+        {
+            for( const item of container )
+            {
+                if( item && typeof item === 'object' && item.id !== undefined )
+                {
+                    used.add( String( this.dtoID( item.id )));
+                }
+            }
+        }
+        else if( container && typeof container === 'object' && container.id !== undefined )
+        {
+            used.add( String( this.dtoID( container.id )));
+        }
+
+        return used;
+    }
+
     public async create( parentID: any, dbe: Omit<DBE, 'id'>, id?: DTO['id'], options?: ModelCreateOptions ): Promise<DTO['id']>
     {
         return this.runOperation( async() =>
@@ -317,7 +349,6 @@ extends AbstractBaseModel<
                 throw new ModelAccessDeniedError( this );
             }
 
-            const _id: DTO['id'] = id ?? await this.id();
             const parentModel = this._models[GET_PARENT]( this.collection.collectionName, this.#prefix );
             const parent = parentModel
                 ? await parentModel.get( parentID, options?.session ? { session: options.session } : undefined )
@@ -329,6 +360,14 @@ extends AbstractBaseModel<
             }
 
             const start = Date.now();
+            const isAutoId = id === undefined;
+            const { maxRetries, verifyUniqueness } = this._resolveIdRetryOptions( options );
+            const usedIds = isAutoId ? this.#collectParentSubdocIds( parent ) : undefined;
+            const generated = isAutoId
+                ? await this._tryGenerateUniqueId( usedIds, maxRetries, verifyUniqueness, options?.session )
+                : { id: id as DTO['id'], collided: false };
+            let _id: DTO['id'] = generated.id;
+
             const session = this._resolveSession( options?.session );
             const pendingAfterCommit: Array<() => void | Promise<void>> = [];
             let initialDoc = this._applyCreateTimestamps({ id: this.dbeID( _id ), ...dbe }) as Partial<DBE>;
@@ -365,11 +404,44 @@ extends AbstractBaseModel<
 
             try
             {
-                await this.collection.updateOne(
-                    resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
-                    resolveBSONObject({ [operation]: { [updatePath]: { id: this.dbeID( _id ), ...validated } } }),
-                    this._withSession( resolveBSONObject({ arrayFilters }), options?.session )
-                );
+                if( generated.collided )
+                {
+                    throw new ModelIdCollisionError( this, _id, maxRetries + 1 );
+                }
+                for( let attempt = 0; ; attempt++ )
+                {
+                    try
+                    {
+                        await this.collection.updateOne(
+                            resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
+                            resolveBSONObject({ [operation]: { [updatePath]: { ...validated, id: this.dbeID( _id ) } } }),
+                            this._withSession( resolveBSONObject({ arrayFilters }), options?.session )
+                        );
+
+                        break;
+                    }
+                    catch( updateErr: any )
+                    {
+                        if( isAutoId && options?.duplicateIgnore !== true && isIdDuplicateKeyError( updateErr, 'id' ) )
+                        {
+                            if( attempt < maxRetries )
+                            {
+                                const nextGen = await this._tryGenerateUniqueId( usedIds, maxRetries - attempt - 1, verifyUniqueness, options?.session );
+
+                                _id = nextGen.id;
+
+                                if( !nextGen.collided )
+                                {
+                                    continue;
+                                }
+                            }
+
+                            throw new ModelIdCollisionError( this, _id, maxRetries + 1, undefined, updateErr instanceof Error ? updateErr : undefined );
+                        }
+
+                        throw updateErr;
+                    }
+                }
 
                 this._notifySiblingCacheInvalidation();
                 await this._runAfterHook( 'afterCreate',
@@ -378,7 +450,7 @@ extends AbstractBaseModel<
                     method          : 'create',
                     id              : _id,
                     parentID,
-                    data            : validated,
+                    data            : { ...validated, id: this.dbeID( _id ) } as Partial<DBE>,
                     insertedCount   : 1,
                     context         : options?.context,
                     traceID         : options?.traceID,
@@ -506,16 +578,43 @@ extends AbstractBaseModel<
 
             const ids: DTO['id'][] = [];
             const docs: Document[] = [];
+            const validatedDocs: Array<Partial<DBE>> = [];
+            const autoIndices: number[] = [];
+            const usedIds = this.#collectParentSubdocIds( parent );
+            const { maxRetries, verifyUniqueness } = this._resolveIdRetryOptions( resolvedOptions );
             const start = Date.now();
             const now = new Date();
             const session = this._resolveSession( resolvedOptions?.session );
             const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            let collidedId: DTO['id'] | undefined;
+            let hasCollision = false;
 
             for( let i = 0; i < items.length; i++ )
             {
                 const item = items[i];
-                const rawId = explicitIds?.[i] ?? ( item.id !== undefined ? this.dtoID( item.id ) : await this.id());
-                const dtoId = this.dtoID( rawId ) as DTO['id'];
+                const isAutoId = explicitIds?.[i] === undefined && item.id === undefined;
+                let dtoId: DTO['id'];
+
+                if( isAutoId )
+                {
+                    const generated = await this._tryGenerateUniqueId( usedIds, maxRetries, verifyUniqueness, resolvedOptions?.session );
+
+                    dtoId = generated.id;
+
+                    if( generated.collided && !hasCollision )
+                    {
+                        hasCollision = true;
+                        collidedId = dtoId;
+                    }
+
+                    autoIndices.push( i );
+                }
+                else
+                {
+                    dtoId = this.dtoID( explicitIds?.[i] ?? item.id ) as DTO['id'];
+                    usedIds.add( String( dtoId ));
+                }
+
                 let initialDoc = this._applyCreateTimestamps({ ...item, id: this.dbeID( dtoId ) }, now ) as Partial<DBE>;
 
                 if( this._softDelete && ( initialDoc as any )[this._softDelete.field] === undefined )
@@ -546,22 +645,68 @@ extends AbstractBaseModel<
                 );
 
                 ids.push( dtoId );
+                validatedDocs.push( validated );
                 docs.push( resolveBSONObject({ ...validated, id: this.dbeID( dtoId ) }));
             }
 
             const { parentIDPath, updatePath, arrayFilters } = propertyModelUpdateParams( this.#paths, parentModel.dbeID( parentID ));
             const isLeafArray = this.#paths[this.#paths.length - 1].array;
-            const updatePayload = isLeafArray
-                ? { $push: { [updatePath]: { $each: docs } } }
-                : { $set: { [updatePath]: docs[docs.length - 1] } };
 
             try
             {
-                await this.collection.updateOne(
-                    resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
-                    resolveBSONObject( updatePayload ),
-                    this._withSession( resolveBSONObject({ arrayFilters }), resolvedOptions?.session )
-                );
+                if( hasCollision )
+                {
+                    throw new ModelIdCollisionError( this, collidedId, maxRetries + 1 );
+                }
+                for( let attempt = 0; ; attempt++ )
+                {
+                    const updatePayload = isLeafArray
+                        ? { $push: { [updatePath]: { $each: docs } } }
+                        : { $set: { [updatePath]: docs[docs.length - 1] } };
+
+                    try
+                    {
+                        await this.collection.updateOne(
+                            resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
+                            resolveBSONObject( updatePayload ),
+                            this._withSession( resolveBSONObject({ arrayFilters }), resolvedOptions?.session )
+                        );
+
+                        break;
+                    }
+                    catch( updateErr: any )
+                    {
+                        if( autoIndices.length > 0 && isIdDuplicateKeyError( updateErr, 'id' ) )
+                        {
+                            if( attempt < maxRetries )
+                            {
+                                let retryCollided = false;
+
+                                for( const idx of autoIndices )
+                                {
+                                    const nextGen = await this._tryGenerateUniqueId( usedIds, maxRetries - attempt - 1, verifyUniqueness, resolvedOptions?.session );
+
+                                    ids[idx] = nextGen.id;
+                                    docs[idx] = resolveBSONObject({ ...validatedDocs[idx], id: this.dbeID( nextGen.id ) });
+
+                                    if( nextGen.collided )
+                                    {
+                                        retryCollided = true;
+                                    }
+                                }
+
+                                if( !retryCollided )
+                                {
+                                    continue;
+                                }
+                            }
+
+                            throw new ModelIdCollisionError( this, ids[autoIndices[0]], maxRetries + 1, undefined, updateErr instanceof Error ? updateErr : undefined );
+                        }
+
+                        throw updateErr;
+                    }
+                }
 
                 this._notifySiblingCacheInvalidation();
                 await this._runAfterHook( 'afterCreate',

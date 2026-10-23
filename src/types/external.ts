@@ -42,6 +42,8 @@ export type ModelsOptions = MongoClientOptions &
 export type ModelCreateOptions =
 {
     duplicateIgnore?    : boolean
+    maxRetries?         : number
+    verifyUniqueness?   : boolean
     access?             : string
     context?            : Record<string, unknown>
     traceID?            : string
@@ -287,6 +289,63 @@ export type ModelVersioningOptions =
 };
 
 export type ModelVersioningConfig = boolean | string | ModelVersioningOptions;
+
+export type ModelIdStrategy = 'objectId' | 'cryptoHex' | 'uuid' | 'ulid' | 'nanoid' | 'base62';
+
+export type ModelIdCollisionRiskLevel = 'negligible' | 'low' | 'moderate' | 'high' | 'critical';
+
+export type ModelIdGeneratorContext =
+{
+    attempt : number
+    model?  : unknown
+};
+
+export type ModelIdGeneratorFn<IdType = string> = (
+    context?: ModelIdGeneratorContext
+) => IdType | Promise<IdType>;
+
+export type ModelIdGeneratorOptions<IdType = string> =
+{
+    strategy?           : ModelIdStrategy
+    generator?          : ModelIdGeneratorFn<IdType>
+    length?             : number
+    alphabet?           : string
+    prefix?             : string
+    maxRetries?         : number
+    verifyUniqueness?   : boolean
+    expectedCount?      : number
+    maxCollisionRisk?   : number
+    minEntropyBits?     : number
+};
+
+export type ModelIdConfig<IdType = any> =
+    | ModelIdStrategy
+    | ModelIdGeneratorFn<IdType>
+    | ModelIdGeneratorOptions<IdType>;
+
+export type ModelIdCollisionRiskOptions =
+{
+    strategy?       : ModelIdStrategy
+    length?         : number
+    alphabet?       : string
+    alphabetSize?   : number
+    entropyBits?    : number
+    expectedCount?  : number
+};
+
+export type ModelIdCollisionRiskResult =
+{
+    strategy?               : ModelIdStrategy
+    alphabetSize            : number
+    length                  : number
+    entropyBits             : number
+    expectedCount           : number
+    collisionProbability    : number
+    maxCountForOneInBillion : number
+    maxCountForOneInMillion : number
+    maxCountForOneInThousand: number
+    riskLevel               : ModelIdCollisionRiskLevel
+};
 
 export type ModelRelationTarget =
     | string
@@ -684,6 +743,7 @@ export type ConstructorExtensions<E extends PropertyModelExtensions<any, any, an
         versioning?         : ModelVersioningConfig
         relations?          : E['relations']
         hooks?              : E['hooks']
+        id?                 : ModelIdConfig
     }
 
 export type ModelExtensions
@@ -708,6 +768,7 @@ export type ModelExtensions
     versioning?         : ModelVersioningConfig
     relations?          : ModelRelationsConfig<DBE>
     hooks?              : ModelHooksConfig<DBE>
+    id?                 : ModelIdConfig
 }
 
 export type PropertyModelExtensions
@@ -732,6 +793,7 @@ export type PropertyModelExtensions
     versioning?         : ModelVersioningConfig
     relations?          : ModelRelationsConfig<DBE>
     hooks?              : ModelHooksConfig<DBE>
+    id?                 : ModelIdConfig
 }
 
 export type MongoBSONTypes<T> = T extends ObjectId
