@@ -609,6 +609,11 @@ function cleanFilterForOptimizer( obj: any ): any
     {
         if( value === undefined )
         {
+            if( key.startsWith( '$' ) && key !== '$and' && key !== '$or' )
+            {
+                result[key] = value;
+            }
+
             continue;
         }
 
@@ -904,6 +909,33 @@ function isEq( obj: any )
         );
 }
 
+function collectExpressionRefs( value: any, out: Set<string> ): void
+{
+    if( typeof value === 'string' )
+    {
+        if( value.startsWith( '$' ) && !value.startsWith( '$$' ) )
+        {
+            const ref = value.slice( 1 );
+
+            if( ref ){ out.add( ref ) }
+        }
+
+        return;
+    }
+
+    if( Array.isArray( value ) )
+    {
+        for( const item of value ){ collectExpressionRefs( item, out ) }
+
+        return;
+    }
+
+    if( value && typeof value === 'object' && !isNonPlainOptimizerValue( value ) )
+    {
+        for( const v of Object.values( value ) ){ collectExpressionRefs( v, out ) }
+    }
+}
+
 /**
  * Extracts fields used in the pipeline by delegating to @webergency-utils/mongodb-query-optimizer
  * @param pipeline
@@ -942,6 +974,40 @@ export function getUsedFields( pipeline: Document[] ): { used: string[], ignored
 
                     continue;
                 }
+            }
+
+            if(( stage === '$addFields' || stage === '$set' || stage === '$project' ) && el[stage] && typeof el[stage] === 'object' )
+            {
+                const refs = new Set<string>();
+
+                collectExpressionRefs( el[stage], refs );
+
+                for( const field of refs )
+                {
+                    if( !ignoredFields.has( field ) ){ usedFields.add( field ) }
+                }
+
+                for( const key of Object.keys( el[stage] ) )
+                {
+                    if( stage !== '$project' || el[stage][key] !== 1 )
+                    {
+                        ignoredFields.add( key );
+                    }
+                }
+
+                continue;
+            }
+
+            if( stage === '$unset' && ( typeof el.$unset === 'string' || Array.isArray( el.$unset ) ) )
+            {
+                const fields = Array.isArray( el.$unset ) ? el.$unset : [ el.$unset ];
+
+                for( const f of fields )
+                {
+                    if( typeof f === 'string' ){ ignoredFields.add( f ) }
+                }
+
+                continue;
             }
 
             throw new Error( `Unsupported pipeline stage: "${stage}"` );

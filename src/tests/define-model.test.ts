@@ -208,4 +208,17 @@ describe( 'Model factory', () =>
         expect( dto1 ).toEqual({ id: 'one:1', name: 'TS' });
         expect( dto2 ).toEqual({ id: 'two:1', name: 'TS' });
     });
+
+    test( 'does not mark accessFilter as overridden when subclass does not override accessFilter', async() =>
+    {
+        class DefaultAccessModel extends Model<SkillDBE, SkillDTO>() {}
+
+        const models = new TestModels();
+        const aggregate = vi.fn(() => ({ toArray: async() => [{ _id: '1', name: 'TS' }] }));
+        const model = new DefaultAccessModel( models, { collectionName: 'skills', aggregate } as any );
+
+        const res = await model.get( '1' );
+
+        expect( res ).toEqual({ id: '1', name: 'TS' });
+    });
 });

@@ -36,7 +36,6 @@ from './operations.js';
 import { RESOLVED_ACCESS } from './symbols.js';
 import
 {
-    AccessFilterResult,
     ExtractComputedProperties,
     ExtractSmartFilters,
     GetManyOptions,
@@ -298,7 +297,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 const snapshot = await this.#findOneAndUpdateWithSnapshots( match, update, options );
 
-                this._invalidateCache([ id ]);
+                this._invalidateCache([ id ], snapshot.matchedCount > 0 );
                 this._emitMutation( 'update', Date.now() - start,
                 {
                     matchedCount    : snapshot.matchedCount,
@@ -316,7 +315,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             const res = await this.collection.updateOne( match, toUpdateOperations( update ));
 
-            this._invalidateCache([ id ]);
+            this._invalidateCache([ id ], res.matchedCount > 0 );
             this._emitMutation( 'update', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
@@ -341,12 +340,30 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         options: ModelUpdateOptions
     ): Promise<{ document?: DBE, documentBefore?: DBE, documentAfter?: DBE, matchedCount: number, modifiedCount: number }>
     {
-        const beforeDoc = options.documentBefore && options.documentAfter
-            ? ( await this.collection.findOne( match, { collation: { locale: 'en' } }) as DBE | null ) || undefined
-            : undefined;
+        let beforeDoc: DBE | undefined;
+        let effectiveMatch = match;
+
+        if( options.documentBefore && options.documentAfter )
+        {
+            beforeDoc = ( await this.collection.findOne( match, { collation: { locale: 'en' } }) as DBE | null ) || undefined;
+
+            if( !beforeDoc )
+            {
+                return {
+                    matchedCount    : 0,
+                    modifiedCount   : 0,
+                    documentBefore  : undefined,
+                    documentAfter   : undefined
+                };
+            }
+
+            effectiveMatch = beforeDoc._id !== undefined
+                ? ({ $and: [ match, { _id: beforeDoc._id } ] } as Filter<DBE>)
+                : match;
+        }
 
         const result = await this.collection.findOneAndUpdate(
-            match,
+            effectiveMatch,
             toUpdateOperations( update ),
             {
                 returnDocument  : options.documentAfter ? 'after' : 'before',
@@ -363,7 +380,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             matchedCount,
             modifiedCount,
             documentBefore  : options.documentBefore
-                ? ( options.documentAfter ? beforeDoc : document )
+                ? ( options.documentAfter ? ( document ? beforeDoc : undefined ) : document )
                 : undefined,
             documentAfter   : options.documentAfter ? document : undefined
         };
@@ -461,7 +478,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 const start = Date.now();
                 const res = await this.collection.updateMany( match, toUpdateOperations( update ));
 
-                this._invalidateCache( idsOrFilter );
+                this._invalidateCache( idsOrFilter, res.matchedCount > 0 );
                 this._emitMutation( 'updateMany', Date.now() - start,
                 {
                     matchedCount    : res.matchedCount,
@@ -483,7 +500,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     if( targetIds && targetIds.length > 0 )
                     {
-                        this._invalidateCache( targetIds );
+                        this._invalidateCache( targetIds, false );
                     }
 
                     this._emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: targetIds ?? undefined });
@@ -497,7 +514,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             if( targetIds && targetIds.length > 0 )
             {
-                this._invalidateCache( targetIds );
+                this._invalidateCache( targetIds, res.matchedCount > 0 );
             }
             else if( res.matchedCount > 0 || res.modifiedCount > 0 )
             {
@@ -539,7 +556,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     if( targetIds && targetIds.length > 0 )
                     {
-                        this._invalidateCache( targetIds );
+                        this._invalidateCache( targetIds, false );
                     }
 
                     this._emitMutation( 'updateOne', 0, { matchedCount: 0, modifiedCount: 0, ids: targetIds ?? undefined });
@@ -559,7 +576,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
                 if( idsToEvict && idsToEvict.length > 0 )
                 {
-                    this._invalidateCache( idsToEvict );
+                    this._invalidateCache( idsToEvict, snapshot.matchedCount > 0 );
                 }
                 else if( snapshot.matchedCount > 0 || snapshot.modifiedCount > 0 )
                 {
@@ -586,7 +603,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             if( targetIds && targetIds.length > 0 )
             {
-                this._invalidateCache( targetIds );
+                this._invalidateCache( targetIds, res.matchedCount > 0 );
             }
             else if( res.matchedCount > 0 || res.modifiedCount > 0 )
             {
@@ -950,8 +967,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         return super.exists( idOrFilter, options );
     }
 
-    protected override async accessFilter( _name: string ): Promise<AccessFilterResult<DBE>> {}
-
     public override async resolveSmartFilter( smartFilter: Record<string, any> )
     {
         return super.resolveSmartFilter( smartFilter ) as Promise<{ filter?: Filter<DBE>, pipeline?: Document[] }>;
@@ -976,7 +991,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             const start = Date.now();
             const res = await this.collection.deleteOne( match );
 
-            this._invalidateCache([ id ]);
+            this._invalidateCache([ id ], res.deletedCount > 0 );
             this._emitMutation( 'delete', Date.now() - start,
             {
                 deletedCount    : res.deletedCount,
@@ -1013,7 +1028,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 const start = Date.now();
                 const res = await this.collection.deleteMany( match );
 
-                this._invalidateCache( idsOrFilter );
+                this._invalidateCache( idsOrFilter, res.deletedCount > 0 );
                 this._emitMutation( 'deleteMany', Date.now() - start,
                 {
                     deletedCount    : res.deletedCount,
@@ -1031,7 +1046,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     if( targetIds && targetIds.length > 0 )
                     {
-                        this._invalidateCache( targetIds );
+                        this._invalidateCache( targetIds, false );
                     }
 
                     this._emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: targetIds ?? undefined });
@@ -1045,7 +1060,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             if( targetIds && targetIds.length > 0 )
             {
-                this._invalidateCache( targetIds );
+                this._invalidateCache( targetIds, res.deletedCount > 0 );
             }
             else if( res.deletedCount > 0 )
             {

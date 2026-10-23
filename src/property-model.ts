@@ -53,7 +53,6 @@ import
 {
     AbstractPropertyModelComputedProperties,
     AbstractPropertyModelSmartFilters,
-    AccessFilterResult,
     ConstructorExtensions,
     ExtractComputedProperties,
     ExtractSmartFilters,
@@ -87,7 +86,7 @@ export abstract class AbstractPropertyModel
     DTO extends Document,
     Extensions extends PropertyModelExtensions<DBE, AbstractPropertyModelSmartFilters<any, any>, AbstractPropertyModelComputedProperties<any, any>>
 >
-extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
+extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<RootDBE, DBE>>
 {
     #paths: { path: string, array: boolean }[];
     #prefix: string;
@@ -460,7 +459,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
 
-            return this.#updateById( id, update, options, access, false );
+            return this.#updateById( id, update, options, access, false, 'update' );
         });
     }
 
@@ -469,31 +468,33 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
         update: Partial<DBE> | UpdateFilter<DBE>,
         options: ModelUpdateOptions | undefined,
         access: { denied: boolean, filter?: Filter<any> },
-        accessVerified: boolean
+        accessVerified: boolean,
+        method: 'update' | 'updateOne'
     ): Promise<PropertyModelUpdateResponse<DBE>>
     {
         const path = `${this.#prefix}.id`;
+        const dbeId = this.dbeID( id );
 
         if( !accessVerified && this.#hasEffectiveSubdocAccessFilter( access.filter ) )
         {
-            const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: this.dbeID( id ) } as any, access: options?.access }, access.filter, 1 );
+            const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: dbeId } as any, access: options?.access }, access.filter, 1 );
 
             if( matchedIds.length === 0 )
             {
-                this._invalidateCache([ id ]);
-                this._emitMutation( 'update', 0, { matchedCount: 0, modifiedCount: 0, ids: [ id ] });
+                this._invalidateCache([ id ], false );
+                this._emitMutation( method, 0, { matchedCount: 0, modifiedCount: 0, ids: [ id ] });
 
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
         }
 
-        const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, this.dbeID( id ));
+        const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, dbeId );
         const operations = addPrefixToUpdate<RootDBE, DBE>( update, updatePrefix );
         const updateOptions: UpdateOptions = arrayFilters ? { arrayFilters } : {};
 
         const match: Filter<RootDBE> = access.filter
-            ? { $and: [{ [path]: this.dbeID( id ) }, addPrefixToFilter( access.filter as any, this.#prefix ) ] } as any
-            : { [path]: this.dbeID( id ) } as Filter<RootDBE>;
+            ? { $and: [{ [path]: dbeId }, addPrefixToFilter( access.filter as any, this.#prefix ) ] } as any
+            : { [path]: dbeId } as Filter<RootDBE>;
 
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
@@ -506,11 +507,11 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
         );
         const duration = Date.now() - start;
 
-        this._invalidateCache([ id ]);
+        this._invalidateCache([ id ], res.matchedCount > 0 );
 
         const documentAfter = options?.documentAfter ? ( await this.get( id, { as: 'dbe' as any }) as DBE ) || undefined : undefined;
 
-        this._emitMutation( 'update', duration,
+        this._emitMutation( method, duration,
         {
             matchedCount    : res.matchedCount,
             modifiedCount   : res.modifiedCount,
@@ -555,40 +556,42 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
         idsOrFilter: DBE['id'][] | DTO['id'][] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
         findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> | undefined,
         accessFilter?: Filter<any>
-    ): Promise<{ targetIds: Array<DBE['id'] | DTO['id']>, cacheIdsToInvalidate: Array<DBE['id'] | DTO['id']> | null }>
+    ): Promise<{ dbeIds: Array<DBE['id']>, cacheIdsToInvalidate: Array<DBE['id'] | DTO['id'] | string> | null }>
     {
         const hasSubdocAccess = this.#hasEffectiveSubdocAccessFilter( accessFilter );
 
         if( Array.isArray( idsOrFilter ) )
         {
+            const dbeIds = idsOrFilter.map( id => this.dbeID( id ));
+
             if( hasSubdocAccess && idsOrFilter.length > 0 )
             {
-                const dbeIds = idsOrFilter.map( id => this.dbeID( id ));
-                const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: { $in: dbeIds } } as any }, accessFilter );
+                const matchedDbeIds = await this.#findMatchingSubdocIds({ filter: { id: { $in: dbeIds } } as any }, accessFilter );
 
-                return { targetIds: matchedIds, cacheIdsToInvalidate: idsOrFilter };
+                return { dbeIds: matchedDbeIds, cacheIdsToInvalidate: idsOrFilter };
             }
 
-            return { targetIds: idsOrFilter, cacheIdsToInvalidate: idsOrFilter };
+            return { dbeIds, cacheIdsToInvalidate: idsOrFilter };
         }
 
-        const extracted = extractTargetIdsFromFilter( idsOrFilter, 'id', id => String( this.dtoID( id )));
+        const rawExtracted = extractTargetIdsFromFilter( idsOrFilter, 'id', id => id );
+        const extractedCacheIds = rawExtracted.map( id => String( this.dtoID( id )));
         const filterKeys = Object.keys( findOptions!.filter ?? {});
-        const isOnlyIdFilter = Boolean( extracted.length > 0 && !findOptions!.smartFilter && filterKeys.every( k => k === 'id' ));
+        const isOnlyIdFilter = Boolean( rawExtracted.length > 0 && !findOptions!.smartFilter && filterKeys.every( k => k === 'id' ));
 
         if( isOnlyIdFilter && !hasSubdocAccess )
         {
             return {
-                cacheIdsToInvalidate    : extracted,
-                targetIds               : extracted
+                cacheIdsToInvalidate    : extractedCacheIds,
+                dbeIds                  : rawExtracted.map( id => this.dbeID( id ))
             };
         }
 
-        const matchedIds = await this.#findMatchingSubdocIds( findOptions!, accessFilter );
+        const matchedDbeIds = await this.#findMatchingSubdocIds( findOptions!, accessFilter );
 
         return {
-            cacheIdsToInvalidate    : extracted.length > 0 ? extracted : matchedIds,
-            targetIds               : matchedIds
+            cacheIdsToInvalidate    : extractedCacheIds.length > 0 ? extractedCacheIds : matchedDbeIds,
+            dbeIds                  : matchedDbeIds
         };
     }
 
@@ -608,17 +611,18 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 return attachPropertyUpdateMetadata<DBE>({ matchedCount: 0, modifiedCount: 0 });
             }
 
-            const targetIds = extractTargetIdsFromFilter( match, 'id', id => String( this.dtoID( id )));
+            const rawTargetIds = extractTargetIdsFromFilter( match, 'id', id => id );
+            const cacheIds = rawTargetIds.map( id => String( this.dtoID( id )));
             const filterKeys = Object.keys( findOptions.filter ?? {});
             const isDirectSingleId = Boolean(
-                targetIds
-                && targetIds.length === 1
+                rawTargetIds.length === 1
                 && !findOptions.smartFilter
+                && !this.#hasEffectiveSubdocAccessFilter( access.filter )
                 && filterKeys.length === 1
                 && filterKeys[0] === 'id'
             );
 
-            let targetId: DTO['id'] | DBE['id'] | undefined = isDirectSingleId ? targetIds![0] : undefined;
+            let targetId: DTO['id'] | DBE['id'] | undefined = isDirectSingleId ? rawTargetIds[0] : undefined;
 
             if( targetId === undefined )
             {
@@ -628,12 +632,12 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
 
             if( targetId === undefined )
             {
-                if( targetIds && targetIds.length > 0 )
+                if( cacheIds.length > 0 )
                 {
-                    this._invalidateCache( targetIds );
+                    this._invalidateCache( cacheIds, false );
                 }
 
-                this._emitMutation( 'updateOne', 0, { matchedCount: 0, modifiedCount: 0, ids: targetIds ?? undefined });
+                this._emitMutation( 'updateOne', 0, { matchedCount: 0, modifiedCount: 0, ids: cacheIds.length > 0 ? cacheIds : undefined });
 
                 return attachPropertyUpdateMetadata<DBE>({ matchedCount: 0, modifiedCount: 0 });
             }
@@ -643,13 +647,14 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 update,
                 { ...options, access: findOptions.access },
                 access,
-                !isDirectSingleId
+                !isDirectSingleId,
+                'updateOne'
             );
 
             const targetDtoId = String( this.dtoID( targetId ));
-            const extraIds = targetIds?.filter( id => String( id ) !== targetDtoId );
+            const extraIds = cacheIds.filter( id => String( id ) !== targetDtoId );
 
-            if( extraIds && extraIds.length > 0 )
+            if( extraIds.length > 0 )
             {
                 this._invalidateCache( extraIds, false );
             }
@@ -686,13 +691,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
 
-            const { targetIds: targetIdsToUpdate, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds( idsOrFilter, findOptions, access.filter );
+            const { dbeIds, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds( idsOrFilter, findOptions, access.filter );
 
-            if( targetIdsToUpdate.length === 0 )
+            if( dbeIds.length === 0 )
             {
                 if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
                 {
-                    this._invalidateCache( cacheIdsToInvalidate );
+                    this._invalidateCache( cacheIdsToInvalidate, false );
                 }
 
                 this._emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: cacheIdsToInvalidate ?? undefined });
@@ -700,7 +705,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
 
-            const dbeIds = targetIdsToUpdate.map( id => this.dbeID( id ));
             const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, { $in: dbeIds });
             const operations = addPrefixToUpdate<RootDBE, DBE>( update, updatePrefix );
             const updateOptions: UpdateOptions = arrayFilters ? { arrayFilters } : {};
@@ -720,7 +724,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
 
             if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
             {
-                this._invalidateCache( cacheIdsToInvalidate );
+                this._invalidateCache( cacheIdsToInvalidate, res.matchedCount > 0 );
             }
 
             this._emitMutation( 'updateMany', Date.now() - start,
@@ -1044,8 +1048,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
         return super.exists( idOrFilter, options );
     }
 
-    protected override async accessFilter( _name: string ): Promise<AccessFilterResult<PropertyModelFilter<RootDBE, DBE>>> {}
-
     public override async resolveSmartFilter( smartFilter: Record<string, any> )
     {
         return super.resolveSmartFilter( smartFilter );
@@ -1067,13 +1069,15 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 return false;
             }
 
+            const dbeId = this.dbeID( id );
+
             if( this.#hasEffectiveSubdocAccessFilter( access.filter ) )
             {
-                const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: this.dbeID( id ) } as any, access: options?.access }, access.filter, 1 );
+                const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: dbeId } as any, access: options?.access }, access.filter, 1 );
 
                 if( matchedIds.length === 0 )
                 {
-                    this._invalidateCache([ id ]);
+                    this._invalidateCache([ id ], false );
                     this._emitMutation( 'delete', 0,
                     {
                         matchedCount    : 0,
@@ -1087,7 +1091,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
             }
 
             const path = `${this.#prefix}.id`;
-            const dbeId = this.dbeID( id );
             const match: Filter<RootDBE> = access.filter
                 ? { $and: [{ [path]: dbeId }, addPrefixToFilter( access.filter as any, this.#prefix ) ] } as any
                 : { [path]: dbeId } as Filter<RootDBE>;
@@ -1101,7 +1104,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 resolveBSONObject( updateOptions )
             );
 
-            this._invalidateCache([ id ]);
+            this._invalidateCache([ id ], res.modifiedCount > 0 );
             this._emitMutation( 'delete', Date.now() - start,
             {
                 matchedCount    : res.matchedCount,
@@ -1132,13 +1135,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 return 0;
             }
 
-            const { targetIds: targetIdsToDelete, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds( idsOrFilter, findOptions, access.filter );
+            const { dbeIds, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds( idsOrFilter, findOptions, access.filter );
 
-            if( targetIdsToDelete.length === 0 )
+            if( dbeIds.length === 0 )
             {
                 if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
                 {
-                    this._invalidateCache( cacheIdsToInvalidate );
+                    this._invalidateCache( cacheIdsToInvalidate, false );
                 }
 
                 this._emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: cacheIdsToInvalidate ?? undefined });
@@ -1147,7 +1150,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
             }
 
             const path = `${this.#prefix}.id`;
-            const dbeIds = targetIdsToDelete.map( id => this.dbeID( id ));
             const match: Filter<RootDBE> = access.filter
                 ? { $and: [{ [path]: { $in: dbeIds } }, addPrefixToFilter( access.filter as any, this.#prefix ) ] } as any
                 : { [path]: { $in: dbeIds } } as Filter<RootDBE>;
@@ -1163,7 +1165,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
 
             if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
             {
-                this._invalidateCache( cacheIdsToInvalidate );
+                this._invalidateCache( cacheIdsToInvalidate, res.modifiedCount > 0 );
             }
 
             this._emitMutation( 'deleteMany', Date.now() - start,

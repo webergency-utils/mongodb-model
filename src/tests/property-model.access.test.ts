@@ -162,5 +162,60 @@ describe( 'AbstractPropertyModel named access', () =>
         const deleteRes = await model.delete( 'subBob' );
         expect( deleteRes ).toBe( false );
         expect( updateOne ).not.toHaveBeenCalled();
+
+        const updateOneRes = await model.updateOne({ id: 'subBob' }, { label: 'hacked' });
+        expect( updateOneRes.matchedCount ).toBe( 0 );
+        expect( updateOneRes.modifiedCount ).toBe( 0 );
+        expect( updateOne ).not.toHaveBeenCalled();
+    });
+
+    test( 'updateMany and deleteMany apply dbeID conversion exactly once when subdocument accessFilter is active', async() =>
+    {
+        const aggregate = vi.fn(() => ({ toArray: async() => [{ id: 'db:sub1' }] }));
+        const updateMany = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+
+        class CustomIdItemModel extends AbstractPropertyModel<RootDBE, ItemDBE, ItemDTO, any>
+        {
+            constructor( models: AbstractModels, collection: any )
+            {
+                super( models, collection, 'items[]',
+                {
+                    converters:
+                    {
+                        dto : { converter: ( dbe: ItemDBE ) => ({ id: this.dtoID( dbe.id ), orgId: dbe.orgId, label: dbe.label }) },
+                        dbe : { converter: ( dbe: ItemDBE ) => dbe }
+                    },
+                    access:
+                    {
+                        filters  : { aliceOnly: async() => ({ orgId: 'alice' }) },
+                        defaults : { update: 'aliceOnly', delete: 'aliceOnly' }
+                    }
+                });
+            }
+
+            public override dbeID( id: string ): string
+            {
+                return id.startsWith( 'db:' ) ? `DOUBLE:${id}` : `db:${id}`;
+            }
+
+            public override dtoID( dbeID: string ): string
+            {
+                return dbeID.replace( /^db:/, '' );
+            }
+        }
+
+        const models = new TestModels();
+        const model = new CustomIdItemModel( models, { collectionName: 'roots', aggregate, updateMany });
+
+        await model.updateMany([ 'sub1' ], { label: 'updated' });
+        expect( updateMany ).toHaveBeenCalledWith(
+            expect.objectContaining({
+                $and: expect.arrayContaining([
+                    { 'items.id': { $in: [ 'db:sub1' ] } }
+                ])
+            }),
+            expect.anything(),
+            expect.anything()
+        );
     });
 });

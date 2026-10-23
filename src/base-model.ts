@@ -101,7 +101,8 @@ export abstract class AbstractBaseModel
     DBE extends Document,
     DTO extends Document,
     Extensions extends { converters: AbstractModelConverters<DBE>, smartFilters?: any, computedProperties?: any },
-    CollectionDoc extends MongoRootDocument = DBE & MongoRootDocument
+    CollectionDoc extends MongoRootDocument = DBE & MongoRootDocument,
+    AccessFilterDoc = DBE
 >
 {
     protected _models: AbstractModels;
@@ -151,8 +152,7 @@ export abstract class AbstractBaseModel
             try
             {
                 const dtoIds = ids.map( id => this.dtoID( id ));
-                const normalizedIds = this._idField === 'id' ? dtoIds : ids;
-                const dbeIds = normalizedIds.map( id => this.dbeID( id ));
+                const dbeIds = ids.map( id => this.dbeID( id ));
 
                 let pipeline = await this.pipeline(
                 {
@@ -164,10 +164,7 @@ export abstract class AbstractBaseModel
 
                 pipeline = this._optimizePipeline( pipeline );
 
-                if( this._idField === '_id' )
-                {
-                    flowGet( 'log' ) && DUMP( pipeline );
-                }
+                flowGet( 'log' ) && DUMP( pipeline );
 
                 const start = Date.now();
                 const documents = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as DBE[];
@@ -200,7 +197,7 @@ export abstract class AbstractBaseModel
 
                 throw new ModelError( 'MODEL_GET_ERROR', this, e?.toString?.() ?? String( e ), e );
             }
-        });
+        }, { normalizeID: ( id: any ) => String( this.dtoID( id )) });
 
         models[REGISTER_MODEL]( this as any, collection.collectionName, this._prefix );
     }
@@ -360,12 +357,14 @@ export abstract class AbstractBaseModel
 
     protected _invalidateCache( ids: Array<any>, notifySiblings: boolean = true ): void
     {
+        if( !ids.length ){ return }
+
         if( notifySiblings )
         {
             this._notifySiblingCacheInvalidation();
         }
 
-        if( !this._cache || !ids.length ){ return }
+        if( !this._cache ){ return }
 
         const normalizedIds = ids.map( id => String( this.dtoID( id )));
         const evicted = this._cache.invalidateIds( normalizedIds );
@@ -641,24 +640,22 @@ export abstract class AbstractBaseModel
     {
         return this.runOperation( async() =>
         {
-            const access = this._idField === '_id'
-                ? await this._access.resolveOrDeny({ operation: 'read', method: 'find', access: options.access })
-                : undefined;
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'find', access: options.access });
 
-            if( access?.denied ){ return null }
+            if( access.denied ){ return null }
 
             const { projection } = this.converters[conversion];
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':find(' + String( conversion ) + ')' ) : undefined;
 
             let pipeline = await this.pipeline(
             {
-                filter      : options.filter,
-                smartFilter : options.smartFilter,
+                filter              : options.filter,
+                smartFilter         : options.smartFilter,
                 projection,
                 sort,
-                limit       : 1,
-                access      : options.access,
-                ...( access ? { [RESOLVED_ACCESS]: access } : {})
+                limit               : 1,
+                access              : options.access,
+                [RESOLVED_ACCESS]   : access
             }, conversion, 'find' );
 
             pipeline = this._optimizePipeline( pipeline );
@@ -699,28 +696,25 @@ export abstract class AbstractBaseModel
     {
         return this.runOperation( async() =>
         {
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'aggregate', access: options?.access });
+
+            if( access.denied ){ return [] }
+
             let aggregationPipeline: Document[];
 
             if( isSet( options ))
             {
-                aggregationPipeline = [ ...await this.pipeline( options!, 'dbe' as any, 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+                aggregationPipeline = [ ...await this.pipeline({ ...options!, [RESOLVED_ACCESS]: access }, 'dbe' as any, 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+            }
+            else if( this._idField === '_id' )
+            {
+                aggregationPipeline = access.filter
+                    ? [{ $match: access.filter }, ...( resolveBSONObject( pipeline ) as Document[] )]
+                    : resolveBSONObject( pipeline ) as Document[];
             }
             else
             {
-                const access = await this._access.resolveOrDeny({ operation: 'read', method: 'aggregate' });
-
-                if( access.denied ){ return [] }
-
-                if( this._idField === '_id' )
-                {
-                    aggregationPipeline = access.filter
-                        ? [{ $match: access.filter }, ...( resolveBSONObject( pipeline ) as Document[] )]
-                        : resolveBSONObject( pipeline ) as Document[];
-                }
-                else
-                {
-                    aggregationPipeline = [ ...await this.pipeline({ [RESOLVED_ACCESS]: access }, 'dbe' as any, 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
-                }
+                aggregationPipeline = [ ...await this.pipeline({ [RESOLVED_ACCESS]: access }, 'dbe' as any, 'aggregate' ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
             }
 
             aggregationPipeline = this._optimizePipeline( aggregationPipeline );
@@ -734,7 +728,7 @@ export abstract class AbstractBaseModel
             LOG_FILE( `Collection: ${this._collectionLabel}` );
             LOG_FILE( `TIME: ${duration} ms` );
             LOG_FILE( aggregationPipeline, true );
-            this._emitQuery( 'aggregate', aggregationPipeline, duration, this._idField === '_id' ? { resultCount: res.length } : undefined );
+            this._emitQuery( 'aggregate', aggregationPipeline, duration, { resultCount: res.length });
 
             return res;
         });
@@ -802,7 +796,7 @@ export abstract class AbstractBaseModel
         });
     }
 
-    protected async accessFilter( _name: string ): Promise<AccessFilterResult<any>> {}
+    protected async accessFilter( _name: string ): Promise<AccessFilterResult<AccessFilterDoc>> {}
 
     public async resolveSmartFilter( smartFilter: Record<string, any> ): Promise<any>
     {

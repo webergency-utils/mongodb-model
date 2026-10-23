@@ -64,6 +64,7 @@ export class AbstractModels
     #closed = false;
     #shutdownPromise?: Promise<void>;
     #models = new Map<string, ModelInstance>();
+    #collectionModels = new Map<string, Set<ModelInstance>>();
     #optimizer: OptimizerConfig = true;
     #observability?: ObservabilityConfig;
     #events = new ModelEventEmitter();
@@ -202,21 +203,32 @@ export class AbstractModels
     [REGISTER_MODEL]( instance: ModelInstance, collection: string, path?: string )
     {
         this.#models.set( collection + ( path ? '.' + path : '' ), instance );
+
+        let set = this.#collectionModels.get( collection );
+
+        if( !set )
+        {
+            set = new Set();
+            this.#collectionModels.set( collection, set );
+        }
+
+        set.add( instance );
     }
 
     [INVALIDATE_COLLECTION_CACHE]( source: ModelInstance, collection: string ): void
     {
-        for( const [ key, instance ] of this.#models.entries() )
+        const set = this.#collectionModels.get( collection );
+
+        if( !set ){ return }
+
+        for( const instance of set )
         {
             if( instance === source )
             {
                 continue;
             }
 
-            if( key === collection || key.startsWith( collection + '.' ) )
-            {
-                instance[CLEAR_LOCAL_CACHE]?.();
-            }
+            instance[CLEAR_LOCAL_CACHE]?.();
         }
     }
 

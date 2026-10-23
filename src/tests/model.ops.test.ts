@@ -311,4 +311,32 @@ describe( 'AbstractModel remaining ops', () =>
             documentAfter   : { _id: '1', name: 'after' }
         });
     });
+
+    test( 'updateOne with documentBefore and documentAfter does not mutate when findOne returns null and constrains findOneAndUpdate to beforeDoc._id', async() =>
+    {
+        const findOne = vi.fn( async() => null );
+        const findOneAndUpdate = vi.fn( async() => ({ _id: '2', name: 'after' }));
+        const model = makeModel({ collectionName: 'users', findOne, findOneAndUpdate, aggregate: vi.fn() });
+
+        const resMiss = await model.updateOne({ name: 'missing' }, { name: 'after' }, { documentBefore: true, documentAfter: true });
+
+        expect( resMiss ).toEqual(
+        {
+            matchedCount    : 0,
+            modifiedCount   : 0,
+            documentBefore  : undefined,
+            documentAfter   : undefined
+        });
+        expect( findOneAndUpdate ).not.toHaveBeenCalled();
+
+        findOne.mockResolvedValueOnce({ _id: 'exact-id', name: 'before' } as any );
+        const resHit = await model.updateOne({ name: 'before' }, { name: 'after' }, { documentBefore: true, documentAfter: true });
+
+        expect( findOneAndUpdate ).toHaveBeenCalledWith(
+            { $and: [{ name: 'before' }, { _id: 'exact-id' }] },
+            { $set: { name: 'after' } },
+            expect.objectContaining({ returnDocument: 'after' })
+        );
+        expect( resHit.matchedCount ).toBe( 1 );
+    });
 });

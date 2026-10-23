@@ -196,4 +196,11 @@ describe( 'mongo helper coverage gaps', () =>
             { path: 'c', array: false }
         ])).toEqual([ 'a', 'b.c' ]);
     });
+
+    test( 'optimizeMatch preserves operator subdocument with undefined operand instead of collapsing to empty filter', () =>
+    {
+        const res = optimizeMatch({ id: { $eq: undefined } } as any );
+
+        expect( Object.keys( res )).toEqual([ 'id' ]);
+    });
 });
