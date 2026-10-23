@@ -357,7 +357,7 @@ describe( 'v2 Parity, Observability, Cache & 2-Level Nested Array Integration (A
         expect( adminDto?.name ).toBe( 'First' );
     });
 
-    test( 'AE4: ID-scoped cache invalidation evicts only targeted IDs and preserves cache on non-ID filter updates', async() =>
+    test( 'AE4: ID-scoped cache invalidation evicts targeted IDs and clears cache on non-ID filter updates that mutate documents', async() =>
     {
         await models.projects.deleteMany({});
         const [ id1, id2 ] = await models.projects.createMany(
@@ -404,13 +404,21 @@ describe( 'v2 Parity, Observability, Cache & 2-Level Nested Array Integration (A
             expect( dbe1AfterIdUpdate?.name ).toBe( 'CachedOneUpdated' );
             expect( cacheEvents.filter( e => e.op === 'miss' )).toHaveLength( 2 );
 
-            // Non-ID updateOne preserves cached entries for both id1 and id2
-            await models.projects.updateOne({ status: 'pending' }, { status: 'active' });
+            // Non-ID updateOne that affects 0 documents preserves cached entries
+            await models.projects.updateOne({ status: 'nonexistent' }, { status: 'active' });
 
             cacheEvents.length = 0;
             await models.projects.get( id1, 'dto' );
             await models.projects.get( id2, 'dto' );
             expect( cacheEvents.filter( e => e.op === 'hit' )).toHaveLength( 2 );
+
+            // Non-ID updateOne that modifies documents clears cache to prevent stale reads
+            await models.projects.updateOne({ status: 'pending' }, { status: 'active' });
+
+            cacheEvents.length = 0;
+            await models.projects.get( id1, 'dto' );
+            await models.projects.get( id2, 'dto' );
+            expect( cacheEvents.filter( e => e.op === 'miss' )).toHaveLength( 2 );
         }
         finally
         {

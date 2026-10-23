@@ -80,10 +80,12 @@ See `example/` for a full domain (organizations → jobs → embedded applicatio
 
 ## Architecture & Internals
 
-- **Registry:** `AbstractModels` owns the shared `MongoClient`, Flow `scope`, transactions, and `shutdown()`.
-- **Root models:** `AbstractModel` / `defineModel` / `Model` — document CRUD, `list`/`stream`/`find`/`aggregate`/`count`, converter recipes, smart filters, computed properties, named access.
-- **Property models:** `AbstractPropertyModel` / `definePropertyModel` / `PropertyModel` — embedded array/object paths (e.g. `applications[]`) with the same read/write surface.
-- **Access:** Named policies in `access.filters`; `defaults` picks a policy from operation + Flow auth.
+- **Registry:** `AbstractModels` owns the shared `MongoClient`, Flow `scope`, transactions, collection-wide cache invalidation, and `shutdown()`.
+- **Shared Base Model:** `AbstractBaseModel` is the shared superclass of `AbstractModel` and `AbstractPropertyModel`, owning collaborator state, lifecycle tracking, `ModelCache`, observability emitters (`on` / `off`), `Aggregator` batching, and read methods (`get`, `getMany`, `find`, `aggregate`, `count`, `exists`).
+- **Root models:** `AbstractModel` / `defineModel` / `Model` — document CRUD (`create`, `createFrom`, `createMany`, `update`, `updateOne`, `updateMany`, `delete`, `deleteMany`), `list`/`stream`/`find`/`aggregate`/`count`/`exists`, converter recipes, smart filters, computed properties, named access.
+- **Property models:** `AbstractPropertyModel` / `definePropertyModel` / `PropertyModel` — embedded array/object paths (e.g. `applications[]`) with the same read/write surface (`create(parentID, ...)`, `createFrom(parentID, ...)`, `createMany(parentID, ...)`, `update`, `updateOne`, `updateMany`, `delete`, `deleteMany`).
+- **Access:** Named policies in `access.filters`; `defaults` picks a policy from operation + Flow auth. Subdocument ID mutations verify subdocument predicates via pipeline before mutating.
+- **Caching:** Built-in `ModelCache` (`cache: true | ModelCacheOptions | ModelCacheInstance`) caches `get` / `getMany` results per conversion and access scope, automatically invalidating on ID mutations, clearing on filter mutations, and invalidating sibling models registered on the same collection.
 - **Pagination:** Opaque cursors from `list` (`next:` / `prev:`); `stream` yields one converted document at a time.
 - **Dual ObjectId installs:** BSON resolve / update / access / cursor paths coerce foreign ObjectId-like values.
 
@@ -110,24 +112,42 @@ Registry for models sharing one Mongo client.
 - **`shutdown({ timeout? })`** — wait for in-flight ops (optional timeout), then close the client.
 - **`assertOpen()` / `trackOperation()`** — used by models during queries.
 
+### `AbstractBaseModel`
+
+Shared superclass extended by both `AbstractModel` and `AbstractPropertyModel`. Exported so consumers can write helpers that accept either a root model or a subdocument property model.
+
+- **Reads:** `get(idOrIds, options?)`, `getMany(ids, options?)`, `find(options, conversion?, sort?)`, `aggregate(pipeline, options?)`, `count(pipelineOrOptions?, options?)`, `exists(idOrFilter?, options?)`
+- **IDs:** `dbeID(id)`, `dtoID(id)`
+- **Events:** `on(event, handler)`, `off(event, handler)` for `'query' | 'mutation' | 'slowQuery' | 'cache' | 'error'`
+- **Resolvers:** `resolveSmartFilter(smartFilter)`, `resolveComputedProperties(properties)`
+
 ### `AbstractModel` / `defineModel` / `Model`
 
-Root collection model.
+Root collection model (extends `AbstractBaseModel`).
 
-- **Reads:** `get`, `getMany`, `find`, `list`, `stream`, `aggregate`, `count`
-- **Writes:** `create`, `update`, `updateMany`, `delete` (`createFrom` / `updateOne` are hooks subclasses may override)
-- **Extensions:** `converters`, `smartFilters`, `computedProperties`, `access`
+- **Reads:** `get`, `getMany`, `find`, `list`, `stream`, `aggregate`, `count`, `exists`
+- **Writes:** `create`, `createFrom`, `createMany`, `update`, `updateOne`, `updateMany`, `delete`, `deleteMany`
+- **Extensions:** `converters`, `smartFilters`, `computedProperties`, `access`, `cache`, `optimizer`, `observability`
 - **IDs:** override `dbeID` / `dtoID` when ids are not raw ObjectIds
-- **Events:** `on('query' | 'error', handler)` / `off`
+- **Events:** `on('query' | 'mutation' | 'slowQuery' | 'cache' | 'error', handler)` / `off`
 
 `list` returns `{ items, total?, cursors: { next?, prev? } }`. Pass `cursor: \`next:${token}\`` (same `sort`) for the next page.
 
 ### `AbstractPropertyModel` / `definePropertyModel` / `PropertyModel`
 
-Embedded-document model (`path` like `applications[]`).
+Embedded-document model (`path` like `applications[]`, extends `AbstractBaseModel`).
 
-- Same read surface as root models; `create(parentID, dbe)` / `update` / `updateMany` target the embedded path.
-- Access filters may use `_root` to constrain the parent document.
+- **Reads:** `get`, `getMany`, `find`, `list`, `stream`, `aggregate`, `count`, `exists`
+- **Writes:** `create(parentID, dbe, id?, options?)`, `createFrom(parentID, data, fromKeyOrId?, idOrOptions?, options?)`, `createMany(parentID, items, idsOrOptions?, options?)`, `update(id, update, options?)`, `updateOne(match, update, options?)`, `updateMany(idsOrFilter, update, options?)`, `delete(id, options?)`, `deleteMany(idsOrFilter, options?)`
+- Access filters may use `_root` to constrain the parent document, and subdocument-level access filters are verified before ID updates/deletes.
+
+### `ModelCache`
+
+In-memory TTL/LRU cache (`cache: true | ModelCacheOptions | ModelCacheInstance`):
+
+- **Options:** `{ ttl?: number, maxTTL?: number, sliding?: boolean, maxSize?: number, clone?: boolean }`
+- Automatically caches `get` / `getMany` responses by conversion and access filter hash.
+- Automatically invalidates affected IDs on `update`, `updateOne`, `updateMany`, `delete`, and `deleteMany`, clears on non-ID filter mutations, and invalidates sibling models registered on the same collection in `AbstractModels`.
 
 ### Converters
 
