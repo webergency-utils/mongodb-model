@@ -459,10 +459,11 @@ describe( 'Unit U6: Symmetric Root & Property Mutations, Cache Invalidation & Bu
         );
     });
 
-    test( 'AE4: updateOne, updateMany, and deleteMany perform ID-scoped cache invalidation and preserve cache on non-ID filters', async() =>
+    test( 'AE3: updateOne, updateMany, and deleteMany perform ID-scoped cache invalidation or clear cache on non-ID filters, and invalidate sibling models on the same collection (R8, R9)', async() =>
     {
         const id1 = new ObjectId();
         const id2 = new ObjectId();
+        const stageId = new ObjectId();
         const dbDocs = new Map<string, UserDBE>(
         [
             [ id1.toString(), { _id: id1, name: 'Alice', status: 'draft' }],
@@ -483,12 +484,13 @@ describe( 'Unit U6: Symmetric Root & Property Mutations, Cache Invalidation & Bu
         const updateMany = vi.fn( async() => ({ matchedCount: 2, modifiedCount: 2 }));
         const deleteMany = vi.fn( async() => ({ deletedCount: 1 }));
         const collection = { collectionName: 'users', aggregate, updateOne, updateMany, deleteMany };
+        const sharedModels = new TestModels();
 
         class CachedUserModel extends AbstractModel<UserDBE, UserDTO, any>
         {
             constructor()
             {
-                super( new TestModels(), collection as any,
+                super( sharedModels, collection as any,
                 {
                     cache: true,
                     converters:
@@ -500,50 +502,78 @@ describe( 'Unit U6: Symmetric Root & Property Mutations, Cache Invalidation & Bu
             }
         }
 
+        const stageAggregate = vi.fn(() => ({ toArray: async() => [{ id: stageId, title: 'Stage 1' }] }));
+        const stageCollection = { collectionName: 'users', aggregate: stageAggregate, updateOne };
+
+        class CachedStageModel extends AbstractPropertyModel<UserDBE, StageDBE, StageDTO, any>
+        {
+            constructor()
+            {
+                super( sharedModels, stageCollection as any, 'stages[]',
+                {
+                    cache: true,
+                    converters:
+                    {
+                        dto : { converter: dbe => ({ id: this.dtoID( dbe.id ), title: dbe.title }) },
+                        dbe : { converter: dbe => dbe }
+                    }
+                });
+            }
+        }
+
         const users = new CachedUserModel();
+        const stages = new CachedStageModel();
 
-        // Populate cache for id1 ('dto' and 'dbe') and id2 ('dto')
+        // Populate cache for id1 ('dto' and 'dbe'), id2 ('dto'), and sibling stageId
         await users.get( id1, 'dto' );
         await users.get( id1, 'dbe' );
         await users.get( id2, 'dto' );
+        await stages.get( stageId, 'dto' );
         expect( aggregate ).toHaveBeenCalledTimes( 3 );
+        expect( stageAggregate ).toHaveBeenCalledTimes( 1 );
 
-        // Verify all 3 are cached
+        // Verify all are cached
         await users.get( id1, 'dto' );
         await users.get( id1, 'dbe' );
         await users.get( id2, 'dto' );
+        await stages.get( stageId, 'dto' );
         expect( aggregate ).toHaveBeenCalledTimes( 3 );
+        expect( stageAggregate ).toHaveBeenCalledTimes( 1 );
 
-        // 1. ID-based updateOne({ _id: id1 }) evicts both 'dto' and 'dbe' variants for id1, keeps id2
+        // 1. ID-based updateOne({ _id: id1 }) evicts both 'dto' and 'dbe' variants for id1, keeps id2, AND clears sibling stage cache
         await users.updateOne({ _id: id1 }, { name: 'Alice Updated' });
         await users.get( id2, 'dto' );
-        expect( aggregate ).toHaveBeenCalledTimes( 3 ); // id2 still cached!
+        expect( aggregate ).toHaveBeenCalledTimes( 3 ); // id2 still cached on users!
+
+        await stages.get( stageId, 'dto' );
+        expect( stageAggregate ).toHaveBeenCalledTimes( 2 ); // sibling stage cache was cleared!
 
         await users.get( id1, 'dto' );
         await users.get( id1, 'dbe' );
         expect( aggregate ).toHaveBeenCalledTimes( 5 ); // both id1 variants refetched!
 
-        // 2. Non-ID updateOne({ status: 'draft' }) keeps both id1 and id2 in cache
-        await users.updateOne({ status: 'draft' }, { status: 'published' });
-        await users.get( id1, 'dto' );
-        await users.get( id2, 'dto' );
-        expect( aggregate ).toHaveBeenCalledTimes( 5 );
-
-        // 3. Non-ID updateMany({ status: 'published' }) keeps cache
+        // 2. Non-ID updateMany({ status: 'published' }) clears users cache when matchedCount > 0
         await users.updateMany({ status: 'published' }, { status: 'archived' });
         await users.get( id1, 'dto' );
         await users.get( id2, 'dto' );
-        expect( aggregate ).toHaveBeenCalledTimes( 5 );
+        expect( aggregate ).toHaveBeenCalledTimes( 7 );
+
+        // 3. Sibling PropertyModel mutation clears root model cache
+        await stages.update( stageId, { title: 'Stage 1 Updated' });
+        await users.get( id1, 'dto' );
+        expect( aggregate ).toHaveBeenCalledTimes( 8 );
 
         // 4. ID-filtered deleteMany({ _id: { $in: [id1] } }) evicts id1, keeps id2
+        await users.get( id2, 'dto' ); // populate id2
+        const callsBeforeDelete = aggregate.mock.calls.length;
         const deleted = await users.deleteMany({ _id: { $in: [ id1 ] } });
 
         expect( deleted ).toBe( 1 );
         await users.get( id2, 'dto' );
-        expect( aggregate ).toHaveBeenCalledTimes( 5 ); // id2 still cached!
+        expect( aggregate ).toHaveBeenCalledTimes( callsBeforeDelete ); // id2 still cached!
 
         await users.get( id1, 'dto' );
-        expect( aggregate ).toHaveBeenCalledTimes( 6 ); // id1 was evicted!
+        expect( aggregate ).toHaveBeenCalledTimes( callsBeforeDelete + 1 ); // id1 was evicted!
     });
 
     test( 'PropertyModel.updateOne, updateMany(filter), and deleteMany(idsOrFilter) work with ID-scoped cache invalidation', async() =>

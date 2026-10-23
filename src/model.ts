@@ -36,8 +36,6 @@ from './operations.js';
 import { RESOLVED_ACCESS } from './symbols.js';
 import
 {
-    AbstractModelProperties,
-    AbstractModelSmartFilters,
     AccessFilterResult,
     ExtractComputedProperties,
     ExtractSmartFilters,
@@ -66,7 +64,7 @@ export abstract class AbstractModel
 <
     DBE extends MongoRootDocument,
     DTO extends Document,
-    Extensions extends ModelExtensions<DBE, AbstractModelSmartFilters<ExtractSmartFilters<Extensions>>, AbstractModelProperties<ExtractComputedProperties<Extensions>>>
+    Extensions extends ModelExtensions<DBE, any, any> = ModelExtensions<DBE, any, any>
 >
 extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 {
@@ -152,6 +150,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             try
             {
                 await this.collection.insertOne( resolveBSONObject({ ...dbe, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE> );
+                this._notifySiblingCacheInvalidation();
                 this._emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
             }
             catch( e: any )
@@ -259,6 +258,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             try
             {
                 await this.collection.insertMany( docs );
+                this._notifySiblingCacheInvalidation();
                 this._emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
 
                 return ids;
@@ -478,6 +478,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._invalidateCache( targetIds );
             }
+            else if( res.matchedCount > 0 || res.modifiedCount > 0 )
+            {
+                this._clearCache();
+            }
 
             this._emitMutation( 'updateMany', Date.now() - start,
             {
@@ -543,11 +547,17 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 const document = ( result as DBE | null ) || undefined;
                 const matchedCount = document ? 1 : 0;
                 const modifiedCount = document ? 1 : 0;
-                const idsToEvict = targetIds ?? ( document?._id !== undefined ? [ String( this.dtoID( document._id )) ] : null );
+                const idsToEvict = targetIds && targetIds.length > 0
+                    ? targetIds
+                    : ( document?._id !== undefined ? [ String( this.dtoID( document._id )) ] : null );
 
                 if( idsToEvict && idsToEvict.length > 0 )
                 {
                     this._invalidateCache( idsToEvict );
+                }
+                else if( matchedCount > 0 || modifiedCount > 0 )
+                {
+                    this._clearCache();
                 }
 
                 this._emitMutation( 'updateOne', Date.now() - start,
@@ -573,6 +583,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             if( targetIds && targetIds.length > 0 )
             {
                 this._invalidateCache( targetIds );
+            }
+            else if( res.matchedCount > 0 || res.modifiedCount > 0 )
+            {
+                this._clearCache();
             }
 
             this._emitMutation( 'updateOne', Date.now() - start,
@@ -1022,6 +1036,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             if( targetIds && targetIds.length > 0 )
             {
                 this._invalidateCache( targetIds );
+            }
+            else if( res.deletedCount > 0 )
+            {
+                this._clearCache();
             }
 
             this._emitMutation( 'deleteMany', Date.now() - start,

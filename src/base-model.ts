@@ -71,6 +71,7 @@ import
     GetManyOptions,
     GetOptions,
     ModelAccessConfig,
+    MongoRootDocument,
     OptimizerConfig,
     OptimizerOptions
 }
@@ -100,7 +101,7 @@ export abstract class AbstractBaseModel
     DBE extends Document,
     DTO extends Document,
     Extensions extends { converters: AbstractModelConverters<DBE>, smartFilters?: any, computedProperties?: any },
-    CollectionDoc extends Document = DBE
+    CollectionDoc extends MongoRootDocument = DBE & MongoRootDocument
 >
 {
     protected _models: AbstractModels;
@@ -351,11 +352,19 @@ export abstract class AbstractBaseModel
         this._emitCache( 'invalidate' );
     }
 
-    protected _invalidateCache( ids: Array<any>, notifySiblings: boolean = true ): void
+    protected _notifySiblingCacheInvalidation(): void
     {
-        if( notifySiblings && typeof ( this._models as any )[INVALIDATE_COLLECTION_CACHE] === 'function' )
+        if( typeof ( this._models as any )[INVALIDATE_COLLECTION_CACHE] === 'function' )
         {
             ( this._models as any )[INVALIDATE_COLLECTION_CACHE]( this, this.collection.collectionName );
+        }
+    }
+
+    protected _invalidateCache( ids: Array<any>, notifySiblings: boolean = true ): void
+    {
+        if( notifySiblings )
+        {
+            this._notifySiblingCacheInvalidation();
         }
 
         if( !this._cache || !ids.length ){ return }
@@ -371,9 +380,9 @@ export abstract class AbstractBaseModel
 
     protected _clearCache( notifySiblings: boolean = true ): void
     {
-        if( notifySiblings && typeof ( this._models as any )[INVALIDATE_COLLECTION_CACHE] === 'function' )
+        if( notifySiblings )
         {
-            ( this._models as any )[INVALIDATE_COLLECTION_CACHE]( this, this.collection.collectionName );
+            this._notifySiblingCacheInvalidation();
         }
 
         this[CLEAR_LOCAL_CACHE]();
@@ -490,7 +499,7 @@ export abstract class AbstractBaseModel
                 Arr( idOrIds ),
                 conversion,
                 { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-            ) as Array<DBE | null>;
+            ) as unknown as Array<DBE | null>;
 
             benchmark?.step( 'QUERY' );
 
@@ -580,7 +589,7 @@ export abstract class AbstractBaseModel
                         missing.map( m => m.id ),
                         conversion,
                         { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-                    ) as Array<DBE | null>;
+                    ) as unknown as Array<DBE | null>;
 
                     benchmark?.step( 'QUERY' );
 
@@ -610,7 +619,7 @@ export abstract class AbstractBaseModel
                 ids,
                 conversion,
                 { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-            ) as Array<DBE | null>;
+            ) as unknown as Array<DBE | null>;
 
             benchmark?.step( 'QUERY' );
 

@@ -176,4 +176,36 @@ describe( 'Model factory', () =>
         expect(( disabled as any )[GET_OPTIMIZER_OPTIONS]()).toBeUndefined();
         expect(( enabled as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({});
     });
+
+    test( 'isolates dtoIDRef and extensions across multiple instances of the same Model factory class (R13)', async() =>
+    {
+        class BaseSkillModel extends Model<SkillDBE, SkillDTO>() {}
+
+        class InstanceOne extends BaseSkillModel
+        {
+            public override dtoID( id: string )
+            {
+                return `one:${id}`;
+            }
+        }
+
+        class InstanceTwo extends BaseSkillModel
+        {
+            public override dtoID( id: string )
+            {
+                return `two:${id}`;
+            }
+        }
+
+        const models = new TestModels();
+        const collection = { collectionName: 'skills', aggregate: vi.fn() } as any;
+        const m1 = new InstanceOne( models, collection );
+        const m2 = new InstanceTwo( models, collection );
+
+        const dto1 = await m1.converters.dto.converter({ _id: '1', name: 'TS' });
+        const dto2 = await m2.converters.dto.converter({ _id: '1', name: 'TS' });
+
+        expect( dto1 ).toEqual({ id: 'one:1', name: 'TS' });
+        expect( dto2 ).toEqual({ id: 'two:1', name: 'TS' });
+    });
 });

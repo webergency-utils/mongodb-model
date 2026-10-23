@@ -14,10 +14,12 @@ from './events.js';
 import { flowExecute, flowGet, flowSet, flowStart } from './flow.js';
 import
 {
+    CLEAR_LOCAL_CACHE,
     EMIT_OBSERVABILITY_EVENT,
     GET_OBSERVABILITY_OPTIONS,
     GET_OPTIMIZER_OPTIONS,
     GET_PARENT,
+    INVALIDATE_COLLECTION_CACHE,
     REGISTER_MODEL
 }
 from './symbols.js';
@@ -201,6 +203,25 @@ export class AbstractModels
     [REGISTER_MODEL]( instance: ModelInstance, collection: string, path?: string )
     {
         this.#models.set( collection + ( path ? '.' + path : '' ), instance );
+    }
+
+    [INVALIDATE_COLLECTION_CACHE]( source: ModelInstance, collection: string ): void
+    {
+        for( const [ key, instance ] of this.#models.entries() )
+        {
+            if( instance === source )
+            {
+                continue;
+            }
+
+            if( key === collection || key.startsWith( collection + '.' ) )
+            {
+                if( typeof ( instance as any )[CLEAR_LOCAL_CACHE] === 'function' )
+                {
+                    ( instance as any )[CLEAR_LOCAL_CACHE]();
+                }
+            }
+        }
     }
 
     [GET_PARENT]( collection: string, path: string ): ModelInstance | undefined

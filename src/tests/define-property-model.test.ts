@@ -210,4 +210,40 @@ describe( 'PropertyModel factory', () =>
         expect(( applicationsOverride as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: true, strictFieldOrder: true });
         expect(( notes as any )[GET_OPTIMIZER_OPTIONS]()).toEqual({ strictErrors: true, strictFieldOrder: true });
     });
+
+    test( 'isolates dtoIDRef and extensions across multiple instances of the same PropertyModel factory class (R13)', async() =>
+    {
+        class BaseAppModel extends PropertyModel<JobDBE, ApplicationDBE, ApplicationDTO>(
+        {
+            path: 'engagements[].applications[]'
+        })
+        {}
+
+        class AppOne extends BaseAppModel
+        {
+            public override dtoID( id: string )
+            {
+                return `one:${id}`;
+            }
+        }
+
+        class AppTwo extends BaseAppModel
+        {
+            public override dtoID( id: string )
+            {
+                return `two:${id}`;
+            }
+        }
+
+        const models = new TestModels();
+        const collection = { collectionName: 'jobs', aggregate: vi.fn() } as any;
+        const a1 = new AppOne( models, collection );
+        const a2 = new AppTwo( models, collection );
+
+        const dto1 = await a1.converters.dto.converter({ id: 'a', status: 'new' });
+        const dto2 = await a2.converters.dto.converter({ id: 'a', status: 'new' });
+
+        expect( dto1 ).toEqual({ id: 'one:a', status: 'new' });
+        expect( dto2 ).toEqual({ id: 'two:a', status: 'new' });
+    });
 });

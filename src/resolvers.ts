@@ -11,6 +11,18 @@ import
 }
 from './types/internal.js';
 
+export type SmartFilterResolverOptions =
+{
+    prefix?         : string
+    parentResolve?  : ( smartFilter: Record<string, any> ) => Promise<any>
+};
+
+export type ComputedPropertyResolverOptions =
+{
+    prefix?         : string
+    parentResolve?  : ( properties?: ComputedPropertiesParam<any> ) => Promise<any>
+};
+
 export class SmartFilterResolver
 {
     #model: object;
@@ -18,7 +30,7 @@ export class SmartFilterResolver
     #prefix?: string;
     #parentResolve?: ( smartFilter: Record<string, any> ) => Promise<any>;
 
-    constructor( model: object, smartFilters: any, options?: { prefix?: string, parentResolve?: ( smartFilter: Record<string, any> ) => Promise<any> })
+    constructor( model: object, smartFilters: any, options?: SmartFilterResolverOptions )
     {
         this.#model = model;
         this.#smartFilters = smartFilters;
@@ -125,7 +137,7 @@ export class ComputedPropertyResolver
     #prefix?: string;
     #parentResolve?: ( properties?: ComputedPropertiesParam<any> ) => Promise<any>;
 
-    constructor( model: object, computedProperties: any, options?: { prefix?: string, parentResolve?: ( properties?: ComputedPropertiesParam<any> ) => Promise<any> })
+    constructor( model: object, computedProperties: any, options?: ComputedPropertyResolverOptions )
     {
         this.#model = model;
         this.#computedProperties = computedProperties;

@@ -4,10 +4,10 @@ import { bindInstanceDtoID, createDtoIDRef } from './dto-id-bind.js';
 import { AbstractModel } from './model.js';
 import { AbstractModels } from './models.js';
 import { ModelExtensions, MongoRootDocument } from './types/external.js';
-import { DefineModelConfig } from './types/definition.js';
+import { ConverterRecipeMap, DefineModelConfig, InferredModelExtensions } from './types/definition.js';
 
 function buildExtensions<DBE extends MongoRootDocument>(
-    config: DefineModelConfig<DBE>,
+    config: DefineModelConfig<DBE, any, any, any>,
     dtoID: ( id: unknown ) => string
 ): ModelExtensions<DBE, any, any>
 {
@@ -25,21 +25,25 @@ function buildExtensions<DBE extends MongoRootDocument>(
 export function defineModel
 <
     DBE extends MongoRootDocument,
-    DTO extends Document = Document
+    DTO extends Document = Document,
+    SmartFilters = never,
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = ConverterRecipeMap<DBE> | undefined
 >(
     models: AbstractModels,
     collection: Collection<DBE>,
-    config: DefineModelConfig<DBE> = {}
-): AbstractModel<DBE, DTO, any>
+    config: DefineModelConfig<DBE, SmartFilters, ComputedProperties, Recipes> = {} as any
+): AbstractModel<DBE, DTO, InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
 {
     const dtoIDOverride = config.dtoID;
-    const dtoIDRef = createDtoIDRef( dtoIDOverride );
-    const extensions = buildExtensions( config, ( id ) => dtoIDRef.current( id ));
 
-    class DefinedRootModel extends AbstractModel<DBE, DTO, any>
+    class DefinedRootModel extends AbstractModel<DBE, DTO, InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
     {
         constructor( m: AbstractModels, c: Collection<DBE> )
         {
+            const dtoIDRef = createDtoIDRef( dtoIDOverride );
+            const extensions = buildExtensions( config, ( id ) => dtoIDRef.current( id )) as unknown as InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>;
+
             super( m, c, extensions );
             bindInstanceDtoID( dtoIDRef, this, dtoIDOverride );
         }
@@ -51,23 +55,27 @@ export function defineModel
 export function Model
 <
     DBE extends MongoRootDocument,
-    DTO extends Document = Document
+    DTO extends Document = Document,
+    SmartFilters = never,
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = ConverterRecipeMap<DBE> | undefined
 >(
-    config: DefineModelConfig<DBE> = {}
-): new ( models: AbstractModels, collection: Collection<DBE> ) => AbstractModel<DBE, DTO, any>
+    config: DefineModelConfig<DBE, SmartFilters, ComputedProperties, Recipes> = {} as any
+): new ( models: AbstractModels, collection: Collection<DBE> ) => AbstractModel<DBE, DTO, InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
 {
     const dtoIDOverride = config.dtoID;
-    const dtoIDRef = createDtoIDRef( dtoIDOverride );
-    const extensions = buildExtensions( config, ( id ) => dtoIDRef.current( id ));
 
-    return class ModelBase extends AbstractModel<DBE, DTO, any>
+    return class ModelBase extends AbstractModel<DBE, DTO, InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
     {
         constructor( models: AbstractModels, collection: Collection<DBE> )
         {
+            const dtoIDRef = createDtoIDRef( dtoIDOverride );
+            const extensions = buildExtensions( config, ( id ) => dtoIDRef.current( id )) as unknown as InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>;
+
             super( models, collection, extensions );
             bindInstanceDtoID( dtoIDRef, this, dtoIDOverride );
         }
     };
 }
 
-export type { DefineModelConfig, RootModelDefinition, ConverterRecipe, ConverterRecipeMap } from './types/definition.js';
+export type { DefineModelConfig, RootModelDefinition, ConverterRecipe, ConverterRecipeMap, InferredModelExtensions } from './types/definition.js';

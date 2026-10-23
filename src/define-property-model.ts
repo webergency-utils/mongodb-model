@@ -10,10 +10,10 @@ import
     MongoRootDocument
 }
 from './types/external.js';
-import { DefinePropertyModelConfig } from './types/definition.js';
+import { ConverterRecipeMap, DefinePropertyModelConfig, InferredPropertyModelExtensions } from './types/definition.js';
 
 function buildPropertyExtensions<DBE extends MongoPropertyDocument>(
-    config: Omit<DefinePropertyModelConfig<DBE>, 'path'>,
+    config: Omit<DefinePropertyModelConfig<DBE, any, any, any>, 'path'>,
     dtoID: ( id: unknown ) => string
 ): ConstructorExtensions<any>
 {
@@ -32,22 +32,26 @@ export function definePropertyModel
 <
     RootDBE extends MongoRootDocument,
     DBE extends MongoPropertyDocument,
-    DTO extends Document = Document
+    DTO extends Document = Document,
+    SmartFilters = never,
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = ConverterRecipeMap<DBE> | undefined
 >(
     models: AbstractModels,
     collection: Collection<RootDBE>,
-    config: DefinePropertyModelConfig<DBE>
-): AbstractPropertyModel<RootDBE, DBE, DTO, any>
+    config: DefinePropertyModelConfig<DBE, SmartFilters, ComputedProperties, Recipes>
+): AbstractPropertyModel<RootDBE, DBE, DTO, InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
 {
     const { path, ...rest } = config;
     const dtoIDOverride = rest.dtoID;
-    const dtoIDRef = createDtoIDRef( dtoIDOverride );
-    const extensions = buildPropertyExtensions( rest, ( id ) => dtoIDRef.current( id ));
 
-    class DefinedPropertyModel extends AbstractPropertyModel<RootDBE, DBE, DTO, any>
+    class DefinedPropertyModel extends AbstractPropertyModel<RootDBE, DBE, DTO, InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
     {
         constructor( m: AbstractModels, c: Collection<RootDBE>, p: string )
         {
+            const dtoIDRef = createDtoIDRef( dtoIDOverride );
+            const extensions = buildPropertyExtensions( rest, ( id ) => dtoIDRef.current( id )) as unknown as ConstructorExtensions<InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>;
+
             super( m, c, p, extensions );
             bindInstanceDtoID( dtoIDRef, this, dtoIDOverride );
         }
@@ -60,24 +64,28 @@ export function PropertyModel
 <
     RootDBE extends MongoRootDocument,
     DBE extends MongoPropertyDocument,
-    DTO extends Document = Document
+    DTO extends Document = Document,
+    SmartFilters = never,
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = ConverterRecipeMap<DBE> | undefined
 >(
-    config: DefinePropertyModelConfig<DBE>
-): new ( models: AbstractModels, collection: Collection<RootDBE> ) => AbstractPropertyModel<RootDBE, DBE, DTO, any>
+    config: DefinePropertyModelConfig<DBE, SmartFilters, ComputedProperties, Recipes>
+): new ( models: AbstractModels, collection: Collection<RootDBE> ) => AbstractPropertyModel<RootDBE, DBE, DTO, InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
 {
     const { path, ...rest } = config;
     const dtoIDOverride = rest.dtoID;
-    const dtoIDRef = createDtoIDRef( dtoIDOverride );
-    const extensions = buildPropertyExtensions( rest, ( id ) => dtoIDRef.current( id ));
 
-    return class PropertyModelBase extends AbstractPropertyModel<RootDBE, DBE, DTO, any>
+    return class PropertyModelBase extends AbstractPropertyModel<RootDBE, DBE, DTO, InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
     {
         constructor( models: AbstractModels, collection: Collection<RootDBE> )
         {
+            const dtoIDRef = createDtoIDRef( dtoIDOverride );
+            const extensions = buildPropertyExtensions( rest, ( id ) => dtoIDRef.current( id )) as unknown as ConstructorExtensions<InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>;
+
             super( models, collection, path, extensions );
             bindInstanceDtoID( dtoIDRef, this, dtoIDOverride );
         }
     };
 }
 
-export type { DefinePropertyModelConfig, PropertyModelDefinition } from './types/definition.js';
+export type { DefinePropertyModelConfig, PropertyModelDefinition, InferredPropertyModelExtensions } from './types/definition.js';

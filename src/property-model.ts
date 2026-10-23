@@ -119,7 +119,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
             smartFilterOptions          :
             {
                 prefix,
-                parentResolve : ( smartFilter ) =>
+                parentResolve : ( smartFilter: Record<string, any> ) =>
                 {
                     const parent = models[GET_PARENT]( collection.collectionName, prefix );
 
@@ -129,7 +129,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
             computedPropertyOptions     :
             {
                 prefix,
-                parentResolve : ( properties ) =>
+                parentResolve : ( properties?: ComputedPropertiesParam<any> ) =>
                 {
                     const parent = models[GET_PARENT]( collection.collectionName, prefix );
 
@@ -307,6 +307,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                 resolveBSONObject({ arrayFilters })
             );
 
+            this._notifySiblingCacheInvalidation();
             this._emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
 
             return _id;
@@ -419,6 +420,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
                     resolveBSONObject({ arrayFilters })
                 );
 
+                this._notifySiblingCacheInvalidation();
                 this._emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
 
                 return ids;

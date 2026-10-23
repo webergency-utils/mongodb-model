@@ -3,12 +3,16 @@ import
 {
     AbstractModelConverter,
     AbstractModelConverters,
+    AbstractModelProperties,
+    AbstractModelSmartFilters,
     ModelAccessConfig,
     ModelCacheConfig,
+    ModelExtensions,
     MongoPropertyDocument,
     MongoRootDocument,
     ObservabilityConfig,
-    OptimizerConfig
+    OptimizerConfig,
+    PropertyModelExtensions
 }
 from './external.js';
 import { AbstractModelFromConverter, ComputedPropertiesParam } from './internal.js';
@@ -85,12 +89,13 @@ export type RootModelDefinition
 <
     DBE extends MongoRootDocument,
     SmartFilters = never,
-    ComputedProperties = never
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = ConverterRecipeMap<DBE> | undefined
 >
 =
 {
     cache?               : ModelCacheConfig
-    converters?          : ConverterRecipeMap<DBE>
+    converters?          : Recipes
     smartFilters?        : SmartFilters
     computedProperties?  : ComputedProperties
     access?              : ModelAccessConfig<DBE>
@@ -103,13 +108,14 @@ export type PropertyModelDefinition
 <
     DBE extends MongoPropertyDocument,
     SmartFilters = never,
-    ComputedProperties = never
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = ConverterRecipeMap<DBE> | undefined
 >
 =
 {
     path                 : string
     cache?               : ModelCacheConfig
-    converters?          : ConverterRecipeMap<DBE>
+    converters?          : Recipes
     smartFilters?        : SmartFilters
     computedProperties?  : ComputedProperties
     access?              : ModelAccessConfig<DBE>
@@ -143,21 +149,61 @@ export type InferConverterMapFromRecipes<DBE extends Document, T extends Convert
         }
         : Record<string, never>
 
-export type DefinedModelConverters<DBE extends Document, Recipes extends ConverterRecipeMap<DBE> | undefined> =
-    AbstractModelConverters<DBE> & InferConverterMapFromRecipes<DBE, Recipes>
+export type DefinedModelConverters<DBE extends Document, DTO extends Document = DBE, Recipes extends ConverterRecipeMap<DBE> | undefined = undefined> =
+{
+    dto : { converter: ( dbe: DBE ) => DTO | Promise<DTO> }
+    dbe : { converter: ( dbe: DBE ) => DBE | Promise<DBE> }
+}
+& AbstractModelConverters<DBE>
+& InferConverterMapFromRecipes<DBE, Recipes>
+
+export type InferredModelExtensions
+<
+    DBE extends MongoRootDocument,
+    DTO extends Document = DBE,
+    SmartFilters = never,
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = undefined
+>
+= Omit<ModelExtensions<DBE, AbstractModelSmartFilters<SmartFilters>, AbstractModelProperties<ComputedProperties>>, 'converters'> &
+{
+    converters: DefinedModelConverters<DBE, DTO, Recipes>
+}
+
+export type InferredPropertyModelExtensions
+<
+    DBE extends MongoPropertyDocument,
+    DTO extends Document = DBE,
+    SmartFilters = never,
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = undefined
+>
+= Omit<
+    PropertyModelExtensions<
+        DBE,
+        [ SmartFilters ] extends [ never ] ? undefined : [ AbstractModelSmartFilters<SmartFilters>, AbstractModelSmartFilters<SmartFilters> ],
+        [ ComputedProperties ] extends [ never ] ? undefined : [ AbstractModelProperties<ComputedProperties>, AbstractModelProperties<ComputedProperties> ]
+    >,
+    'converters'
+> &
+{
+    converters: DefinedModelConverters<DBE, DTO, Recipes>
+}
 
 export type DefineModelConfig
 <
     DBE extends MongoRootDocument,
     SmartFilters = never,
-    ComputedProperties = never
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = ConverterRecipeMap<DBE> | undefined
 >
-= RootModelDefinition<DBE, SmartFilters, ComputedProperties>
+= RootModelDefinition<DBE, SmartFilters, ComputedProperties, Recipes>
 
 export type DefinePropertyModelConfig
 <
     DBE extends MongoPropertyDocument,
     SmartFilters = never,
-    ComputedProperties = never
+    ComputedProperties = never,
+    Recipes extends ConverterRecipeMap<DBE> | undefined = ConverterRecipeMap<DBE> | undefined
 >
-= PropertyModelDefinition<DBE, SmartFilters, ComputedProperties>
+= PropertyModelDefinition<DBE, SmartFilters, ComputedProperties, Recipes>
