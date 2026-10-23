@@ -224,4 +224,91 @@ describe( 'AbstractModel remaining ops', () =>
         expect( result.items.map( i => i.id )).toEqual([ '2', '1' ]);
         expect( result.total ).toBeUndefined();
     });
+
+    test( 'updateMany, updateOne, and deleteMany execute smartFilter.pipeline and scope mutations to matched _ids (AE1, R6)', async() =>
+    {
+        class PipelineFilters
+        {
+            onlyA()
+            {
+                return {
+                    filter   : undefined,
+                    pipeline : [{ $match: { _id: 'A' } }]
+                };
+            }
+        }
+
+        class SmartUserModel extends AbstractModel<UserDBE, UserDTO,
+        {
+            converters:
+            {
+                dto : { converter: ( dbe: UserDBE ) => UserDTO }
+                dbe : { converter: ( dbe: UserDBE ) => UserDBE }
+            }
+            smartFilters: PipelineFilters
+        }>
+        {
+            constructor( models: AbstractModels, c: any )
+            {
+                super( models, c,
+                {
+                    converters:
+                    {
+                        dto : { converter: ( dbe ) => ({ id: dbe._id, name: dbe.name }) },
+                        dbe : { converter: ( dbe ) => dbe }
+                    },
+                    smartFilters: new PipelineFilters()
+                });
+            }
+        }
+
+        const aggregate = vi.fn(() => ({ toArray: async() => [{ _id: 'A' }] }));
+        const updateMany = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const updateOne = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const deleteMany = vi.fn( async() => ({ deletedCount: 1 }));
+
+        const model = new SmartUserModel( new TestModels(), { collectionName: 'users', aggregate, updateMany, updateOne, deleteMany });
+
+        await model.updateMany({ smartFilter: { onlyA: true as any } }, { name: 'Archived' });
+        expect( updateMany ).toHaveBeenCalledWith(
+            { _id: { $in: [ 'A' ] } },
+            { $set: { name: 'Archived' } }
+        );
+
+        await model.updateOne({ smartFilter: { onlyA: true as any } }, { name: 'Single' });
+        expect( updateOne ).toHaveBeenCalledWith(
+            { _id: 'A' },
+            { $set: { name: 'Single' } }
+        );
+
+        await model.deleteMany({ smartFilter: { onlyA: true as any } });
+        expect( deleteMany ).toHaveBeenCalledWith({ _id: { $in: [ 'A' ] } });
+    });
+
+    test( 'update and updateOne return both documentBefore and documentAfter when both are true (AE4, R10)', async() =>
+    {
+        const findOne = vi.fn( async() => ({ _id: '1', name: 'before' }));
+        const findOneAndUpdate = vi.fn( async() => ({ _id: '1', name: 'after' }));
+        const model = makeModel({ collectionName: 'users', findOne, findOneAndUpdate, aggregate: vi.fn() });
+
+        const resUpdate = await model.update( '1', { name: 'after' }, { documentBefore: true, documentAfter: true });
+
+        expect( resUpdate ).toEqual(
+        {
+            matchedCount    : 1,
+            modifiedCount   : 1,
+            documentBefore  : { _id: '1', name: 'before' },
+            documentAfter   : { _id: '1', name: 'after' }
+        });
+
+        const resUpdateOne = await model.updateOne({ _id: '1' }, { name: 'after' }, { documentBefore: true, documentAfter: true });
+
+        expect( resUpdateOne ).toEqual(
+        {
+            matchedCount    : 1,
+            modifiedCount   : 1,
+            documentBefore  : { _id: '1', name: 'before' },
+            documentAfter   : { _id: '1', name: 'after' }
+        });
+    });
 });
