@@ -24,7 +24,8 @@ function buildPropertyExtensions<DBE extends MongoPropertyDocument>(
         computedProperties  : config.computedProperties,
         access              : config.access,
         optimizer           : config.optimizer,
-        observability       : config.observability
+        observability       : config.observability,
+        validate            : config.validate
     };
 }
 

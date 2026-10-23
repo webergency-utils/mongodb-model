@@ -11,11 +11,8 @@ import { AbstractBaseModel } from './base-model.js';
 import { ModelCacheConfig, extractTargetIdsFromFilter } from './cache.js';
 import { ModelAccessDeniedError } from './errors.js';
 import { ModelMutationOperation, ObservabilityConfig } from './events.js';
-import { flowGet } from './flow.js';
-import { Benchmark } from './helpers/benchmark.js';
 import
 {
-    DUMP,
     mergeComputedProperties,
     resolveBSONObject,
     toUpdateOperations
@@ -24,7 +21,7 @@ from './helpers/index.js';
 import { AbstractModels } from './models.js';
 import
 {
-    attachListMetadata,
+    normalizeCursorOption,
     normalizeFindMatch,
     resolveCreateFromArgs
 }
@@ -43,9 +40,9 @@ import
     ModelStreamOptions,
     ModelUpdateOptions,
     ModelUpdateResponse,
+    ModelValidatorConfig,
     MongoRootDocument,
-    OptimizerConfig,
-    WithTotal
+    OptimizerConfig
 }
 from './types/external.js';
 import { SyncComputedPropertyMethod } from './types/internal.js';
@@ -69,7 +66,9 @@ extends AbstractBaseModel<
     ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
     ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>,
     DTO['id'] | DBE['_id'] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
-    Awaited<ReturnType<SyncComputedPropertyMethod>>
+    Awaited<ReturnType<SyncComputedPropertyMethod>>,
+    ModelListOptions<DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
+    ModelStreamOptions<DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
 >
 {
     public smartFilters?: ExtractSmartFilters<Extensions>;
@@ -77,7 +76,12 @@ extends AbstractBaseModel<
     protected constructor(
         models: AbstractModels,
         collection: Collection<DBE>,
-        params: Extensions & { cache?: ModelCacheConfig, optimizer?: OptimizerConfig, observability?: ObservabilityConfig }
+        params: Extensions & {
+            cache?          : ModelCacheConfig
+            optimizer?      : OptimizerConfig
+            observability?  : ObservabilityConfig
+            validate?       : ModelValidatorConfig<DBE>
+        }
     )
     {
         super( models, collection,
@@ -89,6 +93,7 @@ extends AbstractBaseModel<
             access              : params.access,
             optimizer           : params.optimizer,
             observability       : params.observability,
+            validate            : params.validate,
             idField             : '_id'
         });
 
@@ -113,11 +118,13 @@ extends AbstractBaseModel<
     {
         const preResolvedAccess = ( options as any )?.[RESOLVED_ACCESS] as { denied: boolean, filter?: Filter<DBE> } | undefined;
         const { computedProperties: converterComputedProperties } = this.converters[conversion ?? 'dto'];
-        const { filter, sort, limit, skip, pipeline, projection, computedProperties: optionsComputedProperties, smartFilter, access } = resolveBSONObject( options ) as ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>;
+        const resolved = resolveBSONObject( options ) as ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']> & { sample?: number };
+        const { filter, sort, limit, skip, sample, pipeline, projection, computedProperties: optionsComputedProperties, smartFilter, access } = resolved;
+        const cursor = normalizeCursorOption( resolved );
 
         const [ convProps, optProps, accessResult, resolvedSmartFilter ] = await Promise.all(
         [
-            converterComputedProperties ? this.resolveComputedProperties( converterComputedProperties ) : undefined,
+            ( method !== 'listCount' && converterComputedProperties ) ? this.resolveComputedProperties( converterComputedProperties ) : undefined,
             optionsComputedProperties ? this.resolveComputedProperties( optionsComputedProperties ) : undefined,
             preResolvedAccess ?? this._access.resolveOrDeny({ operation: 'read', method, access }),
             smartFilter ? this.resolveSmartFilter( smartFilter ) : undefined
@@ -131,8 +138,10 @@ extends AbstractBaseModel<
             projection,
             computedProperties,
             sort,
+            cursor,
             limit,
             skip,
+            sample,
             pipeline,
             smartFilter : resolvedSmartFilter || undefined,
             accessFilter
@@ -152,10 +161,19 @@ extends AbstractBaseModel<
 
             const _id: DTO['id'] = id ?? await this.id();
             const start = Date.now();
+            const validated = await this._validateWrite(
+                { ...dbe, _id: this.dbeID( _id ) } as Partial<DBE>,
+                { operation: 'create', method: 'create', id: _id },
+                start,
+                options
+            );
 
             try
             {
-                await this.collection.insertOne( resolveBSONObject({ ...dbe, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE> );
+                await this.collection.insertOne(
+                    resolveBSONObject({ ...validated, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE>,
+                    ...this._sessionArg( options?.session )
+                );
                 this._notifySiblingCacheInvalidation();
                 this._emitMutation( 'create', Date.now() - start,
                 {
@@ -174,7 +192,10 @@ extends AbstractBaseModel<
 
                     try
                     {
-                        existingDoc = await this.collection.findOne( e.keyValue, { projection: { _id: 1 }, collation: { locale: 'en' } });
+                        existingDoc = await this.collection.findOne(
+                            e.keyValue,
+                            this._withSession({ projection: { _id: 1 }, collation: { locale: 'en' } }, options.session )
+                        );
                     }
                     catch( findErr )
                     {
@@ -308,22 +329,27 @@ extends AbstractBaseModel<
 
             const ids: DTO['id'][] = [];
             const docs: OptionalUnlessRequiredId<DBE>[] = [];
+            const start = Date.now();
 
             for( let i = 0; i < items.length; i++ )
             {
                 const item = items[i];
                 const rawId = explicitIds?.[i] ?? ( item._id !== undefined ? this.dtoID( item._id ) : await this.id());
                 const dtoId = this.dtoID( rawId ) as DTO['id'];
+                const validated = await this._validateWrite(
+                    { ...item, _id: this.dbeID( dtoId ) } as Partial<DBE>,
+                    { operation: 'create', method: 'createMany', id: dtoId },
+                    start,
+                    resolvedOptions
+                );
 
                 ids.push( dtoId );
-                docs.push( resolveBSONObject({ ...item, _id: this.dbeID( dtoId ) }) as OptionalUnlessRequiredId<DBE> );
+                docs.push( resolveBSONObject({ ...validated, _id: this.dbeID( dtoId ) }) as OptionalUnlessRequiredId<DBE> );
             }
-
-            const start = Date.now();
 
             try
             {
-                await this.collection.insertMany( docs );
+                await this.collection.insertMany( docs, ...this._sessionArg( resolvedOptions?.session ));
                 this._notifySiblingCacheInvalidation();
                 this._emitMutation( 'createMany', Date.now() - start,
                 {
@@ -363,12 +389,19 @@ extends AbstractBaseModel<
             }
 
             const start = Date.now();
+            const validatedUpdate = await this._validateWrite(
+                update,
+                { operation: 'update', method: 'update', id },
+                start,
+                options,
+                match
+            );
 
             try
             {
                 if( options?.documentBefore || options?.documentAfter )
                 {
-                    const snapshot = await this.#findOneAndUpdateWithSnapshots( match, update, options, 'update' );
+                    const snapshot = await this.#findOneAndUpdateWithSnapshots( match, validatedUpdate, options, 'update' );
 
                     this._invalidateCache([ id ], snapshot.matchedCount > 0 );
                     this._emitMutation( 'update', Date.now() - start,
@@ -389,7 +422,11 @@ extends AbstractBaseModel<
                     };
                 }
 
-                const res = await this.collection.updateOne( match, toUpdateOperations( update ));
+                const res = await this.collection.updateOne(
+                    match,
+                    toUpdateOperations( validatedUpdate ),
+                    ...this._sessionArg( options?.session )
+                );
 
                 this._invalidateCache([ id ], res.matchedCount > 0 );
                 this._emitMutation( 'update', Date.now() - start,
@@ -435,7 +472,10 @@ extends AbstractBaseModel<
         {
             const preStart = Date.now();
 
-            beforeDoc = ( await this.collection.findOne( match, { collation: { locale: 'en' } }) as DBE | null ) || undefined;
+            beforeDoc = ( await this.collection.findOne(
+                match,
+                this._withSession({ collation: { locale: 'en' } }, options.session )
+            ) as DBE | null ) || undefined;
 
             const preDuration = Date.now() - preStart;
 
@@ -467,10 +507,11 @@ extends AbstractBaseModel<
         const result = await this.collection.findOneAndUpdate(
             effectiveMatch,
             toUpdateOperations( update ),
+            this._withSession(
             {
                 returnDocument  : options.documentAfter ? 'after' : 'before',
                 collation       : { locale: 'en' }
-            }
+            }, options.session )
         );
 
         const document = ( result as DBE | null ) || undefined;
@@ -492,7 +533,7 @@ extends AbstractBaseModel<
         matchInput: Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
         operation: 'update' | 'delete',
         method: ModelMutationOperation,
-        options?: { access?: string, context?: Record<string, unknown>, traceID?: string },
+        options?: { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ModelUpdateOptions['session'] },
         limit?: number
     ): Promise<{
         finalMatch  : Filter<DBE> | null
@@ -502,9 +543,10 @@ extends AbstractBaseModel<
         smartFilter?: Record<string, unknown>
         context?    : Record<string, unknown>
         traceID?    : string
+        session?    : ModelUpdateOptions['session']
     }>
     {
-        const { filter: rawFilter, smartFilter, access, context, traceID } = normalizeFindMatch<Filter<DBE>, any>( matchInput, options );
+        const { filter: rawFilter, smartFilter, access, context, traceID, session } = normalizeFindMatch<Filter<DBE>, any>( matchInput, options );
         const [ resolvedSmart, accessResult ] = await Promise.all(
         [
             smartFilter ? this.resolveSmartFilter( smartFilter ) : undefined,
@@ -513,7 +555,7 @@ extends AbstractBaseModel<
 
         if( accessResult.denied )
         {
-            return { finalMatch: null, targetIds: [], rawFilter, smartFilter, context, traceID };
+            return { finalMatch: null, targetIds: [], rawFilter, smartFilter, context, traceID, session };
         }
 
         const targetIds = extractTargetIdsFromFilter( matchInput, '_id', id => String( this.dtoID( id )));
@@ -536,7 +578,10 @@ extends AbstractBaseModel<
 
             try
             {
-                docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as Array<{ _id: DBE['_id'] }>;
+                docs = await this.collection.aggregate(
+                    pipeline,
+                    this._withSession({ collation: { locale: 'en' } }, session )
+                ).toArray() as Array<{ _id: DBE['_id'] }>;
             }
             catch( e )
             {
@@ -569,14 +614,14 @@ extends AbstractBaseModel<
 
             if( matchedDbeIds.length === 0 )
             {
-                return { finalMatch: null, targetIds: targetIds.length > 0 ? targetIds : matchedDtoIds, empty: true, rawFilter, smartFilter, context, traceID };
+                return { finalMatch: null, targetIds: targetIds.length > 0 ? targetIds : matchedDtoIds, empty: true, rawFilter, smartFilter, context, traceID, session };
             }
 
             const finalMatch = ( limit === 1
                 ? { _id: matchedDbeIds[0] }
                 : { _id: { $in: matchedDbeIds } } ) as Filter<DBE>;
 
-            return { finalMatch, targetIds: matchedDtoIds, rawFilter, smartFilter, context, traceID };
+            return { finalMatch, targetIds: matchedDtoIds, rawFilter, smartFilter, context, traceID, session };
         }
 
         const combinedFilter = resolvedSmart?.filter
@@ -587,7 +632,7 @@ extends AbstractBaseModel<
             ? ({ $and: [ resolvedBase, accessResult.filter ] } as Filter<DBE>)
             : resolvedBase;
 
-        return { finalMatch, targetIds, rawFilter, smartFilter, context, traceID };
+        return { finalMatch, targetIds, rawFilter, smartFilter, context, traceID, session };
     }
 
     public async updateMany(
@@ -625,11 +670,22 @@ extends AbstractBaseModel<
                 }
 
                 const start = Date.now();
+                const validatedUpdate = await this._validateWrite(
+                    update,
+                    { operation: 'update', method: 'updateMany', ids: idsOrFilter },
+                    start,
+                    options,
+                    match
+                );
                 let res: { matchedCount: number, modifiedCount: number };
 
                 try
                 {
-                    res = await this.collection.updateMany( match, toUpdateOperations( update ));
+                    res = await this.collection.updateMany(
+                        match,
+                        toUpdateOperations( validatedUpdate ),
+                        ...this._sessionArg( options?.session )
+                    );
                 }
                 catch( e )
                 {
@@ -660,7 +716,7 @@ extends AbstractBaseModel<
                 };
             }
 
-            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID } = await this.#resolveFilterMatch(
+            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID, session } = await this.#resolveFilterMatch(
                 idsOrFilter,
                 'update',
                 'updateMany',
@@ -692,11 +748,23 @@ extends AbstractBaseModel<
             }
 
             const start = Date.now();
+            const validatedUpdate = await this._validateWrite(
+                update,
+                { operation: 'update', method: 'updateMany', ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
+                start,
+                { ...options, context, traceID },
+                finalMatch,
+                smartFilter
+            );
             let res: { matchedCount: number, modifiedCount: number };
 
             try
             {
-                res = await this.collection.updateMany( finalMatch, toUpdateOperations( update ));
+                res = await this.collection.updateMany(
+                    finalMatch,
+                    toUpdateOperations( validatedUpdate ),
+                    ...this._sessionArg( session )
+                );
             }
             catch( e )
             {
@@ -746,7 +814,7 @@ extends AbstractBaseModel<
     {
         return this.runOperation( async() =>
         {
-            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID } = await this.#resolveFilterMatch(
+            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID, session } = await this.#resolveFilterMatch(
                 match,
                 'update',
                 'updateOne',
@@ -779,6 +847,14 @@ extends AbstractBaseModel<
             }
 
             const start = Date.now();
+            const validatedUpdate = await this._validateWrite(
+                update,
+                { operation: 'update', method: 'updateOne', ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
+                start,
+                { ...options, context, traceID },
+                finalMatch,
+                smartFilter
+            );
 
             try
             {
@@ -786,8 +862,8 @@ extends AbstractBaseModel<
                 {
                     const snapshot = await this.#findOneAndUpdateWithSnapshots(
                         finalMatch,
-                        update,
-                        { ...options, context, traceID },
+                        validatedUpdate,
+                        { ...options, context, traceID, session },
                         'updateOne'
                     );
                     const idsToEvict = targetIds.length > 0
@@ -822,7 +898,11 @@ extends AbstractBaseModel<
                     };
                 }
 
-                const res = await this.collection.updateOne( finalMatch, toUpdateOperations( update ));
+                const res = await this.collection.updateOne(
+                    finalMatch,
+                    toUpdateOperations( validatedUpdate ),
+                    ...this._sessionArg( session )
+                );
 
                 if( targetIds.length > 0 )
                 {
@@ -864,128 +944,6 @@ extends AbstractBaseModel<
         });
     }
 
-    public async list<K extends keyof Extensions['converters']>(
-        options: ModelListOptions<DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
-        conversion: K = 'dto' as K
-    ): Promise<WithTotal<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>>>
-    {
-        return this.runOperation( async() =>
-        {
-            const bsonInput = this._stripObservabilityOptions( options );
-            const { projection: convProjection, computedProperties: compProps } = this.converters[conversion];
-            let { filter = {}, sort = { _id: 1 }, cursor, limit, countLimit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( bsonInput );
-
-            if( !sort._id )
-            {
-                sort = { ...sort, _id: 1 };
-            }
-
-            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
-            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'list', access: options.access });
-
-            if( access.denied )
-            {
-                return attachListMetadata([], options.count ? 0 : undefined, {});
-            }
-
-            const [ smartFilter, convProps, optProps ] = await Promise.all(
-            [
-                options.smartFilter ? this.resolveSmartFilter( options.smartFilter ) : undefined,
-                compProps ? this.resolveComputedProperties( compProps ) : undefined,
-                optionsCompProps ? this.resolveComputedProperties( optionsCompProps ) : undefined
-            ]);
-            const computedProperties = ( convProps || optProps ) ? mergeComputedProperties({ '': convProps }, { '': optProps })[''] : undefined;
-
-            const params =
-            {
-                ...rest,
-                filter,
-                sort,
-                projection,
-                smartFilter,
-                cursor,
-                limit,
-                countLimit,
-                accessFilter : access.filter,
-                pipeline     : options.pipeline,
-                computedProperties
-            };
-
-            let [ pipeline, countPipeline ] = await Promise.all(
-            [
-                this._pipelineBuilder.pipeline( params ),
-                options.count ? this._pipelineBuilder.count( params ) : undefined
-            ]);
-
-            pipeline = this._optimizePipeline( pipeline );
-            countPipeline && ( countPipeline = this._optimizePipeline( countPipeline ));
-
-            flowGet( 'log' ) && DUMP( pipeline );
-            flowGet( 'log' ) && countPipeline && DUMP( countPipeline );
-
-            return this._executeList( pipeline, countPipeline, options, sort, conversion, benchmark );
-        });
-    }
-
-    public async *stream<K extends keyof Extensions['converters']>(
-        options: ModelStreamOptions<DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
-        conversion: K = 'dto' as K
-    ): AsyncGenerator<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>
-    {
-        const release = this.trackOperation();
-
-        try
-        {
-            const bsonInput = this._stripObservabilityOptions( options );
-            const { projection: convProjection, computedProperties: compProps } = this.converters[conversion];
-            let { filter = {}, sort = { _id: 1 }, cursor, limit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( bsonInput );
-
-            if( !sort._id )
-            {
-                sort = { ...sort, _id: 1 };
-            }
-
-            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'stream', access: options.access });
-
-            if( access.denied )
-            {
-                return;
-            }
-
-            const [ smartFilter, convProps, optProps ] = await Promise.all(
-            [
-                options.smartFilter ? this.resolveSmartFilter( options.smartFilter ) : undefined,
-                compProps ? this.resolveComputedProperties( compProps ) : undefined,
-                optionsCompProps ? this.resolveComputedProperties( optionsCompProps ) : undefined
-            ]);
-            const computedProperties = ( convProps || optProps ) ? mergeComputedProperties({ '': convProps }, { '': optProps })[''] : undefined;
-
-            let pipeline = await this._pipelineBuilder.pipeline(
-            {
-                ...rest,
-                filter,
-                sort,
-                projection,
-                smartFilter,
-                cursor,
-                limit,
-                accessFilter : access.filter,
-                pipeline     : options.pipeline,
-                computedProperties
-            });
-
-            pipeline = this._optimizePipeline( pipeline );
-
-            flowGet( 'log' ) && DUMP( pipeline );
-
-            yield* this._executeStream( pipeline, options, sort, conversion );
-        }
-        finally
-        {
-            release();
-        }
-    }
-
     public async delete( id: DTO['id'] | DBE['_id'], options?: ModelDeleteOptions ): Promise<boolean>
     {
         return this.runOperation( async() =>
@@ -1002,7 +960,7 @@ extends AbstractBaseModel<
 
             try
             {
-                res = await this.collection.deleteOne( match );
+                res = await this.collection.deleteOne( match, ...this._sessionArg( options?.session ));
             }
             catch( e )
             {
@@ -1064,7 +1022,7 @@ extends AbstractBaseModel<
 
                 try
                 {
-                    res = await this.collection.deleteMany( match );
+                    res = await this.collection.deleteMany( match, ...this._sessionArg( options?.session ));
                 }
                 catch( e )
                 {
@@ -1091,7 +1049,7 @@ extends AbstractBaseModel<
                 return res.deletedCount;
             }
 
-            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID } = await this.#resolveFilterMatch(
+            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID, session } = await this.#resolveFilterMatch(
                 idsOrFilter,
                 'delete',
                 'deleteMany',
@@ -1126,7 +1084,7 @@ extends AbstractBaseModel<
 
             try
             {
-                res = await this.collection.deleteMany( finalMatch );
+                res = await this.collection.deleteMany( finalMatch, ...this._sessionArg( session ));
             }
             catch( e )
             {

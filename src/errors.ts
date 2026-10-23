@@ -50,6 +50,26 @@ export class ModelAccessDeniedError extends ModelError
     }
 }
 
+export type ModelValidationIssue =
+{
+    message : string
+    path?   : ReadonlyArray<string | number | symbol>
+};
+
+export class ModelValidationError extends ModelError
+{
+    public readonly issues: ReadonlyArray<ModelValidationIssue>;
+
+    constructor( model: object, message: string, issues: ReadonlyArray<ModelValidationIssue> = [], cause?: Error )
+    {
+        super( 'MODEL_VALIDATION_ERROR', model, message, cause );
+
+        this.issues = issues;
+
+        Error.captureStackTrace( this, cause ? cause.constructor : this.constructor );
+    }
+}
+
 export class ModelAccessConfigError extends ModelError
 {
     constructor( model: object, message: string )

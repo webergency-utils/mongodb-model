@@ -1,7 +1,22 @@
-import { Document, ObjectId, UpdateFilter, UpdateOptions } from 'mongodb';
-import { getCursor, isForeignObjectIdLike, isLibraryObjectId, propertyModelTargetUpdateParams } from './helpers/mongo.js';
+import { ClientSession, Document, ObjectId, UpdateFilter, UpdateOptions } from 'mongodb';
+import { getCursor, isForeignObjectIdLike, isLibraryObjectId, isUpdateOperator, propertyModelTargetUpdateParams } from './helpers/mongo.js';
 import { ConverterManager } from './converters.js';
-import { GetManyOptions, GetOptions, ListResult, ModelCreateOptions, PropertyModelUpdateResponse, WithTotal } from './types/external.js';
+import { ModelValidationError } from './errors.js';
+import
+{
+    GetManyOptions,
+    GetOptions,
+    ListResult,
+    ModelCreateOptions,
+    ModelValidationContext,
+    ModelValidationOperation,
+    ModelValidatorConfig,
+    ModelValidatorFn,
+    ModelValidatorInput,
+    PropertyModelUpdateResponse,
+    WithTotal
+}
+from './types/external.js';
 
 export function attachListMetadata<T>(
     items: T[],
@@ -9,14 +24,45 @@ export function attachListMetadata<T>(
     cursors: { prev?: string, next?: string }
 ): WithTotal<T[]>
 {
+    const nextCursor = cursors.next ? `next:${cursors.next}` : undefined;
+    const prevCursor = cursors.prev ? `prev:${cursors.prev}` : undefined;
+
     Object.defineProperties( items,
     {
-        items   : { value: items, enumerable: false, writable: false, configurable: true },
-        total   : { value: total, enumerable: false, writable: false, configurable: true },
-        cursors : { value: cursors, enumerable: false, writable: false, configurable: true }
+        items       : { value: items, enumerable: false, writable: false, configurable: true },
+        total       : { value: total, enumerable: false, writable: false, configurable: true },
+        cursors     : { value: cursors, enumerable: false, writable: false, configurable: true },
+        nextCursor  : { value: nextCursor, enumerable: false, writable: false, configurable: true },
+        prevCursor  : { value: prevCursor, enumerable: false, writable: false, configurable: true }
     });
 
     return items as WithTotal<T[]>;
+}
+
+export function normalizeCursorOption( options?: { cursor?: string, after?: string, before?: string } ): string | undefined
+{
+    if( !options ){ return undefined }
+
+    if( options.cursor !== undefined )
+    {
+        return options.cursor;
+    }
+
+    if( options.after !== undefined )
+    {
+        return options.after.startsWith( 'next:' ) || options.after.startsWith( 'prev:' )
+            ? options.after
+            : `next:${options.after}`;
+    }
+
+    if( options.before !== undefined )
+    {
+        return options.before.startsWith( 'prev:' ) || options.before.startsWith( 'next:' )
+            ? options.before
+            : `prev:${options.before}`;
+    }
+
+    return undefined;
 }
 
 export function attachCursorToItem<T>( dto: T, dbe: Document, sort: Document ): T & { $cursor?: string }
@@ -35,7 +81,7 @@ export function attachCursorToItem<T>( dto: T, dbe: Document, sort: Document ): 
     return dto as T & { $cursor?: string };
 }
 
-const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'access', 'context', 'traceID' ]);
+const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'cursor', 'after', 'before', 'access', 'context', 'traceID', 'session' ]);
 
 export function isCreateOptionsObject( v: unknown ): v is ModelCreateOptions
 {
@@ -44,7 +90,7 @@ export function isCreateOptionsObject( v: unknown ): v is ModelCreateOptions
         && !Array.isArray( v )
         && !isLibraryObjectId( v )
         && !isForeignObjectIdLike( v )
-        && ( 'duplicateIgnore' in v || 'access' in v || 'context' in v || 'traceID' in v );
+        && ( 'duplicateIgnore' in v || 'access' in v || 'context' in v || 'traceID' in v || 'session' in v );
 }
 
 export function resolveCreateFromArgs<ID>(
@@ -87,7 +133,7 @@ export function resolveCreateFromArgs<ID>(
     };
 }
 
-export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, access?: string, context?: Record<string, unknown>, traceID?: string }
+export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, cursor?: string, after?: string, before?: string, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
 {
     return Boolean(
         match
@@ -98,15 +144,18 @@ export function isFindOptionsObject( match: unknown ): match is { filter?: unkno
         && (
             'filter' in match
             || 'smartFilter' in match
-            || ( 'access' in match && Object.keys( match ).every( k => FIND_OPTION_KEYS.has( k ) ))
+            || 'cursor' in match
+            || 'after' in match
+            || 'before' in match
+            || (( 'access' in match || 'session' in match ) && Object.keys( match ).every( k => FIND_OPTION_KEYS.has( k ) ))
         )
     );
 }
 
 export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilterType = any>(
-    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, access?: string, context?: Record<string, unknown>, traceID?: string },
-    optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string }
-): { filter: FilterType, smartFilter?: SmartFilterType, access?: string, context?: Record<string, unknown>, traceID?: string }
+    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, cursor?: string, after?: string, before?: string, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession },
+    optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+): { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
 {
     const opts = typeof optionsOrAccess === 'string' ? { access: optionsOrAccess } : optionsOrAccess;
 
@@ -116,13 +165,17 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
             ? { ...match.context, ...opts.context }
             : ( opts?.context ?? match.context );
         const traceID = opts?.traceID ?? match.traceID;
+        const session = opts?.session ?? match.session;
+        const cursor = normalizeCursorOption( match );
 
         return {
             filter      : ( match.filter ?? {} ) as FilterType,
             smartFilter : match.smartFilter as SmartFilterType | undefined,
             access      : opts?.access ?? match.access,
+            ...( cursor !== undefined ? { cursor } : {} ),
             ...( context !== undefined ? { context } : {} ),
-            ...( traceID !== undefined ? { traceID } : {} )
+            ...( traceID !== undefined ? { traceID } : {} ),
+            ...( session !== undefined ? { session } : {} )
         };
     }
 
@@ -130,7 +183,8 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
         filter : ( match ?? {} ) as FilterType,
         access : opts?.access,
         ...( opts?.context !== undefined ? { context: opts.context } : {} ),
-        ...( opts?.traceID !== undefined ? { traceID: opts.traceID } : {} )
+        ...( opts?.traceID !== undefined ? { traceID: opts.traceID } : {} ),
+        ...( opts?.session !== undefined ? { session: opts.session } : {} )
     };
 }
 
@@ -138,8 +192,8 @@ export function normalizeExistsOptions<FilterType = Record<string, any>, SmartFi
     idOrFilter: unknown,
     idKey: '_id' | 'id',
     dbeID: ( id: any ) => any,
-    optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string }
-): { filter: FilterType, smartFilter?: SmartFilterType, access?: string, context?: Record<string, unknown>, traceID?: string, isPrimitiveId?: boolean }
+    optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+): { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession, isPrimitiveId?: boolean }
 {
     if( idOrFilter === undefined || idOrFilter === null )
     {
@@ -248,16 +302,158 @@ export function buildListResult<T extends Document>(
     const ordered = options?.reversed ? [ ...items ].reverse() : items;
     const first = ordered[0];
     const last = ordered[ordered.length - 1];
+    const prev = first ? getCursor( first, sort ) : undefined;
+    const next = last ? getCursor( last, sort ) : undefined;
 
     return {
-        items   : ordered,
-        total   : options?.total,
-        cursors :
+        items       : ordered,
+        total       : options?.total,
+        cursors     :
         {
-            prev    : first ? getCursor( first, sort ) : undefined,
-            next    : last ? getCursor( last, sort ) : undefined
-        }
+            prev,
+            next
+        },
+        nextCursor  : next ? `next:${next}` : undefined,
+        prevCursor  : prev ? `prev:${prev}` : undefined
     };
+}
+
+function isPerOperationValidatorMap( config: ModelValidatorConfig<any> ): config is { create?: ModelValidatorInput<any>, update?: ModelValidatorInput<any> }
+{
+    return typeof config === 'object'
+        && config !== null
+        && !( '~standard' in config )
+        && !( 'safeParse' in config )
+        && !( 'safeParseAsync' in config )
+        && !( 'parse' in config )
+        && ( 'create' in config || 'update' in config );
+}
+
+async function runSingleValidator(
+    model: object,
+    validator: ModelValidatorInput<any>,
+    data: any,
+    context: ModelValidationContext
+): Promise<any>
+{
+    try
+    {
+        if( typeof validator === 'function' )
+        {
+            const res = await validator( data, context );
+
+            if( res === false )
+            {
+                throw new ModelValidationError( model, 'Validation failed' );
+            }
+
+            return res && typeof res === 'object' ? res : data;
+        }
+
+        const isSchemaTargetOperator = context.isUpdateOperator && data && typeof data === 'object';
+        const target = isSchemaTargetOperator ? data.$set : data;
+
+        if( isSchemaTargetOperator && ( target === undefined || typeof target !== 'object' || target === null ) )
+        {
+            return data;
+        }
+
+        let validatedTarget = target;
+
+        if( '~standard' in validator )
+        {
+            const res = await validator['~standard'].validate( target );
+
+            if( res.issues )
+            {
+                throw new ModelValidationError( model, res.issues[0]?.message ?? 'Validation failed', res.issues );
+            }
+
+            validatedTarget = res.value;
+        }
+        else if( 'safeParseAsync' in validator && typeof validator.safeParseAsync === 'function' )
+        {
+            const res = await validator.safeParseAsync( target );
+
+            if( !res.success )
+            {
+                const issues = res.error?.issues ?? [];
+
+                throw new ModelValidationError( model, issues[0]?.message ?? res.error?.message ?? 'Validation failed', issues );
+            }
+
+            validatedTarget = res.data ?? target;
+        }
+        else if( 'safeParse' in validator && typeof validator.safeParse === 'function' )
+        {
+            const res = validator.safeParse( target );
+
+            if( !res.success )
+            {
+                const issues = res.error?.issues ?? [];
+
+                throw new ModelValidationError( model, issues[0]?.message ?? res.error?.message ?? 'Validation failed', issues );
+            }
+
+            validatedTarget = res.data ?? target;
+        }
+        else if( 'parse' in validator && typeof validator.parse === 'function' )
+        {
+            validatedTarget = await validator.parse( target );
+        }
+
+        return isSchemaTargetOperator ? { ...data, $set: validatedTarget } : validatedTarget;
+    }
+    catch( err: any )
+    {
+        if( err instanceof ModelValidationError )
+        {
+            throw err;
+        }
+
+        const rawIssues = Array.isArray( err?.issues ) ? err.issues : ( Array.isArray( err?.errors ) ? err.errors : [] );
+        const message = rawIssues[0]?.message ?? err?.message ?? String( err );
+        const issues = rawIssues.length > 0 ? rawIssues : [{ message }];
+
+        throw new ModelValidationError( model, message, issues, err instanceof Error ? err : undefined );
+    }
+}
+
+export async function executeModelValidator<T>(
+    model: object,
+    validatorConfig: ModelValidatorConfig<any> | undefined,
+    methodValidator: ModelValidatorFn<any> | undefined,
+    data: T,
+    operation: ModelValidationOperation
+): Promise<T>
+{
+    if( !validatorConfig && !methodValidator )
+    {
+        return data;
+    }
+
+    const isCreate = operation === 'create' || operation === 'createMany';
+    const isOp = !isCreate && typeof data === 'object' && data !== null && isUpdateOperator( data as object );
+    const context: ModelValidationContext = { operation, isUpdateOperator: isOp };
+    const configValidator = validatorConfig
+        ? ( isPerOperationValidatorMap( validatorConfig )
+            ? ( isCreate ? validatorConfig.create : validatorConfig.update )
+            : validatorConfig )
+        : undefined;
+
+    let current: any = data;
+
+    if( configValidator )
+    {
+        current = await runSingleValidator( model, configValidator, current, context );
+    }
+
+    if( methodValidator )
+    {
+        current = await runSingleValidator( model, methodValidator, current, context );
+    }
+
+    return current as T;
 }
 
 export async function convertDocuments

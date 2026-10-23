@@ -10,7 +10,16 @@ import
     resolveObservabilityOptions
 }
 from './events.js';
-import { flowExecute, flowGet, flowSet, flowStart } from './flow.js';
+import
+{
+    flowExecute,
+    flowGet,
+    flowSet,
+    flowStart,
+    TRANSACTION_POST_COMMIT_KEY,
+    TRANSACTION_SESSION_KEY
+}
+from './flow.js';
 import
 {
     CLEAR_LOCAL_CACHE,
@@ -280,10 +289,32 @@ export class AbstractModels
         try
         {
             const session = this.client.startSession();
+            const postCommitCallbacks = new Set<() => void>();
 
             try
             {
-                return await session.withTransaction( fn );
+                const result = await session.withTransaction( async( txSession ) =>
+                {
+                    const activeSession = txSession ?? session;
+
+                    postCommitCallbacks.clear();
+
+                    return await flowExecute(
+                        () => fn( activeSession ),
+                        {
+                            [TRANSACTION_SESSION_KEY]       : activeSession,
+                            [TRANSACTION_POST_COMMIT_KEY]   : postCommitCallbacks
+                        },
+                        false
+                    );
+                });
+
+                for( const callback of postCommitCallbacks )
+                {
+                    callback();
+                }
+
+                return result as T;
             }
             finally
             {

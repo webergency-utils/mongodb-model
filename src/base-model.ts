@@ -1,5 +1,6 @@
 import
 {
+    ClientSession,
     Collection,
     Document,
     Filter,
@@ -33,7 +34,7 @@ import
     resolveObservabilityOptions
 }
 from './events.js';
-import { flowGet } from './flow.js';
+import { flowGet, getActiveSession, registerTransactionPostCommit } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
 {
@@ -53,6 +54,8 @@ import
     attachCursorToItem,
     attachListMetadata,
     convertDocuments,
+    executeModelValidator,
+    normalizeCursorOption,
     normalizeExistsOptions,
     normalizeGetManyOptions,
     normalizeGetOptions
@@ -69,7 +72,8 @@ import
     HAS_OBSERVABILITY_LISTENERS,
     INVALIDATE_COLLECTION_CACHE,
     REGISTER_MODEL,
-    RESOLVED_ACCESS
+    RESOLVED_ACCESS,
+    RESOLVED_SESSION
 }
 from './symbols.js';
 import
@@ -80,6 +84,9 @@ import
     GetOptions,
     ModelAccessConfig,
     ModelExistsOptions,
+    ModelValidationContext,
+    ModelValidationOperation,
+    ModelValidatorConfig,
     MongoRootDocument,
     OptimizerConfig,
     OptimizerOptions,
@@ -106,6 +113,7 @@ export type BaseModelParams<DBE extends Document> =
     access?                 : ModelAccessConfig<DBE>
     optimizer?              : OptimizerConfig
     observability?          : ObservabilityConfig
+    validate?               : ModelValidatorConfig<DBE>
     idField                 : '_id' | 'id'
     prefix?                 : string
     smartFilterOptions?     : SmartFilterResolverOptions
@@ -126,9 +134,14 @@ export abstract class AbstractBaseModel
     FindOpts = any,
     AggregateOpts = any,
     ExistsInput = any,
-    ResolvedComputedProps = any
+    ResolvedComputedProps = any,
+    ListOpts = any,
+    StreamOpts = any
 >
 {
+    static #sessionIds = new WeakMap<ClientSession, number>();
+    static #nextSessionId = 1;
+
     protected _models: AbstractModels;
     protected _converters: ConverterManager<DBE>;
     protected _access: AccessControl<DBE>;
@@ -139,6 +152,7 @@ export abstract class AbstractBaseModel
     protected _cache?: ModelCache;
     protected _optimizer?: OptimizerConfig;
     protected _observability?: ObservabilityConfig;
+    protected _validator?: ModelValidatorConfig<DBE>;
     protected _idField: '_id' | 'id';
     protected _prefix?: string;
 
@@ -161,6 +175,7 @@ export abstract class AbstractBaseModel
         this._cache = params.cache ? new ModelCache( params.cache ) : undefined;
         this._optimizer = params.optimizer;
         this._observability = params.observability;
+        this._validator = params.validate;
         this._pipelineBuilder = new PipelineBuilder<CollectionDoc>();
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this._converters = new ConverterManager( this, this.converters, ( err, op ) => this._emitError( err, op ));
@@ -174,7 +189,7 @@ export abstract class AbstractBaseModel
         this._smartFilters = new SmartFilterResolver( this, params.smartFilters, params.smartFilterOptions );
         this._computedProperties = new ComputedPropertyResolver( this, params.computedProperties, params.computedPropertyOptions );
 
-        this.#findAggregator = new Aggregator( async( ids: Array<any>, conversion: keyof Extensions['converters'], accessCtx?: { access?: string, scopeKey?: string, [RESOLVED_ACCESS]?: { denied: boolean, filter?: Filter<DBE> } } ) =>
+        this.#findAggregator = new Aggregator( async( ids: Array<any>, conversion: keyof Extensions['converters'], accessCtx?: { access?: string, scopeKey?: string, [RESOLVED_ACCESS]?: { denied: boolean, filter?: Filter<DBE> }, [RESOLVED_SESSION]?: ClientSession } ) =>
         {
             const metaKey = this.#batchMetaKey( conversion, accessCtx?.access, accessCtx?.scopeKey );
             const queue = this.#pendingBatchMeta.get( metaKey );
@@ -271,7 +286,7 @@ export abstract class AbstractBaseModel
                 flowGet( 'log' ) && DUMP( pipeline );
 
                 start = Date.now();
-                const documents = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as DBE[];
+                const documents = await this.collection.aggregate( pipeline, this._withSession({ collation: { locale: 'en' } }, accessCtx?.[RESOLVED_SESSION] )).toArray() as DBE[];
                 const duration = Date.now() - start;
 
                 LOG_FILE( `Collection: ${this._collectionLabel}` );
@@ -701,30 +716,113 @@ export abstract class AbstractBaseModel
     {
         if( !ids.length ){ return }
 
-        if( notifySiblings )
-        {
-            this._notifySiblingCacheInvalidation();
-        }
-
-        if( !this._cache ){ return }
-
         const normalizedIds = ids.map( id => String( this.dtoID( id )));
-        const evicted = this._cache.invalidateIds( normalizedIds );
 
-        if( evicted.length > 0 )
+        const performInvalidation = () =>
         {
-            this._emitCache( 'invalidate', { ids: normalizedIds });
-        }
+            if( notifySiblings )
+            {
+                this._notifySiblingCacheInvalidation();
+            }
+
+            if( !this._cache ){ return }
+
+            const evicted = this._cache.invalidateIds( normalizedIds );
+
+            if( evicted.length > 0 )
+            {
+                this._emitCache( 'invalidate', { ids: normalizedIds });
+            }
+        };
+
+        performInvalidation();
+        registerTransactionPostCommit( performInvalidation );
     }
 
     protected _clearCache( notifySiblings: boolean = true ): void
     {
-        if( notifySiblings )
+        const performClear = () =>
         {
-            this._notifySiblingCacheInvalidation();
+            if( notifySiblings )
+            {
+                this._notifySiblingCacheInvalidation();
+            }
+
+            this[CLEAR_LOCAL_CACHE]();
+        };
+
+        performClear();
+        registerTransactionPostCommit( performClear );
+    }
+
+    protected _resolveSession( explicitSession?: ClientSession ): ClientSession | undefined
+    {
+        return getActiveSession( explicitSession );
+    }
+
+    protected _withSession<T extends Record<string, any>>( baseOptions: T, explicitSession?: ClientSession ): T & { session?: ClientSession }
+    {
+        const session = this._resolveSession( explicitSession );
+
+        return session ? { ...baseOptions, session } : baseOptions;
+    }
+
+    protected _sessionArg( explicitSession?: ClientSession ): [ { session: ClientSession } ] | []
+    {
+        const session = this._resolveSession( explicitSession );
+
+        return session ? [{ session }] : [];
+    }
+
+    #sessionScopeToken( session?: ClientSession ): string | undefined
+    {
+        if( !session ){ return undefined }
+
+        let id = AbstractBaseModel.#sessionIds.get( session );
+
+        if( !id )
+        {
+            id = AbstractBaseModel.#nextSessionId++;
+            AbstractBaseModel.#sessionIds.set( session, id );
         }
 
-        this[CLEAR_LOCAL_CACHE]();
+        return `tx:${id}`;
+    }
+
+    protected validate?( data: any, context: ModelValidationContext ): void | boolean | any | Promise<void | boolean | any>;
+
+    protected async _validateWrite<T>(
+        data: T,
+        operationOrMeta: ModelValidationOperation | { operation: 'create' | 'update', method: ModelMutationOperation, id?: unknown, ids?: unknown[], filter?: Document, parentID?: unknown },
+        start: number = Date.now(),
+        options?: { context?: Record<string, unknown>, traceID?: string },
+        filter?: Document,
+        smartFilter?: Record<string, unknown>,
+        parentID?: unknown
+    ): Promise<T>
+    {
+        const operation = typeof operationOrMeta === 'string' ? operationOrMeta : operationOrMeta.method as ModelValidationOperation;
+        const methodValidator = typeof this.validate === 'function'
+            ? ( d: any, ctx: ModelValidationContext ) => this.validate!( d, ctx )
+            : undefined;
+
+        try
+        {
+            return await executeModelValidator( this, this._validator, methodValidator, data, operation );
+        }
+        catch( e )
+        {
+            this._emitError( e, operation, Date.now() - start,
+            {
+                filter,
+                smartFilter,
+                parentID,
+                context : options?.context,
+                traceID : options?.traceID
+            });
+
+            throw e;
+        }
     }
 
     protected id(): DTO['id'] | Promise<DTO['id']>
@@ -831,11 +929,13 @@ export abstract class AbstractBaseModel
 
             if( access.denied ){ return null }
 
+            const session = this._resolveSession( options.session );
             const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
+            const batchScopeKey = session ? `${scopeKey ?? ''}|${this.#sessionScopeToken( session )}` : scopeKey;
             let dtoId: string | undefined;
             let cacheKey: string | undefined;
 
-            if( this._cache )
+            if( this._cache && !session )
             {
                 dtoId = String( this.dtoID( idOrIds ));
                 cacheKey = buildCacheKey( String( conversion ), dtoId, scopeKey );
@@ -853,7 +953,7 @@ export abstract class AbstractBaseModel
 
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
             const rawIds = Arr( idOrIds );
-            const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, scopeKey, rawIds,
+            const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, batchScopeKey, rawIds,
             {
                 operation   : 'get',
                 access      : options.access,
@@ -868,12 +968,12 @@ export abstract class AbstractBaseModel
                 documents = await this.#findAggregator.execute(
                     rawIds,
                     conversion,
-                    { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
+                    { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session }
                 ) as unknown as Array<DBE | null>;
             }
             finally
             {
-                this.#cleanupBatchMetaEntry( conversion, options.access, scopeKey, batchMetaEntry );
+                this.#cleanupBatchMetaEntry( conversion, options.access, batchScopeKey, batchMetaEntry );
             }
 
             benchmark?.step( 'QUERY' );
@@ -884,7 +984,7 @@ export abstract class AbstractBaseModel
 
             const result = ( entries[0] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
 
-            if( this._cache && cacheKey && dtoId !== undefined && result !== null )
+            if( this._cache && !session && cacheKey && dtoId !== undefined && result !== null )
             {
                 this._cache.set( cacheKey, result, [ dtoId ]);
                 this.#emitCacheEntry( 'set', cacheKey, dtoId, conversion, options );
@@ -925,10 +1025,12 @@ export abstract class AbstractBaseModel
                 return options.filter ? [] : ids.map(() => null );
             }
 
+            const session = this._resolveSession( options.session );
             const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
+            const batchScopeKey = session ? `${scopeKey ?? ''}|${this.#sessionScopeToken( session )}` : scopeKey;
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
 
-            if( this._cache )
+            if( this._cache && !session )
             {
                 const results: Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null> = new Array( ids.length ).fill( null );
                 const missing: Array<{ index: number, id: any, dtoId: string, cacheKey: string }> = [];
@@ -964,7 +1066,7 @@ export abstract class AbstractBaseModel
                 if( missing.length > 0 )
                 {
                     const missingIds = missing.map( m => m.id );
-                    const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, scopeKey, missingIds,
+                    const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, batchScopeKey, missingIds,
                     {
                         operation   : 'getMany',
                         access      : options.access,
@@ -979,12 +1081,12 @@ export abstract class AbstractBaseModel
                         documents = await this.#findAggregator.execute(
                             missingIds,
                             conversion,
-                            { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
+                            { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session }
                         ) as unknown as Array<DBE | null>;
                     }
                     finally
                     {
-                        this.#cleanupBatchMetaEntry( conversion, options.access, scopeKey, batchMetaEntry );
+                        this.#cleanupBatchMetaEntry( conversion, options.access, batchScopeKey, batchMetaEntry );
                     }
 
                     benchmark?.step( 'QUERY' );
@@ -1015,7 +1117,7 @@ export abstract class AbstractBaseModel
                 return options.filter ? results.filter( Boolean ) : results;
             }
 
-            const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, scopeKey, ids,
+            const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, batchScopeKey, ids,
             {
                 operation   : 'getMany',
                 access      : options.access,
@@ -1030,12 +1132,12 @@ export abstract class AbstractBaseModel
                 documents = await this.#findAggregator.execute(
                     ids,
                     conversion,
-                    { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
+                    { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session }
                 ) as unknown as Array<DBE | null>;
             }
             finally
             {
-                this.#cleanupBatchMetaEntry( conversion, options.access, scopeKey, batchMetaEntry );
+                this.#cleanupBatchMetaEntry( conversion, options.access, batchScopeKey, batchMetaEntry );
             }
 
             benchmark?.step( 'QUERY' );
@@ -1048,14 +1150,14 @@ export abstract class AbstractBaseModel
         });
     }
 
-    protected _stripObservabilityOptions<T extends { context?: Record<string, unknown>, traceID?: string }>( options: T ): Omit<T, 'context' | 'traceID'>
+    protected _stripObservabilityOptions<T extends { context?: Record<string, unknown>, traceID?: string, session?: ClientSession }>( options: T ): Omit<T, 'context' | 'traceID' | 'session'>
     {
-        if( options.context === undefined && options.traceID === undefined )
+        if( options.context === undefined && options.traceID === undefined && options.session === undefined )
         {
             return options;
         }
 
-        const { context: _c, traceID: _t, ...rest } = options;
+        const { context: _c, traceID: _t, session: _s, ...rest } = options;
 
         return rest;
     }
@@ -1071,7 +1173,9 @@ export abstract class AbstractBaseModel
     ): Promise<WithTotal<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>>>
     {
         const { context, traceID } = options;
-        const prev = options.cursor?.startsWith( 'prev:' );
+        const effectiveCursor = normalizeCursorOption( options );
+        const prev = effectiveCursor?.startsWith( 'prev:' );
+        const aggOpts = this._withSession({ collation: { locale: 'en' } }, options.session );
         const start = Date.now();
         let queryDuration = 0;
         let entries: Document[];
@@ -1081,7 +1185,7 @@ export abstract class AbstractBaseModel
         {
             [ entries, total ] = await Promise.all(
             [
-                this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+                this.collection.aggregate( pipeline, aggOpts ).toArray().then( r =>
                 {
                     queryDuration = Date.now() - start;
 
@@ -1092,7 +1196,7 @@ export abstract class AbstractBaseModel
                     return r;
                 }),
                 countPipeline
-                    ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+                    ? this.collection.aggregate( countPipeline, aggOpts ).toArray().then( r =>
                     {
                         const duration = Date.now() - start;
 
@@ -1171,7 +1275,9 @@ export abstract class AbstractBaseModel
     ): AsyncGenerator<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>
     {
         const { context, traceID } = options;
-        const prev = options.cursor?.startsWith( 'prev:' );
+        const effectiveCursor = normalizeCursorOption( options );
+        const prev = effectiveCursor?.startsWith( 'prev:' );
+        const aggOpts = this._withSession({ collation: { locale: 'en' } }, options.session );
         const start = Date.now();
         const emitStreamQuery = ( duration: number ) =>
         {
@@ -1186,7 +1292,7 @@ export abstract class AbstractBaseModel
 
         try
         {
-            const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
+            const cursorDocs = this.collection.aggregate( pipeline, aggOpts );
 
             if( prev )
             {
@@ -1247,9 +1353,128 @@ export abstract class AbstractBaseModel
         }
     }
 
+    public async list<K extends keyof Extensions['converters']>(
+        options: ListOpts,
+        conversion: K = 'dto' as K
+    ): Promise<WithTotal<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>>>
+    {
+        return this.runOperation( async() =>
+        {
+            const opts = options as any;
+            const bsonInput = this._stripObservabilityOptions( opts );
+            const { projection: convProjection } = this.converters[conversion];
+            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'list', access: opts.access });
+
+            if( access.denied )
+            {
+                return attachListMetadata([], opts.count ? 0 : undefined, {});
+            }
+
+            const resolvedList = resolveBSONObject( bsonInput );
+            const effectiveCursor = normalizeCursorOption( resolvedList );
+            let { sort = { [this._idField]: 1 }, projection = convProjection, countLimit, cursor: _cursor, after: _after, before: _before, count: _count, ...countRest } = resolvedList;
+
+            if( !sort[this._idField] )
+            {
+                sort = { ...sort, [this._idField]: 1 };
+            }
+
+            const resolvedAccess = { denied: false, filter: access.filter };
+            let [ pipeline, countPipeline ] = await Promise.all(
+            [
+                this.pipeline(
+                    {
+                        ...resolvedList,
+                        cursor              : effectiveCursor,
+                        sort,
+                        projection,
+                        [RESOLVED_ACCESS]   : resolvedAccess
+                    } as any,
+                    conversion,
+                    'list'
+                ),
+                resolvedList.count
+                    ? this.pipeline(
+                        {
+                            ...countRest,
+                            ...( this._idField === '_id' ? { computedProperties: undefined } : {} ),
+                            sort,
+                            projection,
+                            [RESOLVED_ACCESS] : resolvedAccess
+                        } as any,
+                        conversion,
+                        'listCount'
+                    ).then( p => this._pipelineBuilder.buildCountPipeline( p, countLimit ))
+                    : undefined
+            ]);
+
+            pipeline = this._optimizePipeline( pipeline );
+            countPipeline && ( countPipeline = this._optimizePipeline( countPipeline ));
+
+            flowGet( 'log' ) && DUMP( pipeline );
+            flowGet( 'log' ) && countPipeline && DUMP( countPipeline );
+
+            return this._executeList( pipeline, countPipeline, opts, sort, conversion, benchmark, Boolean( resolvedList.count ));
+        });
+    }
+
+    public async *stream<K extends keyof Extensions['converters']>(
+        options: StreamOpts,
+        conversion: K = 'dto' as K
+    ): AsyncGenerator<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>
+    {
+        const release = this.trackOperation();
+
+        try
+        {
+            const opts = options as any;
+            const bsonInput = this._stripObservabilityOptions( opts );
+            const { projection: convProjection } = this.converters[conversion];
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'stream', access: opts.access });
+
+            if( access.denied )
+            {
+                return;
+            }
+
+            const resolvedList = resolveBSONObject( bsonInput );
+            const effectiveCursor = normalizeCursorOption( resolvedList );
+            let { sort = { [this._idField]: 1 }, projection = convProjection } = resolvedList;
+
+            if( !sort[this._idField] )
+            {
+                sort = { ...sort, [this._idField]: 1 };
+            }
+
+            let pipeline = await this.pipeline(
+                {
+                    ...resolvedList,
+                    cursor              : effectiveCursor,
+                    sort,
+                    projection,
+                    [RESOLVED_ACCESS]   : { denied: false, filter: access.filter }
+                } as any,
+                conversion,
+                'stream'
+            );
+
+            pipeline = this._optimizePipeline( pipeline );
+
+            flowGet( 'log' ) && DUMP( pipeline );
+
+            yield* this._executeStream( pipeline, opts, sort, conversion );
+        }
+        finally
+        {
+            release();
+        }
+    }
+
     protected _buildListQueryContext( options: any, sort?: Document ): ModelQueryContext
     {
         const query: ModelQueryContext = {};
+        const effectiveCursor = normalizeCursorOption( options );
 
         if( options?.filter !== undefined ){ query.filter = options.filter }
         if( options?.smartFilter !== undefined ){ query.smartFilter = options.smartFilter as Record<string, unknown> }
@@ -1258,7 +1483,7 @@ export abstract class AbstractBaseModel
         if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
         if( options?.limit !== undefined ){ query.limit = options.limit }
         if( options?.skip !== undefined ){ query.skip = options.skip }
-        if( options?.cursor !== undefined ){ query.cursor = options.cursor }
+        if( effectiveCursor !== undefined ){ query.cursor = effectiveCursor }
         if( options?.access !== undefined ){ query.access = options.access }
 
         return query;
@@ -1305,13 +1530,26 @@ export abstract class AbstractBaseModel
 
             const { projection } = this.converters[conversion];
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':find(' + String( conversion ) + ')' ) : undefined;
+            const effectiveCursor = normalizeCursorOption( opts );
+            let effectiveSort: any = sort;
+
+            if( effectiveCursor !== undefined )
+            {
+                effectiveSort = effectiveSort ? { ...( effectiveSort as Record<string, any> ) } : { [this._idField]: 1 };
+
+                if( !effectiveSort[this._idField] )
+                {
+                    effectiveSort[this._idField] = 1;
+                }
+            }
 
             let pipeline = await this.pipeline(
             {
                 filter              : opts.filter,
                 smartFilter         : opts.smartFilter,
                 projection,
-                sort,
+                sort                : effectiveSort,
+                ...( effectiveCursor !== undefined ? { cursor: effectiveCursor } : {} ),
                 limit               : 1,
                 access              : opts.access,
                 [RESOLVED_ACCESS]   : access
@@ -1326,7 +1564,7 @@ export abstract class AbstractBaseModel
 
             try
             {
-                dbe = ( await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() )[0] as DBE | undefined;
+                dbe = ( await this.collection.aggregate( pipeline, this._withSession({ collation: { locale: 'en' } }, opts.session )).toArray() )[0] as DBE | undefined;
             }
             catch( e )
             {
@@ -1334,7 +1572,7 @@ export abstract class AbstractBaseModel
                 {
                     filter      : opts.filter,
                     smartFilter : opts.smartFilter,
-                    query       : this.#buildFindQueryContext( opts, sort ),
+                    query       : this.#buildFindQueryContext( opts, effectiveSort ),
                     context     : opts.context,
                     traceID     : opts.traceID
                 }));
@@ -1359,7 +1597,7 @@ export abstract class AbstractBaseModel
                 converterDuration,
                 resultCount : data ? 1 : 0,
                 conversion  : String( conversion ),
-                query       : this.#buildFindQueryContext( opts, sort ),
+                query       : this.#buildFindQueryContext( opts, effectiveSort ),
                 context     : opts.context,
                 traceID     : opts.traceID
             }));
@@ -1378,16 +1616,20 @@ export abstract class AbstractBaseModel
     {
         return this.runOperation( async() =>
         {
-            const { context, traceID, ...pipelineOptions } = ( options ?? {} ) as Record<string, any>;
+            const { context, traceID, session, ...pipelineOptions } = ( options ?? {} ) as Record<string, any>;
             const access = await this._access.resolveOrDeny({ operation: 'read', method: operation, access: pipelineOptions.access });
 
             if( access.denied ){ return [] }
 
+            const effectiveCursor = normalizeCursorOption( pipelineOptions );
+            const normalizedPipelineOpts = effectiveCursor !== undefined
+                ? { ...pipelineOptions, cursor: effectiveCursor }
+                : pipelineOptions;
             let aggregationPipeline: Document[];
 
-            if( isSet( pipelineOptions ) )
+            if( isSet( normalizedPipelineOpts ) )
             {
-                aggregationPipeline = [ ...await this.pipeline({ ...pipelineOptions, [RESOLVED_ACCESS]: access }, 'dbe' as any, operation ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+                aggregationPipeline = [ ...await this.pipeline({ ...normalizedPipelineOpts, [RESOLVED_ACCESS]: access }, 'dbe' as any, operation ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
             }
             else if( this._idField === '_id' )
             {
@@ -1409,7 +1651,7 @@ export abstract class AbstractBaseModel
 
             try
             {
-                res = await this.collection.aggregate( aggregationPipeline, { collation: { locale: 'en' } }).toArray() as T[];
+                res = await this.collection.aggregate( aggregationPipeline, this._withSession({ collation: { locale: 'en' } }, session )).toArray() as T[];
             }
             catch( e )
             {
@@ -1512,7 +1754,7 @@ export abstract class AbstractBaseModel
 
             try
             {
-                res = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray();
+                res = await this.collection.aggregate( pipeline, this._withSession({ collation: { locale: 'en' } }, findOptions.session )).toArray();
             }
             catch( e )
             {

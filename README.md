@@ -175,13 +175,19 @@ Configure `observability` on `AbstractModels`, `AbstractModel`, or `AbstractProp
 - **`AccessControl`** — named filters + defaults; deny-fast on `false`
 - Per-call `access: 'policy-name' | false` overrides defaults
 
+### Transactions, Validation & Cursor Pagination
+
+- **Transactions (`models.transaction(fn)` & `options.session`)**: `await models.transaction(async (session) => { ... })` automatically propagates the active `ClientSession` through `@liqd-js/flow` to every read (`get`, `getMany`, `find`, `list`, `stream`, `count`, `exists`, `aggregate`) and write (`create`, `createFrom`, `createMany`, `update`, `updateOne`, `updateMany`, `delete`, `deleteMany`) inside the callback. You can also pass `{ session }` per call. Active transactions bypass reading/populating `ModelCache` and replay cache invalidations after commit.
+- **Runtime Validation (`validate`)**: Pass a function `(data, ctx) => ...`, a Standard Schema v1 (`~standard.validate`), a Zod/Valibot-compatible schema (`safeParse` / `safeParseAsync` / `parse`), or `{ create?, update? }` in `defineModel` / `definePropertyModel` (or override `protected validate(data, ctx)` on subclasses). Failures throw `ModelValidationError` (`MODEL_VALIDATION_ERROR`, with `issues`) and emit `error` observability events.
+- **Keyset Cursor Pagination (`after` / `before` / `nextCursor` / `prevCursor`)**: `list()` results include ready-to-pass `page.nextCursor` (`next:<token>`) and `page.prevCursor` (`prev:<token>`) alongside `page.cursors`. `list()`, `stream()`, `find()`, and `aggregate()` accept `{ after }` and `{ before }` (either raw base64url tokens or prefixed tokens) in addition to `{ cursor }`.
+
 ### Helpers (selected)
 
 Re-exported object helpers include `objectHash`, `objectFlatten`, `deleteNullishProperties`, `i18n`, and related utilities. Pipeline/access internals (`PipelineBuilder`, `AccessControl`) are available for advanced composition.
 
 ### Errors
 
-- `ModelError`, `ModelQueryError`, `ModelConverterError`, `ModelAccessDeniedError`, `ModelAccessConfigError`, `ConverterRecipeError`
+- `ModelError`, `ModelQueryError`, `ModelConverterError`, `ModelAccessDeniedError`, `ModelAccessConfigError`, `ModelValidationError`, `ConverterRecipeError`
 
 ## Troubleshooting
 

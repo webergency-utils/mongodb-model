@@ -1,6 +1,7 @@
-import { Document, Filter, FindOptions, MongoClientOptions, ObjectId } from 'mongodb';
+import { ClientSession, Document, Filter, FindOptions, MongoClientOptions, ObjectId } from 'mongodb';
 import type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
 import type { ModelCacheConfig } from '../cache.js';
+import type { ModelValidationIssue } from '../errors.js';
 import type { ObservabilityConfig } from '../events.js';
 import
 {
@@ -44,6 +45,7 @@ export type ModelCreateOptions =
     access?             : string
     context?            : Record<string, unknown>
     traceID?            : string
+    session?            : ClientSession
 };
 
 export type ModelUpdateOptions =
@@ -53,6 +55,7 @@ export type ModelUpdateOptions =
     access?         : string
     context?        : Record<string, unknown>
     traceID?        : string
+    session?        : ClientSession
 };
 
 export type ModelDeleteOptions =
@@ -60,6 +63,7 @@ export type ModelDeleteOptions =
     access?     : string
     context?    : Record<string, unknown>
     traceID?    : string
+    session?    : ClientSession
 };
 
 export type ModelExistsOptions =
@@ -67,6 +71,7 @@ export type ModelExistsOptions =
     access?     : string
     context?    : Record<string, unknown>
     traceID?    : string
+    session?    : ClientSession
 };
 
 export type MongoRootDocument = Document & { _id: any };
@@ -74,14 +79,16 @@ export type MongoPropertyDocument = Document & { id: any };
 
 export type ListResult<T> =
 {
-    items   : T[]
-    total?  : number
-    cursors : { next?: string, prev?: string }
+    items       : T[]
+    total?      : number
+    cursors     : { next?: string, prev?: string }
+    nextCursor? : string
+    prevCursor? : string
 }
 
 export type WithTotal<T> = T extends Array<infer U>
     ? Array<U> & ListResult<U>
-    : T & { total?: number, cursors?: { next?: string, prev?: string } };
+    : T & { total?: number, cursors?: { next?: string, prev?: string }, nextCursor?: string, prevCursor?: string };
 
 export type GetOptions<K extends string | number | symbol = 'dto'> =
 {
@@ -89,6 +96,7 @@ export type GetOptions<K extends string | number | symbol = 'dto'> =
     access?     : string
     context?    : Record<string, unknown>
     traceID?    : string
+    session?    : ClientSession
 }
 
 export type GetManyOptions<K extends string | number | symbol = 'dto'> =
@@ -98,6 +106,7 @@ export type GetManyOptions<K extends string | number | symbol = 'dto'> =
     access?     : string
     context?    : Record<string, unknown>
     traceID?    : string
+    session?    : ClientSession
 }
 
 export type ModelSmartFilter<T> = { [K in PublicMethodNames<T>]?: FirstParameter<T[K]> }
@@ -110,6 +119,8 @@ export type ModelListOptions<DBE extends Document, Filters = never, Properties =
     smartFilter?        : ModelSmartFilter<Filters>
     computedProperties? : ComputedPropertiesParam<Properties extends AbstractModelProperties<any> ? Properties : any>
     cursor?             : string
+    after?              : string
+    before?             : string
     pipeline?           : Document[]
     count?              : boolean
     sample?             : number
@@ -117,6 +128,7 @@ export type ModelListOptions<DBE extends Document, Filters = never, Properties =
     access?             : string
     context?            : Record<string, unknown>
     traceID?            : string
+    session?            : ClientSession
 };
 
 export type ModelStreamOptions<DBE extends Document, Filters = never, Properties = never> =
@@ -135,6 +147,8 @@ export type PropertyModelListOptions
     smartFilter?        : ModelSmartFilter<FirstType<Filters>>
     computedProperties? : ComputedPropertiesParam<SecondType<Properties> extends AbstractModelProperties<any> ? SecondType<Properties> : any>
     cursor?             : string
+    after?              : string
+    before?             : string
     projection?         : FindOptions['projection'] & { _root?: FindOptions['projection'] }
     pipeline?           : Document[]
     count?              : boolean
@@ -143,6 +157,7 @@ export type PropertyModelListOptions
     access?             : string
     context?            : Record<string, unknown>
     traceID?            : string
+    session?            : ClientSession
 };
 
 export type PropertyModelStreamOptions
@@ -158,9 +173,13 @@ export type ModelFindOptions<DBE extends Document, Filters = never> =
 {
     filter?      : Filter<DBE>
     smartFilter? : ModelSmartFilter<Filters>
+    cursor?      : string
+    after?       : string
+    before?      : string
     access?      : string
     context?     : Record<string, unknown>
     traceID?     : string
+    session?     : ClientSession
 }
 
 export type PropertyModelFindOptions
@@ -173,9 +192,13 @@ export type PropertyModelFindOptions
 {
     filter?      : PropertyModelFilter<RootDBE, DBE>
     smartFilter? : ModelSmartFilter<SecondType<Filters>>
+    cursor?      : string
+    after?       : string
+    before?      : string
     access?      : string
     context?     : Record<string, unknown>
     traceID?     : string
+    session?     : ClientSession
 }
 
 export type ModelAggregateOptions
@@ -193,10 +216,15 @@ export type ModelAggregateOptions
     sort?               : FindOptions['sort']
     limit?              : number
     skip?               : number
+    cursor?             : string
+    after?              : string
+    before?             : string
+    sample?             : number
     pipeline?           : Document[]
     access?             : string
     context?            : Record<string, unknown>
     traceID?            : string
+    session?            : ClientSession
 };
 
 export type PropertyModelAggregateOptions
@@ -215,10 +243,15 @@ export type PropertyModelAggregateOptions
     sort?               : FindOptions['sort']
     limit?              : number
     skip?               : number
+    cursor?             : string
+    after?              : string
+    before?             : string
+    sample?             : number
     pipeline?           : Document[]
     access?             : string
     context?            : Record<string, unknown>
     traceID?            : string
+    session?            : ClientSession
 };
 
 export type FirstType<T> = T extends [ infer U, ...unknown[] ] ? U : undefined;
@@ -279,6 +312,7 @@ export type ConstructorExtensions<E extends PropertyModelExtensions<any, any, an
         computedProperties? : FirstType<ExtractComputedProperties<E>>
         optimizer?          : OptimizerConfig
         observability?      : ObservabilityConfig
+        validate?           : E['validate']
     }
 
 export type ModelExtensions
@@ -296,6 +330,7 @@ export type ModelExtensions
     access?             : ModelAccessConfig<DBE>
     optimizer?          : OptimizerConfig
     observability?      : ObservabilityConfig
+    validate?           : ModelValidatorConfig<DBE>
 }
 
 export type PropertyModelExtensions
@@ -313,6 +348,7 @@ export type PropertyModelExtensions
     access?             : ModelAccessConfig<DBE>
     optimizer?          : OptimizerConfig
     observability?      : ObservabilityConfig
+    validate?           : ModelValidatorConfig<DBE>
 }
 
 export type MongoBSONTypes<T> = T extends ObjectId
@@ -359,3 +395,48 @@ export type ModelAccessConfig<T = Document> =
     filters?  : Record<string, AccessFilterFn<T>>
     defaults? : AccessDefaultsMap | AccessDefaultsFn
 }
+
+export type ModelValidationOperation = 'create' | 'createMany' | 'update' | 'updateOne' | 'updateMany';
+
+export type ModelValidationContext =
+{
+    operation           : ModelValidationOperation
+    isUpdateOperator    : boolean
+};
+
+export type ModelStandardSchemaV1<T = unknown> =
+{
+    '~standard' :
+    {
+        validate : ( value: unknown ) =>
+            | { value: T, issues?: undefined }
+            | { issues: ReadonlyArray<ModelValidationIssue> }
+            | Promise<{ value: T, issues?: undefined } | { issues: ReadonlyArray<ModelValidationIssue> }>
+    }
+};
+
+export type ModelParseSchema<T = unknown> =
+    | {
+        safeParse       : ( value: unknown ) => { success: boolean, data?: T, error?: { message?: string, issues?: ReadonlyArray<ModelValidationIssue> } }
+        safeParseAsync? : ( value: unknown ) => Promise<{ success: boolean, data?: T, error?: { message?: string, issues?: ReadonlyArray<ModelValidationIssue> } }>
+    }
+    | {
+        parse           : ( value: unknown ) => T | Promise<T>
+    };
+
+export type ModelValidatorFn<T = any> = (
+    data: T,
+    context: ModelValidationContext
+) => void | boolean | T | Promise<void | boolean | T>;
+
+export type ModelValidatorInput<T = any> =
+    | ModelValidatorFn<T>
+    | ModelStandardSchemaV1<T>
+    | ModelParseSchema<T>;
+
+export type ModelValidatorConfig<DBE extends Document = Document> =
+    | ModelValidatorInput<Partial<DBE> | any>
+    | {
+        create? : ModelValidatorInput<Partial<DBE> | any>
+        update? : ModelValidatorInput<Partial<DBE> | any>
+    };

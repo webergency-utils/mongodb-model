@@ -8,6 +8,7 @@ import
     ModelAccessConfig,
     ModelCacheConfig,
     ModelExtensions,
+    ModelValidatorConfig,
     MongoPropertyDocument,
     MongoRootDocument,
     ObservabilityConfig,
@@ -101,6 +102,7 @@ export type RootModelDefinition
     access?              : ModelAccessConfig<DBE>
     optimizer?           : OptimizerConfig
     observability?       : ObservabilityConfig
+    validate?            : ModelValidatorConfig<DBE>
     dtoID?               : ( id: unknown ) => string
 }
 
@@ -121,6 +123,7 @@ export type PropertyModelDefinition
     access?              : ModelAccessConfig<DBE>
     optimizer?           : OptimizerConfig
     observability?       : ObservabilityConfig
+    validate?            : ModelValidatorConfig<DBE>
     dtoID?               : ( id: unknown ) => string
 }
 

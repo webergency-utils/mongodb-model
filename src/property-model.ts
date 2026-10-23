@@ -12,7 +12,6 @@ import { extractTargetIdsFromFilter } from './cache.js';
 import { ModelAccessDeniedError, ModelError } from './errors.js';
 import { ModelMutationOperation } from './events.js';
 import { flowGet } from './flow.js';
-import { Benchmark } from './helpers/benchmark.js';
 import
 {
     LOG,
@@ -38,9 +37,9 @@ import { propertyModelTargetUpdateParams } from './helpers/mongo.js';
 import { AbstractModels } from './models.js';
 import
 {
-    attachListMetadata,
     attachPropertyUpdateMetadata,
     buildPropertyDeleteOperation,
+    normalizeCursorOption,
     normalizeFindMatch,
     resolveCreateFromArgs
 }
@@ -65,8 +64,7 @@ import
     PropertyModelFindOptions,
     PropertyModelListOptions,
     PropertyModelStreamOptions,
-    PropertyModelUpdateResponse,
-    WithTotal
+    PropertyModelUpdateResponse
 }
 from './types/external.js';
 import { ComputedPropertiesParam, SyncComputedPropertyMethod } from './types/internal.js';
@@ -91,7 +89,9 @@ extends AbstractBaseModel<
     PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
     PropertyModelAggregateOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
     DTO['id'] | DBE['id'] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
-    { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> }
+    { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> },
+    PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
+    PropertyModelStreamOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
 >
 {
     #paths: { path: string, array: boolean }[];
@@ -118,6 +118,7 @@ extends AbstractBaseModel<
             access                      : params.access,
             optimizer                   : params.optimizer,
             observability               : params.observability,
+            validate                    : params.validate,
             idField                     : 'id',
             prefix,
             smartFilterOptions          :
@@ -166,6 +167,7 @@ extends AbstractBaseModel<
         const preResolvedAccess = ( options as any )?.[RESOLVED_ACCESS] as { denied: boolean, filter?: Filter<DBE> } | undefined;
         const { computedProperties } = this.converters[conversion ?? 'dto'];
         const { sort = { id: -1 }, projection, skip, limit, pipeline: userPipeline } = resolveBSONObject( options );
+        const cursor = normalizeCursorOption( options );
 
         let pipeline: Document[] = [], prefix = '$';
 
@@ -274,7 +276,7 @@ extends AbstractBaseModel<
             pipeline.push({ $unset: unsetFields });
         }
 
-        const prev = options.cursor?.startsWith( 'prev:' );
+        const prev = cursor?.startsWith( 'prev:' );
 
         pipeline.push( ...await this._pipelineBuilder.pipeline(
         {
@@ -300,23 +302,35 @@ extends AbstractBaseModel<
 
             const _id: DTO['id'] = id ?? await this.id();
             const parentModel = this._models[GET_PARENT]( this.collection.collectionName, this.#prefix );
-            const parent = parentModel ? await parentModel.get( parentID ) : null;
+            const parent = parentModel
+                ? await parentModel.get( parentID, options?.session ? { session: options.session } : undefined )
+                : null;
 
             if( !parent || !parentModel )
             {
                 throw new ModelError( 'MODEL_PARENT_NOT_FOUND', this, `Parent document not found: ${parentID}` );
             }
 
+            const start = Date.now();
+            const validated = await this._validateWrite(
+                { id: this.dbeID( _id ), ...dbe } as Partial<DBE>,
+                { operation: 'create', method: 'create', id: _id, parentID },
+                start,
+                options,
+                undefined,
+                undefined,
+                parentID
+            );
+
             const { parentIDPath, updatePath, arrayFilters } = propertyModelUpdateParams( this.#paths, parentModel.dbeID( parentID ));
             const operation = this.#paths[this.#paths.length - 1].array ? '$push' : '$set';
-            const start = Date.now();
 
             try
             {
                 await this.collection.updateOne(
                     resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
-                    resolveBSONObject({ [operation]: { [updatePath]: { id: this.dbeID( _id ), ...dbe } } }),
-                    resolveBSONObject({ arrayFilters })
+                    resolveBSONObject({ [operation]: { [updatePath]: { id: this.dbeID( _id ), ...validated } } }),
+                    this._withSession( resolveBSONObject({ arrayFilters }), options?.session )
                 );
 
                 this._notifySiblingCacheInvalidation();
@@ -417,7 +431,9 @@ extends AbstractBaseModel<
             }
 
             const parentModel = this._models[GET_PARENT]( this.collection.collectionName, this.#prefix );
-            const parent = parentModel ? await parentModel.get( parentID ) : null;
+            const parent = parentModel
+                ? await parentModel.get( parentID, resolvedOptions?.session ? { session: resolvedOptions.session } : undefined )
+                : null;
 
             if( !parent || !parentModel )
             {
@@ -440,15 +456,25 @@ extends AbstractBaseModel<
 
             const ids: DTO['id'][] = [];
             const docs: Document[] = [];
+            const start = Date.now();
 
             for( let i = 0; i < items.length; i++ )
             {
                 const item = items[i];
                 const rawId = explicitIds?.[i] ?? ( item.id !== undefined ? this.dtoID( item.id ) : await this.id());
                 const dtoId = this.dtoID( rawId ) as DTO['id'];
+                const validated = await this._validateWrite(
+                    { ...item, id: this.dbeID( dtoId ) } as Partial<DBE>,
+                    { operation: 'create', method: 'createMany', id: dtoId, parentID },
+                    start,
+                    resolvedOptions,
+                    undefined,
+                    undefined,
+                    parentID
+                );
 
                 ids.push( dtoId );
-                docs.push( resolveBSONObject({ ...item, id: this.dbeID( dtoId ) }));
+                docs.push( resolveBSONObject({ ...validated, id: this.dbeID( dtoId ) }));
             }
 
             const { parentIDPath, updatePath, arrayFilters } = propertyModelUpdateParams( this.#paths, parentModel.dbeID( parentID ));
@@ -456,14 +482,13 @@ extends AbstractBaseModel<
             const updatePayload = isLeafArray
                 ? { $push: { [updatePath]: { $each: docs } } }
                 : { $set: { [updatePath]: docs[docs.length - 1] } };
-            const start = Date.now();
 
             try
             {
                 await this.collection.updateOne(
                     resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
                     resolveBSONObject( updatePayload ),
-                    resolveBSONObject({ arrayFilters })
+                    this._withSession( resolveBSONObject({ arrayFilters }), resolvedOptions?.session )
                 );
 
                 this._notifySiblingCacheInvalidation();
@@ -538,7 +563,8 @@ extends AbstractBaseModel<
                     filter  : { id: dbeId } as any,
                     access  : options?.access,
                     context : options?.context,
-                    traceID : options?.traceID
+                    traceID : options?.traceID,
+                    session : options?.session
                 },
                 access.filter,
                 1,
@@ -563,8 +589,18 @@ extends AbstractBaseModel<
             }
         }
 
+        const start = Date.now();
+        const validatedUpdate = await this._validateWrite(
+            update,
+            { operation: 'update', method, id, filter: callerFilter?.filter },
+            start,
+            options,
+            callerFilter?.filter ?? { [path]: dbeId },
+            callerFilter?.smartFilter
+        );
+
         const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, dbeId );
-        const operations = addPrefixToUpdate<RootDBE, DBE>( update, updatePrefix );
+        const operations = addPrefixToUpdate<RootDBE, DBE>( validatedUpdate, updatePrefix );
         const updateOptions: UpdateOptions = arrayFilters ? { arrayFilters } : {};
 
         const match: Filter<RootDBE> = access.filter
@@ -574,7 +610,6 @@ extends AbstractBaseModel<
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
         const documentBefore = options?.documentBefore ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options ) : undefined;
-        const start = Date.now();
         let res: { matchedCount: number, modifiedCount: number };
 
         try
@@ -582,7 +617,7 @@ extends AbstractBaseModel<
             res = await this.collection.updateOne(
                 resolveBSONObject( match ) as Filter<RootDBE>,
                 toUpdateOperations( operations ),
-                resolveBSONObject( updateOptions )
+                this._withSession( resolveBSONObject( updateOptions ), options?.session )
             );
         }
         catch( e )
@@ -644,7 +679,10 @@ extends AbstractBaseModel<
 
         try
         {
-            docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as DBE[];
+            docs = await this.collection.aggregate(
+                pipeline,
+                this._withSession({ collation: { locale: 'en' } }, options?.session )
+            ).toArray() as DBE[];
         }
         catch( e )
         {
@@ -709,7 +747,10 @@ extends AbstractBaseModel<
 
         try
         {
-            docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as Array<{ id: DBE['id'] }>;
+            docs = await this.collection.aggregate(
+                pipeline,
+                this._withSession({ collation: { locale: 'en' } }, findOptions.session )
+            ).toArray() as Array<{ id: DBE['id'] }>;
         }
         catch( e )
         {
@@ -757,7 +798,7 @@ extends AbstractBaseModel<
         findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> | undefined,
         accessFilter?: Filter<any>,
         parentOperation: 'updateMany' | 'deleteMany' = 'updateMany',
-        options?: { access?: string, context?: Record<string, unknown>, traceID?: string }
+        options?: { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ModelUpdateOptions['session'] }
     ): Promise<{ dbeIds: Array<DBE['id']>, cacheIdsToInvalidate: Array<DBE['id'] | DTO['id'] | string> | null }>
     {
         const hasSubdocAccess = this.#hasEffectiveSubdocAccessFilter( accessFilter );
@@ -773,7 +814,8 @@ extends AbstractBaseModel<
                         filter  : { id: { $in: dbeIds } } as any,
                         access  : options?.access,
                         context : options?.context,
-                        traceID : options?.traceID
+                        traceID : options?.traceID,
+                        session : options?.session
                     },
                     accessFilter,
                     undefined,
@@ -866,7 +908,7 @@ extends AbstractBaseModel<
             const res = await this.#updateById(
                 targetId,
                 update,
-                { ...options, access: findOptions.access, context: findOptions.context, traceID: findOptions.traceID },
+                { ...options, access: findOptions.access, context: findOptions.context, traceID: findOptions.traceID, session: findOptions.session },
                 access,
                 !isDirectSingleId,
                 'updateOne',
@@ -905,6 +947,7 @@ extends AbstractBaseModel<
             const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
             const effectiveContext = isIdArray ? options?.context : findOptions?.context;
             const effectiveTraceID = isIdArray ? options?.traceID : findOptions?.traceID;
+            const effectiveSession = isIdArray ? options?.session : findOptions?.session;
 
             const access = await this._access.resolveOrDeny({ operation: 'update', method: 'updateMany', access: effectiveAccess });
 
@@ -942,8 +985,18 @@ extends AbstractBaseModel<
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
 
+            const start = Date.now();
+            const validatedUpdate = await this._validateWrite(
+                update,
+                { operation: 'update', method: 'updateMany', ids: cacheIdsToInvalidate ?? dbeIds, filter: findOptions?.filter },
+                start,
+                { ...options, context: effectiveContext, traceID: effectiveTraceID },
+                findOptions?.filter,
+                findOptions?.smartFilter as Record<string, unknown>
+            );
+
             const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, { $in: dbeIds });
-            const operations = addPrefixToUpdate<RootDBE, DBE>( update, updatePrefix );
+            const operations = addPrefixToUpdate<RootDBE, DBE>( validatedUpdate, updatePrefix );
             const updateOptions: UpdateOptions = arrayFilters ? { arrayFilters } : {};
 
             const match: Filter<RootDBE> = access.filter
@@ -952,7 +1005,6 @@ extends AbstractBaseModel<
 
             flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
-            const start = Date.now();
             let res: { matchedCount: number, modifiedCount: number };
 
             try
@@ -960,7 +1012,7 @@ extends AbstractBaseModel<
                 res = await this.collection.updateMany(
                     resolveBSONObject( match ) as Filter<RootDBE>,
                     toUpdateOperations( operations ),
-                    resolveBSONObject( updateOptions )
+                    this._withSession( resolveBSONObject( updateOptions ), effectiveSession )
                 );
             }
             catch( e )
@@ -998,88 +1050,6 @@ extends AbstractBaseModel<
         });
     }
 
-    public async list<K extends keyof Extensions['converters']>(
-        options: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
-        conversion: K = 'dto' as K
-    ): Promise<WithTotal<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>>>
-    {
-        return this.runOperation( async() =>
-        {
-            const bsonInput = this._stripObservabilityOptions( options );
-            const { projection } = this.converters[conversion];
-            const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
-            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'list', access: options.access });
-
-            if( access.denied )
-            {
-                return attachListMetadata([], options.count ? 0 : undefined, {});
-            }
-
-            const resolvedList = resolveBSONObject( bsonInput );
-            // Strip cursor/count from the count path — count is not page-scoped, and must not
-            // re-apply cursor against a different default sort than the list pipeline.
-            let { sort = { id: 1 }, countLimit, cursor: _cursor, count: _count, ...countRest } = resolvedList;
-
-            if( !sort.id )
-            {
-                sort = { ...sort, id: 1 };
-            }
-
-            const resolvedAccess = { denied: false, filter: access.filter };
-            let [ pipeline, countPipeline ] = await Promise.all(
-            [
-                this.pipeline({ ...resolvedList, sort, projection, [RESOLVED_ACCESS]: resolvedAccess } as any, conversion, 'list' ),
-                resolvedList.count
-                    ? this.pipeline({ ...countRest, sort, projection, [RESOLVED_ACCESS]: resolvedAccess } as any, conversion, 'list' )
-                        .then( p => this._pipelineBuilder.buildCountPipeline( p, countLimit ))
-                    : undefined
-            ]);
-
-            pipeline = this._optimizePipeline( pipeline );
-            countPipeline && ( countPipeline = this._optimizePipeline( countPipeline ));
-
-            return this._executeList( pipeline, countPipeline, options, sort, conversion, benchmark, Boolean( resolvedList.count ));
-        });
-    }
-
-    public async *stream<K extends keyof Extensions['converters']>(
-        options: PropertyModelStreamOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
-        conversion: K = 'dto' as K
-    ): AsyncGenerator<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>
-    {
-        const release = this.trackOperation();
-
-        try
-        {
-            const bsonInput = this._stripObservabilityOptions( options );
-            const { projection } = this.converters[conversion];
-            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'stream', access: options.access });
-
-            if( access.denied )
-            {
-                return;
-            }
-
-            const resolvedList = resolveBSONObject( bsonInput );
-            let { sort = { id: 1 } } = resolvedList;
-
-            if( !sort.id )
-            {
-                sort = { ...sort, id: 1 };
-            }
-
-            let pipeline = await this.pipeline({ ...resolvedList, sort, projection, [RESOLVED_ACCESS]: { denied: false, filter: access.filter } } as any, conversion, 'stream' );
-
-            pipeline = this._optimizePipeline( pipeline );
-
-            yield* this._executeStream( pipeline, options, sort, conversion );
-        }
-        finally
-        {
-            release();
-        }
-    }
-
     public async delete( id: DTO['id'] | DBE['id'], options?: ModelDeleteOptions ): Promise<boolean>
     {
         return this.runOperation( async() =>
@@ -1100,7 +1070,8 @@ extends AbstractBaseModel<
                         filter  : { id: dbeId } as any,
                         access  : options?.access,
                         context : options?.context,
-                        traceID : options?.traceID
+                        traceID : options?.traceID,
+                        session : options?.session
                     },
                     access.filter,
                     1,
@@ -1139,7 +1110,7 @@ extends AbstractBaseModel<
                 res = await this.collection.updateOne(
                     resolveBSONObject( match ) as Filter<RootDBE>,
                     resolveBSONObject( operations ) as UpdateFilter<RootDBE>,
-                    resolveBSONObject( updateOptions )
+                    this._withSession( resolveBSONObject( updateOptions ), options?.session )
                 );
             }
             catch( e )
@@ -1181,6 +1152,7 @@ extends AbstractBaseModel<
             const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
             const effectiveContext = isIdArray ? options?.context : findOptions?.context;
             const effectiveTraceID = isIdArray ? options?.traceID : findOptions?.traceID;
+            const effectiveSession = isIdArray ? options?.session : findOptions?.session;
 
             const access = await this._access.resolveOrDeny({ operation: 'delete', method: 'deleteMany', access: effectiveAccess });
 
@@ -1232,7 +1204,7 @@ extends AbstractBaseModel<
                 res = await this.collection.updateMany(
                     resolveBSONObject( match ) as Filter<RootDBE>,
                     resolveBSONObject( operations ) as UpdateFilter<RootDBE>,
-                    resolveBSONObject( updateOptions )
+                    this._withSession( resolveBSONObject( updateOptions ), effectiveSession )
                 );
             }
             catch( e )
@@ -1278,7 +1250,8 @@ extends AbstractBaseModel<
         const sort = list.sort ?? { id: -1 };
         const access = preResolvedAccess ?? await this._access.resolveOrDeny({ operation: 'read', method, access: list.access });
         const accessFilter = access.denied ? { '_root._id': { $exists: false }, id: { $exists: false } } : access.filter;
-        const cursorFilter = list.cursor ? generateCursorCondition( list.cursor, sort ) : undefined;
+        const cursor = normalizeCursorOption( list );
+        const cursorFilter = cursor ? generateCursorCondition( cursor, sort ) : undefined;
         const stageFilter = optimizeMatch( resolveBSONObject(
         {
             $and: [ addPrefixToFilter({ $and: [ list.filter, accessFilter, cursorFilter ] }, this.#prefix ) ]
