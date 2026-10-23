@@ -7,6 +7,10 @@ const
     deleteNullishProperties,
     compileConverters,
     createDefaultConverters,
+    collectAddedFields,
+    getUsedFields,
+    optimizeMatch,
+    ModelCache,
     AccessControl,
     PipelineBuilder,
     ModelAccessDeniedError
@@ -76,10 +80,23 @@ module.exports.fuzz = function( data )
         createDefaultConverters({ dtoID: ( id ) => String( id ) });
         compileConverters({ basic: { pick: [ 'name' ] } }, { dtoID: ( id ) => String( id ) });
 
-        const access = new AccessControl({},
+        optimizeMatch( obj );
+        collectAddedFields([{ $addFields: obj }]);
+        getUsedFields([{ $match: obj }]);
+
+        const cache = new ModelCache({ maxSize: 8, ttl: 1000 });
+        cache.set( 'k', obj );
+        cache.get( 'k' );
+
+        const access = new AccessControl(
         {
-            filters     : { open: async() => ({}) },
-            defaults    : { read: 'open' }
+            model           : {},
+            config          :
+            {
+                filters     : { open: async() => ({}) },
+                defaults    : { read: 'open' }
+            },
+            invokeFilter    : async() => ({})
         });
 
         void access.resolve({ operation: 'read', method: 'list' });

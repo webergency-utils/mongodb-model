@@ -2,8 +2,6 @@
   "include": ["./**/*.ts", "./**/*.d.ts"],
   "compilerOptions":
   {
-    "ignoreDeprecations": "6.0",
-    "baseUrl": ".",
     "paths":
     {
       "@webergency-utils/mongodb-model": [ "../src/index.ts" ]
