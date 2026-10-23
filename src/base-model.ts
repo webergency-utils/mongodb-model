@@ -51,14 +51,24 @@ from './helpers/index.js';
 import { AbstractModels } from './models.js';
 import
 {
+    ResolvedSoftDeleteConfig,
+    ResolvedTimestampsConfig,
+    applyCreateTimestamps,
+    applyUpdateTimestamps,
     attachCursorToItem,
     attachListMetadata,
+    buildSoftDeleteFilter,
+    combineMongoFilters,
     convertDocuments,
     executeModelValidator,
     normalizeCursorOption,
     normalizeExistsOptions,
+    normalizeFindMatch,
     normalizeGetManyOptions,
-    normalizeGetOptions
+    normalizeGetOptions,
+    normalizeModelIndexes,
+    resolveSoftDeleteConfig,
+    resolveTimestampsConfig
 }
 from './operations.js';
 import { PipelineBuilder } from './pipeline-builder.js';
@@ -66,10 +76,12 @@ import { ComputedPropertyResolver, SmartFilterResolver, SmartFilterResolverOptio
 import
 {
     CLEAR_LOCAL_CACHE,
+    GET_MANAGED_INDEXES,
     GET_OBSERVABILITY_OPTIONS,
     GET_OPTIMIZER_OPTIONS,
     GET_PARENT,
     HAS_OBSERVABILITY_LISTENERS,
+    INCLUDE_DELETED,
     INVALIDATE_COLLECTION_CACHE,
     REGISTER_MODEL,
     RESOLVED_ACCESS,
@@ -83,11 +95,20 @@ import
     GetManyOptions,
     GetOptions,
     ModelAccessConfig,
+    ModelDistinctOptions,
     ModelExistsOptions,
+    ModelHookContext,
+    ModelHooksConfig,
+    ModelIndexDefinition,
+    ModelSoftDeleteConfig,
+    ModelSyncIndexesOptions,
+    ModelSyncIndexesResult,
+    ModelTimestampsConfig,
     ModelValidationContext,
     ModelValidationOperation,
     ModelValidatorConfig,
     MongoRootDocument,
+    NormalizedModelIndex,
     OptimizerConfig,
     OptimizerOptions,
     WithTotal
@@ -114,6 +135,10 @@ export type BaseModelParams<DBE extends Document> =
     optimizer?              : OptimizerConfig
     observability?          : ObservabilityConfig
     validate?               : ModelValidatorConfig<DBE>
+    indexes?                : ModelIndexDefinition[]
+    timestamps?             : ModelTimestampsConfig
+    softDelete?             : ModelSoftDeleteConfig
+    hooks?                  : ModelHooksConfig<DBE>
     idField                 : '_id' | 'id'
     prefix?                 : string
     smartFilterOptions?     : SmartFilterResolverOptions
@@ -153,6 +178,10 @@ export abstract class AbstractBaseModel
     protected _optimizer?: OptimizerConfig;
     protected _observability?: ObservabilityConfig;
     protected _validator?: ModelValidatorConfig<DBE>;
+    protected _indexes: NormalizedModelIndex[];
+    protected _timestamps?: ResolvedTimestampsConfig;
+    protected _softDelete?: ResolvedSoftDeleteConfig;
+    protected _hooks?: ModelHooksConfig<DBE>;
     protected _idField: '_id' | 'id';
     protected _prefix?: string;
 
@@ -176,6 +205,10 @@ export abstract class AbstractBaseModel
         this._optimizer = params.optimizer;
         this._observability = params.observability;
         this._validator = params.validate;
+        this._indexes = normalizeModelIndexes( params.indexes, params.prefix );
+        this._timestamps = resolveTimestampsConfig( params.timestamps );
+        this._softDelete = resolveSoftDeleteConfig( params.softDelete );
+        this._hooks = params.hooks;
         this._pipelineBuilder = new PipelineBuilder<CollectionDoc>();
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this._converters = new ConverterManager( this, this.converters, ( err, op ) => this._emitError( err, op ));
@@ -189,7 +222,7 @@ export abstract class AbstractBaseModel
         this._smartFilters = new SmartFilterResolver( this, params.smartFilters, params.smartFilterOptions );
         this._computedProperties = new ComputedPropertyResolver( this, params.computedProperties, params.computedPropertyOptions );
 
-        this.#findAggregator = new Aggregator( async( ids: Array<any>, conversion: keyof Extensions['converters'], accessCtx?: { access?: string, scopeKey?: string, [RESOLVED_ACCESS]?: { denied: boolean, filter?: Filter<DBE> }, [RESOLVED_SESSION]?: ClientSession } ) =>
+        this.#findAggregator = new Aggregator( async( ids: Array<any>, conversion: keyof Extensions['converters'], accessCtx?: { access?: string, scopeKey?: string, [RESOLVED_ACCESS]?: { denied: boolean, filter?: Filter<DBE> }, [RESOLVED_SESSION]?: ClientSession, [INCLUDE_DELETED]?: boolean } ) =>
         {
             const metaKey = this.#batchMetaKey( conversion, accessCtx?.access, accessCtx?.scopeKey );
             const queue = this.#pendingBatchMeta.get( metaKey );
@@ -278,7 +311,8 @@ export abstract class AbstractBaseModel
                     filter              : { [this._idField]: { $in: dbeIds } } as any,
                     projection          : this.converters[conversion].projection,
                     access              : accessCtx?.access,
-                    [RESOLVED_ACCESS]   : accessCtx?.[RESOLVED_ACCESS]
+                    [RESOLVED_ACCESS]   : accessCtx?.[RESOLVED_ACCESS],
+                    [INCLUDE_DELETED]   : accessCtx?.[INCLUDE_DELETED]
                 } as any, conversion, batchOperation );
 
                 pipeline = this._optimizePipeline( pipeline );
@@ -790,6 +824,309 @@ export abstract class AbstractBaseModel
     }
 
     protected validate?( data: any, context: ModelValidationContext ): void | boolean | any | Promise<void | boolean | any>;
+    protected beforeCreate?( ctx: ModelHookContext<DBE> ): void | Partial<DBE> | Promise<void | Partial<DBE>>;
+    protected afterCreate?( ctx: ModelHookContext<DBE> ): void | Promise<void>;
+    protected beforeUpdate?( ctx: ModelHookContext<DBE> ): void | Document | Promise<void | Document>;
+    protected afterUpdate?( ctx: ModelHookContext<DBE> ): void | Promise<void>;
+    protected beforeDelete?( ctx: ModelHookContext<DBE> ): void | Promise<void>;
+    protected afterDelete?( ctx: ModelHookContext<DBE> ): void | Promise<void>;
+
+    protected _applyCreateTimestamps( doc: Record<string, any>, now: Date = new Date() ): Record<string, any>
+    {
+        return applyCreateTimestamps( doc, this._timestamps, now );
+    }
+
+    protected _applyUpdateTimestamps( update: Record<string, any>, now: Date = new Date(), isUpsert: boolean = false ): Record<string, any>
+    {
+        return applyUpdateTimestamps( update, this._timestamps, now, isUpsert );
+    }
+
+    protected _softDeleteFilter( includeDeleted?: boolean ): Document | undefined
+    {
+        return buildSoftDeleteFilter( this._softDelete, includeDeleted );
+    }
+
+    protected _hasHook( name: keyof ModelHooksConfig<DBE> ): boolean
+    {
+        return Boolean( this._hooks?.[name] || typeof ( this as any )[name] === 'function' );
+    }
+
+    protected async _runBeforeHook(
+        name: 'beforeCreate' | 'beforeUpdate' | 'beforeDelete',
+        ctxInput: Omit<ModelHookContext<DBE>, 'model' | 'collection' | 'afterCommit'>,
+        pendingAfterCommit?: Array<() => void | Promise<void>>
+    ): Promise<any>
+    {
+        if( !this._hasHook( name ) )
+        {
+            return name === 'beforeCreate' ? ctxInput.data : ctxInput.update;
+        }
+
+        const afterCommit = ( callback: () => void | Promise<void> ) =>
+        {
+            if( !registerTransactionPostCommit( callback ) )
+            {
+                pendingAfterCommit?.push( callback );
+            }
+        };
+
+        const ctx: ModelHookContext<DBE> =
+        {
+            ...ctxInput,
+            model       : this,
+            collection  : this._collectionLabel,
+            afterCommit
+        };
+
+        const configHook = this._hooks?.[name];
+        const hooks = configHook ? ( Array.isArray( configHook ) ? configHook : [ configHook ]) : [];
+        const methodHook = typeof ( this as any )[name] === 'function'
+            ? ( c: ModelHookContext<DBE> ) => ( this as any )[name]( c )
+            : undefined;
+
+        for( const hook of hooks )
+        {
+            const result = await hook( ctx as any );
+
+            if( result && typeof result === 'object' )
+            {
+                if( name === 'beforeCreate' ){ ctx.data = result as Partial<DBE> }
+                else if( name === 'beforeUpdate' ){ ctx.update = result as Document }
+            }
+        }
+
+        if( methodHook )
+        {
+            const result = await methodHook( ctx );
+
+            if( result && typeof result === 'object' )
+            {
+                if( name === 'beforeCreate' ){ ctx.data = result as Partial<DBE> }
+                else if( name === 'beforeUpdate' ){ ctx.update = result as Document }
+            }
+        }
+
+        return name === 'beforeCreate' ? ctx.data : ctx.update;
+    }
+
+    protected async _runAfterHook(
+        name: 'afterCreate' | 'afterUpdate' | 'afterDelete',
+        ctxInput: Omit<ModelHookContext<DBE>, 'model' | 'collection' | 'afterCommit'>,
+        pendingAfterCommit?: Array<() => void | Promise<void>>
+    ): Promise<void>
+    {
+        const localCallbacks: Array<() => void | Promise<void>> = pendingAfterCommit ? [ ...pendingAfterCommit ] : [];
+
+        if( this._hasHook( name ) )
+        {
+            const afterCommit = ( callback: () => void | Promise<void> ) =>
+            {
+                if( !registerTransactionPostCommit( callback ) )
+                {
+                    localCallbacks.push( callback );
+                }
+            };
+
+            const ctx: ModelHookContext<DBE> =
+            {
+                ...ctxInput,
+                model       : this,
+                collection  : this._collectionLabel,
+                afterCommit
+            };
+
+            const configHook = this._hooks?.[name];
+            const hooks = configHook ? ( Array.isArray( configHook ) ? configHook : [ configHook ]) : [];
+            const methodHook = typeof ( this as any )[name] === 'function'
+                ? ( c: ModelHookContext<DBE> ) => ( this as any )[name]( c )
+                : undefined;
+
+            for( const hook of hooks )
+            {
+                await hook( ctx );
+            }
+
+            if( methodHook )
+            {
+                await methodHook( ctx );
+            }
+        }
+
+        for( const callback of localCallbacks )
+        {
+            await callback();
+        }
+    }
+
+    [GET_MANAGED_INDEXES](): NormalizedModelIndex[]
+    {
+        return this._indexes;
+    }
+
+    public async syncIndexes( options?: ModelSyncIndexesOptions ): Promise<ModelSyncIndexesResult>
+    {
+        return this.runOperation( async() =>
+        {
+            const created: string[] = [];
+            const dropped: string[] = [];
+            const unchanged: string[] = [];
+            const siblingModels = ( this._models as any )?.getCollectionModels?.( this.collection.collectionName ) as Set<AbstractBaseModel<any, any, any, any>> | undefined;
+            const includeSiblings = ( options as any )?.includeSiblingModels !== false;
+            const managedMap = new Map<string, NormalizedModelIndex>();
+
+            for( const idx of this._indexes )
+            {
+                if( idx.options.name )
+                {
+                    managedMap.set( idx.options.name, idx );
+                }
+            }
+
+            if( includeSiblings && siblingModels )
+            {
+                for( const sibling of siblingModels )
+                {
+                    for( const idx of sibling[GET_MANAGED_INDEXES]() )
+                    {
+                        if( idx.options.name && !managedMap.has( idx.options.name ) )
+                        {
+                            managedMap.set( idx.options.name, idx );
+                        }
+                    }
+                }
+            }
+
+            const managed = Array.from( managedMap.values() );
+            let existingIndexes: Document[] = [];
+
+            if( typeof ( this.collection as any ).indexes === 'function' )
+            {
+                try
+                {
+                    existingIndexes = await this.collection.indexes( ...this._sessionArg( options?.session )) as Document[];
+                }
+                catch( e: any )
+                {
+                    if( e?.code !== 26 )
+                    {
+                        throw e;
+                    }
+                }
+            }
+
+            const existingByName = new Map<string, Document>();
+
+            for( const idx of existingIndexes )
+            {
+                if( typeof idx.name === 'string' )
+                {
+                    existingByName.set( idx.name, idx );
+                }
+            }
+
+            const allManagedNames = new Set<string>( managed.map( m => m.options.name! ));
+
+            if( siblingModels )
+            {
+                for( const sibling of siblingModels )
+                {
+                    for( const idx of sibling[GET_MANAGED_INDEXES]() )
+                    {
+                        if( idx.options.name )
+                        {
+                            allManagedNames.add( idx.options.name );
+                        }
+                    }
+                }
+            }
+
+            const indexMatches = ( existing: Document, target: NormalizedModelIndex ): boolean =>
+            {
+                if( JSON.stringify( existing.key ) !== JSON.stringify( target.key ) )
+                {
+                    return false;
+                }
+
+                if( Boolean( existing.unique ) !== Boolean( target.options.unique ) )
+                {
+                    return false;
+                }
+
+                if( Boolean( existing.sparse ) !== Boolean( target.options.sparse ) )
+                {
+                    return false;
+                }
+
+                if( ( existing.expireAfterSeconds ?? undefined ) !== ( target.options.expireAfterSeconds ?? undefined ) )
+                {
+                    return false;
+                }
+
+                return true;
+            };
+
+            if( options?.dropObsolete )
+            {
+                for( const existing of existingIndexes )
+                {
+                    const name = existing.name as string | undefined;
+
+                    if( !name || name === '_id_' ){ continue }
+
+                    const matchingManaged = managed.find( m => m.options.name === name );
+
+                    if( !allManagedNames.has( name ) || ( matchingManaged && !indexMatches( existing, matchingManaged ) ) )
+                    {
+                        if( !options?.dryRun )
+                        {
+                            await this.collection.dropIndex( name, ...this._sessionArg( options?.session ));
+                        }
+
+                        dropped.push( name );
+                        existingByName.delete( name );
+                    }
+                }
+            }
+
+            for( const idx of managed )
+            {
+                const name = idx.options.name!;
+                const existing = existingByName.get( name );
+
+                if( existing && indexMatches( existing, idx ) )
+                {
+                    unchanged.push( name );
+                    continue;
+                }
+
+                if( !options?.dryRun )
+                {
+                    const createOpts = options?.background !== undefined
+                        ? { ...idx.options, background: options.background }
+                        : idx.options;
+
+                    if( typeof ( this.collection as any ).createIndex === 'function' )
+                    {
+                        await this.collection.createIndex( idx.key, this._withSession( createOpts, options?.session ));
+                    }
+                    else if( typeof ( this.collection as any ).createIndexes === 'function' )
+                    {
+                        await this.collection.createIndexes([{ key: idx.key, ...createOpts }], ...this._sessionArg( options?.session ));
+                    }
+                }
+
+                created.push( name );
+            }
+
+            return {
+                collection  : this.collection.collectionName,
+                created,
+                dropped,
+                unchanged,
+                existing    : unchanged
+            };
+        });
+    }
 
     protected async _validateWrite<T>(
         data: T,
@@ -930,7 +1267,8 @@ export abstract class AbstractBaseModel
             if( access.denied ){ return null }
 
             const session = this._resolveSession( options.session );
-            const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
+            const baseScopeKey = access.filter ? objectHash( access.filter ) : undefined;
+            const scopeKey = options.includeDeleted ? `${baseScopeKey ?? ''}|incDel` : baseScopeKey;
             const batchScopeKey = session ? `${scopeKey ?? ''}|${this.#sessionScopeToken( session )}` : scopeKey;
             let dtoId: string | undefined;
             let cacheKey: string | undefined;
@@ -968,7 +1306,7 @@ export abstract class AbstractBaseModel
                 documents = await this.#findAggregator.execute(
                     rawIds,
                     conversion,
-                    { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session }
+                    { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
                 ) as unknown as Array<DBE | null>;
             }
             finally
@@ -1026,7 +1364,8 @@ export abstract class AbstractBaseModel
             }
 
             const session = this._resolveSession( options.session );
-            const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
+            const baseScopeKey = access.filter ? objectHash( access.filter ) : undefined;
+            const scopeKey = options.includeDeleted ? `${baseScopeKey ?? ''}|incDel` : baseScopeKey;
             const batchScopeKey = session ? `${scopeKey ?? ''}|${this.#sessionScopeToken( session )}` : scopeKey;
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
 
@@ -1081,7 +1420,7 @@ export abstract class AbstractBaseModel
                         documents = await this.#findAggregator.execute(
                             missingIds,
                             conversion,
-                            { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session }
+                            { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
                         ) as unknown as Array<DBE | null>;
                     }
                     finally
@@ -1132,7 +1471,7 @@ export abstract class AbstractBaseModel
                 documents = await this.#findAggregator.execute(
                     ids,
                     conversion,
-                    { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session }
+                    { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
                 ) as unknown as Array<DBE | null>;
             }
             finally
@@ -1152,9 +1491,9 @@ export abstract class AbstractBaseModel
 
     protected _stripObservabilityOptions<T extends { context?: Record<string, unknown>, traceID?: string, session?: ClientSession }>( options: T ): Omit<T, 'context' | 'traceID' | 'session'>
     {
-        if( options.context === undefined && options.traceID === undefined && options.session === undefined )
+        if( !options || ( options.context === undefined && options.traceID === undefined && options.session === undefined ) )
         {
-            return options;
+            return ( options ?? {} ) as Omit<T, 'context' | 'traceID' | 'session'>;
         }
 
         const { context: _c, traceID: _t, session: _s, ...rest } = options;
@@ -1354,13 +1693,13 @@ export abstract class AbstractBaseModel
     }
 
     public async list<K extends keyof Extensions['converters']>(
-        options: ListOpts,
+        options: ListOpts = {} as ListOpts,
         conversion: K = 'dto' as K
     ): Promise<WithTotal<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>>>
     {
         return this.runOperation( async() =>
         {
-            const opts = options as any;
+            const opts = ( options ?? {} ) as any;
             const bsonInput = this._stripObservabilityOptions( opts );
             const { projection: convProjection } = this.converters[conversion];
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
@@ -1420,7 +1759,7 @@ export abstract class AbstractBaseModel
     }
 
     public async *stream<K extends keyof Extensions['converters']>(
-        options: StreamOpts,
+        options: StreamOpts = {} as StreamOpts,
         conversion: K = 'dto' as K
     ): AsyncGenerator<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>
     {
@@ -1428,7 +1767,7 @@ export abstract class AbstractBaseModel
 
         try
         {
-            const opts = options as any;
+            const opts = ( options ?? {} ) as any;
             const bsonInput = this._stripObservabilityOptions( opts );
             const { projection: convProjection } = this.converters[conversion];
             const access = await this._access.resolveOrDeny({ operation: 'read', method: 'stream', access: opts.access });
@@ -1552,7 +1891,9 @@ export abstract class AbstractBaseModel
                 ...( effectiveCursor !== undefined ? { cursor: effectiveCursor } : {} ),
                 limit               : 1,
                 access              : opts.access,
-                [RESOLVED_ACCESS]   : access
+                includeDeleted      : opts.includeDeleted,
+                [RESOLVED_ACCESS]   : access,
+                [INCLUDE_DELETED]   : opts.includeDeleted
             }, conversion, 'find' );
 
             pipeline = this._optimizePipeline( pipeline );
@@ -1629,17 +1970,19 @@ export abstract class AbstractBaseModel
 
             if( isSet( normalizedPipelineOpts ) )
             {
-                aggregationPipeline = [ ...await this.pipeline({ ...normalizedPipelineOpts, [RESOLVED_ACCESS]: access }, 'dbe' as any, operation ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+                aggregationPipeline = [ ...await this.pipeline({ ...normalizedPipelineOpts, [RESOLVED_ACCESS]: access, [INCLUDE_DELETED]: normalizedPipelineOpts.includeDeleted }, 'dbe' as any, operation ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
             }
             else if( this._idField === '_id' )
             {
-                aggregationPipeline = access.filter
-                    ? [{ $match: access.filter }, ...( resolveBSONObject( pipeline ) as Document[] )]
+                const effectiveAccessFilter = combineMongoFilters( access.filter, this._softDeleteFilter( normalizedPipelineOpts.includeDeleted ));
+
+                aggregationPipeline = effectiveAccessFilter
+                    ? [{ $match: effectiveAccessFilter }, ...( resolveBSONObject( pipeline ) as Document[] )]
                     : resolveBSONObject( pipeline ) as Document[];
             }
             else
             {
-                aggregationPipeline = [ ...await this.pipeline({ [RESOLVED_ACCESS]: access }, 'dbe' as any, operation ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
+                aggregationPipeline = [ ...await this.pipeline({ [RESOLVED_ACCESS]: access, [INCLUDE_DELETED]: normalizedPipelineOpts.includeDeleted }, 'dbe' as any, operation ), ...( resolveBSONObject( pipeline ) as Document[] ) ];
             }
 
             aggregationPipeline = this._optimizePipeline( aggregationPipeline );
@@ -1744,7 +2087,9 @@ export abstract class AbstractBaseModel
                 projection          : { [this._idField]: 1 },
                 limit               : 1,
                 access              : findOptions.access,
-                [RESOLVED_ACCESS]   : access
+                includeDeleted      : findOptions.includeDeleted,
+                [RESOLVED_ACCESS]   : access,
+                [INCLUDE_DELETED]   : findOptions.includeDeleted
             }, 'dbe' as any, 'exists' );
 
             pipeline = this._optimizePipeline( pipeline );
@@ -1781,6 +2126,72 @@ export abstract class AbstractBaseModel
             }));
 
             return res.length > 0;
+        });
+    }
+
+    public async distinct<T = any>(
+        field: string,
+        filterOrOptions?: Filter<AccessFilterDoc> | ModelDistinctOptions<AccessFilterDoc, Record<string, any>>,
+        options?: ModelDistinctOptions<AccessFilterDoc, Record<string, any>>
+    ): Promise<T[]>
+    {
+        return this.runOperation( async() =>
+        {
+            const distinctOptions = filterOrOptions === undefined
+                ? ( options ?? {} )
+                : normalizeFindMatch<any, any>( filterOrOptions as any, options as any );
+
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'distinct', access: distinctOptions.access });
+
+            if( access.denied ){ return [] }
+
+            const basePipeline = await this.pipeline(
+            {
+                filter              : distinctOptions.filter,
+                smartFilter         : distinctOptions.smartFilter as any,
+                access              : distinctOptions.access,
+                includeDeleted      : distinctOptions.includeDeleted,
+                [RESOLVED_ACCESS]   : access,
+                [INCLUDE_DELETED]   : distinctOptions.includeDeleted
+            } as any, 'dbe' as any, 'distinct' );
+
+            const pipeline = this._optimizePipeline([ ...basePipeline, { $group: { _id: `$${field}` } }]);
+            const start = Date.now();
+            let res: Document[];
+
+            try
+            {
+                res = await this.collection.aggregate( pipeline, this._withSession({ collation: { locale: 'en' } }, distinctOptions.session )).toArray();
+            }
+            catch( e )
+            {
+                this._emitError( e, 'distinct', Date.now() - start, () => (
+                {
+                    filter      : distinctOptions.filter,
+                    smartFilter : distinctOptions.smartFilter as Record<string, unknown>,
+                    query       : this.#buildFindQueryContext( distinctOptions ),
+                    context     : distinctOptions.context,
+                    traceID     : distinctOptions.traceID
+                }));
+
+                throw e;
+            }
+
+            const duration = Date.now() - start;
+            const values = res
+                .filter( r => r && r._id !== undefined && r._id !== null )
+                .flatMap( r => Array.isArray( r._id ) ? r._id : [ r._id ]) as T[];
+            const uniqueValues = Array.from( new Set( values ));
+
+            this._emitQuery( 'distinct', pipeline, duration, () => (
+            {
+                resultCount : uniqueValues.length,
+                query       : this.#buildFindQueryContext( distinctOptions ),
+                context     : distinctOptions.context,
+                traceID     : distinctOptions.traceID
+            }));
+
+            return uniqueValues;
         });
     }
 

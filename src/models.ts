@@ -33,7 +33,7 @@ import
 }
 from './symbols.js';
 import type { AbstractBaseModel } from './base-model.js';
-import type { ModelsOptions, OptimizerConfig, OptimizerOptions } from './types/external.js';
+import type { ModelSyncIndexesOptions, ModelSyncIndexesResult, ModelsOptions, OptimizerConfig, OptimizerOptions } from './types/external.js';
 
 const Clients = new Map<string, MongoClient>();
 const ClosedClients = new WeakSet<MongoClient>();
@@ -209,6 +209,28 @@ export class AbstractModels
         ]);
     }
 
+    public getCollectionModels( collection: string ): Set<ModelInstance> | undefined
+    {
+        return this.#collectionModels.get( collection );
+    }
+
+    public async syncIndexes( options?: ModelSyncIndexesOptions ): Promise<ModelSyncIndexesResult[]>
+    {
+        const results: ModelSyncIndexesResult[] = [];
+
+        for( const models of this.#collectionModels.values() )
+        {
+            const firstModel = models.values().next().value;
+
+            if( firstModel )
+            {
+                results.push( await firstModel.syncIndexes({ ...options, includeSiblingModels: true } as any ));
+            }
+        }
+
+        return results;
+    }
+
     [REGISTER_MODEL]( instance: ModelInstance, collection: string, path?: string )
     {
         this.#models.set( collection + ( path ? '.' + path : '' ), instance );
@@ -289,7 +311,7 @@ export class AbstractModels
         try
         {
             const session = this.client.startSession();
-            const postCommitCallbacks = new Set<() => void>();
+            const postCommitCallbacks = new Set<() => void | Promise<void>>();
 
             try
             {
@@ -311,7 +333,7 @@ export class AbstractModels
 
                 for( const callback of postCommitCallbacks )
                 {
-                    callback();
+                    await callback();
                 }
 
                 return result as T;

@@ -1,5 +1,6 @@
 import
 {
+    AnyBulkWriteOperation,
     Collection,
     Document,
     Filter,
@@ -21,25 +22,37 @@ from './helpers/index.js';
 import { AbstractModels } from './models.js';
 import
 {
+    buildRestoreUpdate,
+    buildSoftDeleteUpdate,
+    combineMongoFilters,
     normalizeCursorOption,
     normalizeFindMatch,
     resolveCreateFromArgs
 }
 from './operations.js';
-import { RESOLVED_ACCESS } from './symbols.js';
+import { INCLUDE_DELETED, RESOLVED_ACCESS } from './symbols.js';
 import
 {
     ExtractComputedProperties,
     ExtractSmartFilters,
     ModelAggregateOptions,
+    ModelBulkWriteOperation,
+    ModelBulkWriteOptions,
+    ModelBulkWriteResult,
     ModelCreateOptions,
     ModelDeleteOptions,
     ModelExtensions,
     ModelFindOptions,
+    ModelHooksConfig,
+    ModelIndexDefinition,
     ModelListOptions,
+    ModelSoftDeleteConfig,
     ModelStreamOptions,
+    ModelTimestampsConfig,
     ModelUpdateOptions,
     ModelUpdateResponse,
+    ModelUpsertOptions,
+    ModelUpsertResponse,
     ModelValidatorConfig,
     MongoRootDocument,
     OptimizerConfig
@@ -81,6 +94,10 @@ extends AbstractBaseModel<
             optimizer?      : OptimizerConfig
             observability?  : ObservabilityConfig
             validate?       : ModelValidatorConfig<DBE>
+            indexes?        : ModelIndexDefinition<DBE>[]
+            timestamps?     : ModelTimestampsConfig
+            softDelete?     : ModelSoftDeleteConfig
+            hooks?          : ModelHooksConfig<DBE>
         }
     )
     {
@@ -94,6 +111,10 @@ extends AbstractBaseModel<
             optimizer           : params.optimizer,
             observability       : params.observability,
             validate            : params.validate,
+            indexes             : params.indexes,
+            timestamps          : params.timestamps,
+            softDelete          : params.softDelete,
+            hooks               : params.hooks,
             idField             : '_id'
         });
 
@@ -121,6 +142,7 @@ extends AbstractBaseModel<
         const resolved = resolveBSONObject( options ) as ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']> & { sample?: number };
         const { filter, sort, limit, skip, sample, pipeline, projection, computedProperties: optionsComputedProperties, smartFilter, access } = resolved;
         const cursor = normalizeCursorOption( resolved );
+        const includeDeleted = Boolean( resolved.includeDeleted || ( options as any )?.[INCLUDE_DELETED] );
 
         const [ convProps, optProps, accessResult, resolvedSmartFilter ] = await Promise.all(
         [
@@ -130,7 +152,10 @@ extends AbstractBaseModel<
             smartFilter ? this.resolveSmartFilter( smartFilter ) : undefined
         ]);
         const computedProperties = ( convProps || optProps ) ? mergeComputedProperties({ '': convProps }, { '': optProps })[''] : undefined;
-        const accessFilter = accessResult.denied ? ({ _id: { $exists: false } } as Filter<DBE>) : accessResult.filter;
+        const softDeleteFilter = this._softDeleteFilter( includeDeleted ) as Filter<DBE> | undefined;
+        const accessFilter = accessResult.denied
+            ? ({ _id: { $exists: false } } as Filter<DBE>)
+            : combineMongoFilters( accessResult.filter, softDeleteFilter );
 
         return this._pipelineBuilder.pipeline(
         {
@@ -161,8 +186,28 @@ extends AbstractBaseModel<
 
             const _id: DTO['id'] = id ?? await this.id();
             const start = Date.now();
+            const session = this._resolveSession( options?.session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            let initialDoc = this._applyCreateTimestamps({ ...dbe, _id: this.dbeID( _id ) }) as Partial<DBE>;
+
+            if( this._softDelete && ( initialDoc as any )[this._softDelete.field] === undefined )
+            {
+                initialDoc = { ...initialDoc, [this._softDelete.field]: null };
+            }
+
+            const hookedData = await this._runBeforeHook( 'beforeCreate',
+            {
+                operation   : 'create',
+                method      : 'create',
+                id          : _id,
+                data        : initialDoc,
+                context     : options?.context,
+                traceID     : options?.traceID,
+                session
+            }, pendingAfterCommit );
+
             const validated = await this._validateWrite(
-                { ...dbe, _id: this.dbeID( _id ) } as Partial<DBE>,
+                { ...hookedData, _id: this.dbeID( _id ) } as Partial<DBE>,
                 { operation: 'create', method: 'create', id: _id },
                 start,
                 options
@@ -175,6 +220,17 @@ extends AbstractBaseModel<
                     ...this._sessionArg( options?.session )
                 );
                 this._notifySiblingCacheInvalidation();
+                await this._runAfterHook( 'afterCreate',
+                {
+                    operation       : 'create',
+                    method          : 'create',
+                    id              : _id,
+                    data            : validated,
+                    insertedCount   : 1,
+                    context         : options?.context,
+                    traceID         : options?.traceID,
+                    session
+                }, pendingAfterCommit );
                 this._emitMutation( 'create', Date.now() - start,
                 {
                     insertedCount   : 1,
@@ -330,14 +386,35 @@ extends AbstractBaseModel<
             const ids: DTO['id'][] = [];
             const docs: OptionalUnlessRequiredId<DBE>[] = [];
             const start = Date.now();
+            const now = new Date();
+            const session = this._resolveSession( resolvedOptions?.session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
 
             for( let i = 0; i < items.length; i++ )
             {
                 const item = items[i];
                 const rawId = explicitIds?.[i] ?? ( item._id !== undefined ? this.dtoID( item._id ) : await this.id());
                 const dtoId = this.dtoID( rawId ) as DTO['id'];
+                let initialDoc = this._applyCreateTimestamps({ ...item, _id: this.dbeID( dtoId ) }, now ) as Partial<DBE>;
+
+                if( this._softDelete && ( initialDoc as any )[this._softDelete.field] === undefined )
+                {
+                    initialDoc = { ...initialDoc, [this._softDelete.field]: null };
+                }
+
+                const hookedData = await this._runBeforeHook( 'beforeCreate',
+                {
+                    operation   : 'create',
+                    method      : 'createMany',
+                    id          : dtoId,
+                    data        : initialDoc,
+                    context     : resolvedOptions?.context,
+                    traceID     : resolvedOptions?.traceID,
+                    session
+                }, pendingAfterCommit );
+
                 const validated = await this._validateWrite(
-                    { ...item, _id: this.dbeID( dtoId ) } as Partial<DBE>,
+                    { ...hookedData, _id: this.dbeID( dtoId ) } as Partial<DBE>,
                     { operation: 'create', method: 'createMany', id: dtoId },
                     start,
                     resolvedOptions
@@ -351,6 +428,16 @@ extends AbstractBaseModel<
             {
                 await this.collection.insertMany( docs, ...this._sessionArg( resolvedOptions?.session ));
                 this._notifySiblingCacheInvalidation();
+                await this._runAfterHook( 'afterCreate',
+                {
+                    operation       : 'create',
+                    method          : 'createMany',
+                    ids,
+                    insertedCount   : docs.length,
+                    context         : resolvedOptions?.context,
+                    traceID         : resolvedOptions?.traceID,
+                    session
+                }, pendingAfterCommit );
                 this._emitMutation( 'createMany', Date.now() - start,
                 {
                     insertedCount   : docs.length,
@@ -378,19 +465,35 @@ extends AbstractBaseModel<
     {
         return this.runOperation( async() =>
         {
-            const match = await this._access.match(
+            const baseMatch = await this._access.match(
                 resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
                 { operation: 'update', method: 'update', access: options?.access }
             );
 
-            if( !match )
+            if( !baseMatch )
             {
                 return { matchedCount: 0, modifiedCount: 0 };
             }
 
+            const match = combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!;
             const start = Date.now();
+            const session = this._resolveSession( options?.session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            const timestampedUpdate = this._applyUpdateTimestamps( update as Record<string, any> );
+            const hookedUpdate = await this._runBeforeHook( 'beforeUpdate',
+            {
+                operation   : 'update',
+                method      : 'update',
+                id,
+                filter      : match,
+                update      : timestampedUpdate,
+                context     : options?.context,
+                traceID     : options?.traceID,
+                session
+            }, pendingAfterCommit );
+
             const validatedUpdate = await this._validateWrite(
-                update,
+                hookedUpdate,
                 { operation: 'update', method: 'update', id },
                 start,
                 options,
@@ -404,6 +507,21 @@ extends AbstractBaseModel<
                     const snapshot = await this.#findOneAndUpdateWithSnapshots( match, validatedUpdate, options, 'update' );
 
                     this._invalidateCache([ id ], snapshot.matchedCount > 0 );
+                    await this._runAfterHook( 'afterUpdate',
+                    {
+                        operation       : 'update',
+                        method          : 'update',
+                        id,
+                        filter          : match,
+                        update          : validatedUpdate as Document,
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        documentBefore  : snapshot.documentBefore,
+                        documentAfter   : snapshot.documentAfter,
+                        context         : options.context,
+                        traceID         : options.traceID,
+                        session
+                    }, pendingAfterCommit );
                     this._emitMutation( 'update', Date.now() - start,
                     {
                         matchedCount    : snapshot.matchedCount,
@@ -429,6 +547,19 @@ extends AbstractBaseModel<
                 );
 
                 this._invalidateCache([ id ], res.matchedCount > 0 );
+                await this._runAfterHook( 'afterUpdate',
+                {
+                    operation       : 'update',
+                    method          : 'update',
+                    id,
+                    filter          : match,
+                    update          : validatedUpdate as Document,
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount,
+                    context         : options?.context,
+                    traceID         : options?.traceID,
+                    session
+                }, pendingAfterCommit );
                 this._emitMutation( 'update', Date.now() - start,
                 {
                     matchedCount    : res.matchedCount,
@@ -461,9 +592,9 @@ extends AbstractBaseModel<
     async #findOneAndUpdateWithSnapshots(
         match: Filter<DBE>,
         update: Partial<DBE> | UpdateFilter<DBE>,
-        options: ModelUpdateOptions,
-        parentOperation: 'update' | 'updateOne'
-    ): Promise<{ document?: DBE, documentBefore?: DBE, documentAfter?: DBE, matchedCount: number, modifiedCount: number }>
+        options: ModelUpdateOptions & { upsert?: boolean },
+        parentOperation: 'update' | 'updateOne' | 'upsert'
+    ): Promise<{ document?: DBE, documentBefore?: DBE, documentAfter?: DBE, matchedCount: number, modifiedCount: number, upsertedCount: number, upsertedId?: DTO['id'] }>
     {
         let beforeDoc: DBE | undefined;
         let effectiveMatch = match;
@@ -489,19 +620,21 @@ extends AbstractBaseModel<
                 traceID         : options.traceID
             }), { internal: true, parentOperation });
 
-            if( !beforeDoc )
+            if( !beforeDoc && !options.upsert )
             {
                 return {
                     matchedCount    : 0,
                     modifiedCount   : 0,
+                    upsertedCount   : 0,
                     documentBefore  : undefined,
                     documentAfter   : undefined
                 };
             }
 
-            effectiveMatch = beforeDoc._id !== undefined
-                ? ({ $and: [ match, { _id: beforeDoc._id } ] } as Filter<DBE>)
-                : match;
+            if( beforeDoc && beforeDoc._id !== undefined )
+            {
+                effectiveMatch = ({ $and: [ match, { _id: beforeDoc._id } ] } as Filter<DBE>);
+            }
         }
 
         const result = await this.collection.findOneAndUpdate(
@@ -510,18 +643,23 @@ extends AbstractBaseModel<
             this._withSession(
             {
                 returnDocument  : options.documentAfter ? 'after' : 'before',
+                ...( options.upsert ? { upsert: true } : {} ),
                 collation       : { locale: 'en' }
             }, options.session )
         );
 
         const document = ( result as DBE | null ) || undefined;
-        const matchedCount = document ? 1 : 0;
-        const modifiedCount = document ? 1 : 0;
+        const wasInserted = Boolean( options.upsert && options.documentBefore && options.documentAfter && !beforeDoc && document );
+        const matchedCount = wasInserted ? 0 : ( document ? 1 : 0 );
+        const modifiedCount = wasInserted ? 0 : ( document ? 1 : 0 );
+        const upsertedCount = wasInserted ? 1 : 0;
 
         return {
             document,
             matchedCount,
             modifiedCount,
+            upsertedCount,
+            upsertedId      : wasInserted && document?._id !== undefined ? this.dtoID( document._id ) : undefined,
             documentBefore  : options.documentBefore
                 ? ( options.documentAfter ? ( document ? beforeDoc : undefined ) : document )
                 : undefined,
@@ -533,7 +671,7 @@ extends AbstractBaseModel<
         matchInput: Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
         operation: 'update' | 'delete',
         method: ModelMutationOperation,
-        options?: { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ModelUpdateOptions['session'] },
+        options?: { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ModelUpdateOptions['session'], includeDeleted?: boolean },
         limit?: number
     ): Promise<{
         finalMatch  : Filter<DBE> | null
@@ -546,7 +684,7 @@ extends AbstractBaseModel<
         session?    : ModelUpdateOptions['session']
     }>
     {
-        const { filter: rawFilter, smartFilter, access, context, traceID, session } = normalizeFindMatch<Filter<DBE>, any>( matchInput, options );
+        const { filter: rawFilter, smartFilter, access, context, traceID, session, includeDeleted } = normalizeFindMatch<Filter<DBE>, any>( matchInput, options );
         const [ resolvedSmart, accessResult ] = await Promise.all(
         [
             smartFilter ? this.resolveSmartFilter( smartFilter ) : undefined,
@@ -558,6 +696,8 @@ extends AbstractBaseModel<
             return { finalMatch: null, targetIds: [], rawFilter, smartFilter, context, traceID, session };
         }
 
+        const softDeleteFilter = this._softDeleteFilter( includeDeleted || options?.includeDeleted ) as Filter<DBE> | undefined;
+        const effectiveAccessFilter = combineMongoFilters( accessResult.filter, softDeleteFilter );
         const targetIds = extractTargetIdsFromFilter( matchInput, '_id', id => String( this.dtoID( id )));
 
         if( resolvedSmart?.pipeline?.length )
@@ -566,7 +706,7 @@ extends AbstractBaseModel<
             {
                 filter          : resolveBSONObject( rawFilter ) as Filter<DBE>,
                 smartFilter     : resolvedSmart,
-                accessFilter    : accessResult.filter,
+                accessFilter    : effectiveAccessFilter,
                 projection      : { _id: 1 },
                 limit
             });
@@ -628,9 +768,7 @@ extends AbstractBaseModel<
             ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
             : rawFilter;
         const resolvedBase = resolveBSONObject( combinedFilter ) as Filter<DBE>;
-        const finalMatch = accessResult.filter
-            ? ({ $and: [ resolvedBase, accessResult.filter ] } as Filter<DBE>)
-            : resolvedBase;
+        const finalMatch = combineMongoFilters( resolvedBase, effectiveAccessFilter ) ?? resolvedBase;
 
         return { finalMatch, targetIds, rawFilter, smartFilter, context, traceID, session };
     }
@@ -645,12 +783,12 @@ extends AbstractBaseModel<
         {
             if( Array.isArray( idsOrFilter ) )
             {
-                const match = await this._access.match(
+                const baseMatch = await this._access.match(
                     resolveBSONObject({ _id: { $in: idsOrFilter.map( id => this.dbeID( id )) } }) as Filter<DBE>,
                     { operation: 'update', method: 'updateMany', access: options?.access }
                 );
 
-                if( !match )
+                if( !baseMatch )
                 {
                     return { matchedCount: 0, modifiedCount: 0 };
                 }
@@ -669,9 +807,25 @@ extends AbstractBaseModel<
                     return { matchedCount: 0, modifiedCount: 0 };
                 }
 
+                const match = combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!;
                 const start = Date.now();
+                const session = this._resolveSession( options?.session );
+                const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+                const timestampedUpdate = this._applyUpdateTimestamps( update as Record<string, any> );
+                const hookedUpdate = await this._runBeforeHook( 'beforeUpdate',
+                {
+                    operation   : 'update',
+                    method      : 'updateMany',
+                    ids         : idsOrFilter,
+                    filter      : match,
+                    update      : timestampedUpdate,
+                    context     : options?.context,
+                    traceID     : options?.traceID,
+                    session
+                }, pendingAfterCommit );
+
                 const validatedUpdate = await this._validateWrite(
-                    update,
+                    hookedUpdate,
                     { operation: 'update', method: 'updateMany', ids: idsOrFilter },
                     start,
                     options,
@@ -700,6 +854,19 @@ extends AbstractBaseModel<
                 }
 
                 this._invalidateCache( idsOrFilter, res.matchedCount > 0 );
+                await this._runAfterHook( 'afterUpdate',
+                {
+                    operation       : 'update',
+                    method          : 'updateMany',
+                    ids             : idsOrFilter,
+                    filter          : match,
+                    update          : validatedUpdate as Document,
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount,
+                    context         : options?.context,
+                    traceID         : options?.traceID,
+                    session
+                }, pendingAfterCommit );
                 this._emitMutation( 'updateMany', Date.now() - start,
                 {
                     matchedCount    : res.matchedCount,
@@ -748,8 +915,23 @@ extends AbstractBaseModel<
             }
 
             const start = Date.now();
+            const resolvedSession = this._resolveSession( session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            const timestampedUpdate = this._applyUpdateTimestamps( update as Record<string, any> );
+            const hookedUpdate = await this._runBeforeHook( 'beforeUpdate',
+            {
+                operation   : 'update',
+                method      : 'updateMany',
+                ids         : targetIds.length > 0 ? targetIds : undefined,
+                filter      : finalMatch,
+                update      : timestampedUpdate,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
             const validatedUpdate = await this._validateWrite(
-                update,
+                hookedUpdate,
                 { operation: 'update', method: 'updateMany', ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
                 start,
                 { ...options, context, traceID },
@@ -787,6 +969,20 @@ extends AbstractBaseModel<
             {
                 this._clearCache();
             }
+
+            await this._runAfterHook( 'afterUpdate',
+            {
+                operation       : 'update',
+                method          : 'updateMany',
+                ids             : targetIds.length > 0 ? targetIds : undefined,
+                filter          : finalMatch,
+                update          : validatedUpdate as Document,
+                matchedCount    : res.matchedCount,
+                modifiedCount   : res.modifiedCount,
+                context,
+                traceID,
+                session         : resolvedSession
+            }, pendingAfterCommit );
 
             this._emitMutation( 'updateMany', Date.now() - start,
             {
@@ -847,8 +1043,23 @@ extends AbstractBaseModel<
             }
 
             const start = Date.now();
+            const resolvedSession = this._resolveSession( session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            const timestampedUpdate = this._applyUpdateTimestamps( update as Record<string, any> );
+            const hookedUpdate = await this._runBeforeHook( 'beforeUpdate',
+            {
+                operation   : 'update',
+                method      : 'updateOne',
+                ids         : targetIds.length > 0 ? targetIds : undefined,
+                filter      : finalMatch,
+                update      : timestampedUpdate,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
             const validatedUpdate = await this._validateWrite(
-                update,
+                hookedUpdate,
                 { operation: 'update', method: 'updateOne', ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
                 start,
                 { ...options, context, traceID },
@@ -878,6 +1089,22 @@ extends AbstractBaseModel<
                     {
                         this._clearCache();
                     }
+
+                    await this._runAfterHook( 'afterUpdate',
+                    {
+                        operation       : 'update',
+                        method          : 'updateOne',
+                        ids             : idsToEvict ?? undefined,
+                        filter          : finalMatch,
+                        update          : validatedUpdate as Document,
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        documentBefore  : snapshot.documentBefore,
+                        documentAfter   : snapshot.documentAfter,
+                        context,
+                        traceID,
+                        session         : resolvedSession
+                    }, pendingAfterCommit );
 
                     this._emitMutation( 'updateOne', Date.now() - start,
                     {
@@ -913,6 +1140,20 @@ extends AbstractBaseModel<
                     this._clearCache();
                 }
 
+                await this._runAfterHook( 'afterUpdate',
+                {
+                    operation       : 'update',
+                    method          : 'updateOne',
+                    ids             : targetIds.length > 0 ? targetIds : undefined,
+                    filter          : finalMatch,
+                    update          : validatedUpdate as Document,
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount,
+                    context,
+                    traceID,
+                    session         : resolvedSession
+                }, pendingAfterCommit );
+
                 this._emitMutation( 'updateOne', Date.now() - start,
                 {
                     matchedCount    : res.matchedCount,
@@ -944,27 +1185,294 @@ extends AbstractBaseModel<
         });
     }
 
-    public async delete( id: DTO['id'] | DBE['_id'], options?: ModelDeleteOptions ): Promise<boolean>
+    public async upsert(
+        filter: Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        update: Partial<DBE> | UpdateFilter<DBE>,
+        options?: ModelUpsertOptions
+    ): Promise<ModelUpsertResponse<DBE, DTO['id']>>
     {
         return this.runOperation( async() =>
         {
-            const match = await this._access.match(
-                resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
-                { operation: 'delete', method: 'delete', access: options?.access }
+            const { finalMatch, targetIds, rawFilter, smartFilter, context, traceID, session } = await this.#resolveFilterMatch(
+                filter,
+                'update',
+                'upsert',
+                options,
+                1
             );
 
-            if( !match ){ return false }
+            if( !finalMatch )
+            {
+                return {
+                    id              : undefined,
+                    upsertedId      : undefined,
+                    upserted        : false,
+                    created         : false,
+                    upsertedCount   : 0,
+                    matchedCount    : 0,
+                    modifiedCount   : 0
+                };
+            }
 
             const start = Date.now();
-            let res: { deletedCount: number };
+            const resolvedSession = this._resolveSession( session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            const now = new Date();
+            const timestampedUpdate = this._applyUpdateTimestamps( update as Record<string, any>, now, true );
+            const hookedUpdate = await this._runBeforeHook( 'beforeUpdate',
+            {
+                operation   : 'update',
+                method      : 'upsert',
+                ids         : targetIds.length > 0 ? targetIds : undefined,
+                filter      : finalMatch,
+                update      : timestampedUpdate,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
+            const validatedUpdate = await this._validateWrite(
+                hookedUpdate,
+                { operation: 'update', method: 'upsert', ids: targetIds.length > 0 ? targetIds : undefined, filter: rawFilter },
+                start,
+                { ...options, context, traceID },
+                finalMatch,
+                smartFilter
+            );
+
+            const updateOps = toUpdateOperations( validatedUpdate ) as Record<string, any>;
+            const generatedDtoId = ( options?.id ?? ( targetIds.length === 1 ? targetIds[0] : await this.id())) as DTO['id'];
+            const setOnInsert: Record<string, any> = { ...( updateOps.$setOnInsert ?? {} ) };
+
+            if( setOnInsert._id === undefined && updateOps.$set?._id === undefined && ( finalMatch as any )._id === undefined )
+            {
+                setOnInsert._id = this.dbeID( generatedDtoId );
+            }
+
+            if( this._softDelete && setOnInsert[this._softDelete.field] === undefined && updateOps.$set?.[this._softDelete.field] === undefined )
+            {
+                setOnInsert[this._softDelete.field] = this._softDelete.field === this._softDelete.deletedAtField ? null : false;
+            }
+
+            if( Object.keys( setOnInsert ).length > 0 )
+            {
+                updateOps.$setOnInsert = setOnInsert;
+            }
 
             try
             {
-                res = await this.collection.deleteOne( match, ...this._sessionArg( options?.session ));
+                if( options?.documentBefore || options?.documentAfter )
+                {
+                    const snapshot = await this.#findOneAndUpdateWithSnapshots(
+                        finalMatch,
+                        updateOps as UpdateFilter<DBE>,
+                        { ...options, context, traceID, session, upsert: true },
+                        'upsert'
+                    );
+                    const upsertedId = snapshot.upsertedId ?? ( snapshot.upsertedCount > 0 ? generatedDtoId : undefined );
+                    const resolvedId = upsertedId ?? ( snapshot.document?._id !== undefined ? this.dtoID( snapshot.document._id ) : ( targetIds[0] as DTO['id'] | undefined ));
+                    const idsToEvict = targetIds.length > 0
+                        ? targetIds
+                        : ( snapshot.document?._id !== undefined ? [ String( this.dtoID( snapshot.document._id )) ] : null );
+
+                    if( idsToEvict && idsToEvict.length > 0 )
+                    {
+                        this._invalidateCache( idsToEvict, true );
+                    }
+                    else
+                    {
+                        this._clearCache();
+                    }
+
+                    await this._runAfterHook( 'afterUpdate',
+                    {
+                        operation       : 'update',
+                        method          : 'upsert',
+                        id              : resolvedId,
+                        ids             : idsToEvict ?? undefined,
+                        filter          : finalMatch,
+                        update          : updateOps,
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        upsertedCount   : snapshot.upsertedCount,
+                        documentBefore  : snapshot.documentBefore,
+                        documentAfter   : snapshot.documentAfter,
+                        context,
+                        traceID,
+                        session         : resolvedSession
+                    }, pendingAfterCommit );
+
+                    this._emitMutation( 'upsert', Date.now() - start,
+                    {
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        upsertedCount   : snapshot.upsertedCount,
+                        ids             : idsToEvict ?? ( upsertedId !== undefined ? [ upsertedId ] : undefined ),
+                        filter          : finalMatch,
+                        smartFilter,
+                        context,
+                        traceID
+                    });
+
+                    return {
+                        id              : resolvedId,
+                        upsertedId,
+                        upserted        : snapshot.upsertedCount > 0,
+                        created         : snapshot.upsertedCount > 0,
+                        upsertedCount   : snapshot.upsertedCount,
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        documentBefore  : snapshot.documentBefore,
+                        documentAfter   : snapshot.documentAfter
+                    };
+                }
+
+                const res = await this.collection.updateOne(
+                    finalMatch,
+                    updateOps as UpdateFilter<DBE>,
+                    this._withSession({ upsert: true }, session )
+                );
+
+                const upsertedCount = ( res as any ).upsertedCount ?? ( res.upsertedId ? 1 : 0 );
+                const upsertedId = res.upsertedId !== undefined && res.upsertedId !== null
+                    ? this.dtoID( res.upsertedId as any )
+                    : ( upsertedCount > 0 ? generatedDtoId : undefined );
+                const resolvedId = upsertedId ?? ( targetIds[0] as DTO['id'] | undefined );
+                const affectedIds = targetIds.length > 0
+                    ? targetIds
+                    : ( upsertedId !== undefined ? [ String( upsertedId ) ] : [] );
+
+                if( affectedIds.length > 0 )
+                {
+                    this._invalidateCache( affectedIds, true );
+                }
+                else
+                {
+                    this._clearCache();
+                }
+
+                await this._runAfterHook( 'afterUpdate',
+                {
+                    operation       : 'update',
+                    method          : 'upsert',
+                    id              : resolvedId,
+                    ids             : affectedIds.length > 0 ? affectedIds : undefined,
+                    filter          : finalMatch,
+                    update          : updateOps,
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount,
+                    upsertedCount,
+                    context,
+                    traceID,
+                    session         : resolvedSession
+                }, pendingAfterCommit );
+
+                this._emitMutation( 'upsert', Date.now() - start,
+                {
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount,
+                    upsertedCount,
+                    ids             : affectedIds.length > 0 ? affectedIds : undefined,
+                    filter          : finalMatch,
+                    smartFilter,
+                    context,
+                    traceID
+                });
+
+                return {
+                    id              : resolvedId,
+                    upsertedId,
+                    upserted        : upsertedCount > 0,
+                    created         : upsertedCount > 0,
+                    upsertedCount,
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount
+                };
             }
             catch( e )
             {
-                this._emitError( e, 'delete', Date.now() - start,
+                this._emitError( e, 'upsert', Date.now() - start,
+                {
+                    filter      : finalMatch,
+                    smartFilter,
+                    context,
+                    traceID
+                });
+
+                throw e;
+            }
+        });
+    }
+
+    public async delete( id: DTO['id'] | DBE['_id'], options?: ModelDeleteOptions ): Promise<boolean>
+    {
+        return this.#executeDeleteById( id, options, options?.hard ? 'hardDelete' : 'delete' );
+    }
+
+    public async hardDelete( id: DTO['id'] | DBE['_id'], options?: Omit<ModelDeleteOptions, 'hard'> ): Promise<boolean>
+    {
+        return this.#executeDeleteById( id, { ...options, hard: true }, 'hardDelete' );
+    }
+
+    async #executeDeleteById(
+        id: DTO['id'] | DBE['_id'],
+        options: ModelDeleteOptions | undefined,
+        method: 'delete' | 'hardDelete'
+    ): Promise<boolean>
+    {
+        return this.runOperation( async() =>
+        {
+            const baseMatch = await this._access.match(
+                resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
+                { operation: 'delete', method, access: options?.access }
+            );
+
+            if( !baseMatch ){ return false }
+
+            const isSoft = Boolean( this._softDelete && !options?.hard );
+            const match = isSoft
+                ? combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!
+                : baseMatch;
+            const start = Date.now();
+            const session = this._resolveSession( options?.session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+
+            await this._runBeforeHook( 'beforeDelete',
+            {
+                operation   : 'delete',
+                method,
+                id,
+                filter      : match,
+                context     : options?.context,
+                traceID     : options?.traceID,
+                session
+            }, pendingAfterCommit );
+
+            let deletedCount = 0;
+
+            try
+            {
+                if( isSoft )
+                {
+                    const softUpdate = buildSoftDeleteUpdate( this._softDelete!, this._timestamps );
+                    const res = await this.collection.updateOne(
+                        match,
+                        softUpdate as UpdateFilter<DBE>,
+                        ...this._sessionArg( options?.session )
+                    );
+
+                    deletedCount = res.modifiedCount ?? res.matchedCount ?? 0;
+                }
+                else
+                {
+                    const res = await this.collection.deleteOne( match, ...this._sessionArg( options?.session ));
+
+                    deletedCount = res.deletedCount;
+                }
+            }
+            catch( e )
+            {
+                this._emitError( e, method, Date.now() - start,
                 {
                     filter  : match,
                     context : options?.context,
@@ -974,17 +1482,28 @@ extends AbstractBaseModel<
                 throw e;
             }
 
-            this._invalidateCache([ id ], res.deletedCount > 0 );
-            this._emitMutation( 'delete', Date.now() - start,
+            this._invalidateCache([ id ], deletedCount > 0 );
+            await this._runAfterHook( 'afterDelete',
             {
-                deletedCount    : res.deletedCount,
+                operation   : 'delete',
+                method,
+                id,
+                filter      : match,
+                deletedCount,
+                context     : options?.context,
+                traceID     : options?.traceID,
+                session
+            }, pendingAfterCommit );
+            this._emitMutation( method, Date.now() - start,
+            {
+                deletedCount,
                 ids             : [ id ],
                 filter          : match,
                 context         : options?.context,
                 traceID         : options?.traceID
             });
 
-            return res.deletedCount === 1;
+            return deletedCount === 1;
         });
     }
 
@@ -993,20 +1512,39 @@ extends AbstractBaseModel<
         options?: ModelDeleteOptions
     ): Promise<number>
     {
+        return this.#executeDeleteMany( idsOrFilter, options, options?.hard ? 'hardDeleteMany' : 'deleteMany' );
+    }
+
+    public async hardDeleteMany(
+        idsOrFilter: DTO['id'][] | DBE['_id'][] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        options?: Omit<ModelDeleteOptions, 'hard'>
+    ): Promise<number>
+    {
+        return this.#executeDeleteMany( idsOrFilter, { ...options, hard: true }, 'hardDeleteMany' );
+    }
+
+    async #executeDeleteMany(
+        idsOrFilter: DTO['id'][] | DBE['_id'][] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        options: ModelDeleteOptions | undefined,
+        method: 'deleteMany' | 'hardDeleteMany'
+    ): Promise<number>
+    {
         return this.runOperation( async() =>
         {
+            const isSoft = Boolean( this._softDelete && !options?.hard );
+
             if( Array.isArray( idsOrFilter ) )
             {
-                const match = await this._access.match(
+                const baseMatch = await this._access.match(
                     resolveBSONObject({ _id: { $in: idsOrFilter.map( id => this.dbeID( id )) } }) as Filter<DBE>,
-                    { operation: 'delete', method: 'deleteMany', access: options?.access }
+                    { operation: 'delete', method, access: options?.access }
                 );
 
-                if( !match ){ return 0 }
+                if( !baseMatch ){ return 0 }
 
                 if( idsOrFilter.length === 0 )
                 {
-                    this._emitMutation( 'deleteMany', 0,
+                    this._emitMutation( method, 0,
                     {
                         deletedCount    : 0,
                         ids             : [],
@@ -1017,16 +1555,49 @@ extends AbstractBaseModel<
                     return 0;
                 }
 
+                const match = isSoft
+                    ? combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!
+                    : baseMatch;
                 const start = Date.now();
-                let res: { deletedCount: number };
+                const session = this._resolveSession( options?.session );
+                const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+
+                await this._runBeforeHook( 'beforeDelete',
+                {
+                    operation   : 'delete',
+                    method,
+                    ids         : idsOrFilter,
+                    filter      : match,
+                    context     : options?.context,
+                    traceID     : options?.traceID,
+                    session
+                }, pendingAfterCommit );
+
+                let deletedCount = 0;
 
                 try
                 {
-                    res = await this.collection.deleteMany( match, ...this._sessionArg( options?.session ));
+                    if( isSoft )
+                    {
+                        const softUpdate = buildSoftDeleteUpdate( this._softDelete!, this._timestamps );
+                        const res = await this.collection.updateMany(
+                            match,
+                            softUpdate as UpdateFilter<DBE>,
+                            ...this._sessionArg( options?.session )
+                        );
+
+                        deletedCount = res.modifiedCount ?? res.matchedCount ?? 0;
+                    }
+                    else
+                    {
+                        const res = await this.collection.deleteMany( match, ...this._sessionArg( options?.session ));
+
+                        deletedCount = res.deletedCount;
+                    }
                 }
                 catch( e )
                 {
-                    this._emitError( e, 'deleteMany', Date.now() - start,
+                    this._emitError( e, method, Date.now() - start,
                     {
                         filter  : match,
                         context : options?.context,
@@ -1036,24 +1607,35 @@ extends AbstractBaseModel<
                     throw e;
                 }
 
-                this._invalidateCache( idsOrFilter, res.deletedCount > 0 );
-                this._emitMutation( 'deleteMany', Date.now() - start,
+                this._invalidateCache( idsOrFilter, deletedCount > 0 );
+                await this._runAfterHook( 'afterDelete',
                 {
-                    deletedCount    : res.deletedCount,
+                    operation   : 'delete',
+                    method,
+                    ids         : idsOrFilter,
+                    filter      : match,
+                    deletedCount,
+                    context     : options?.context,
+                    traceID     : options?.traceID,
+                    session
+                }, pendingAfterCommit );
+                this._emitMutation( method, Date.now() - start,
+                {
+                    deletedCount,
                     ids             : idsOrFilter,
                     filter          : match,
                     context         : options?.context,
                     traceID         : options?.traceID
                 });
 
-                return res.deletedCount;
+                return deletedCount;
             }
 
             const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID, session } = await this.#resolveFilterMatch(
                 idsOrFilter,
                 'delete',
-                'deleteMany',
-                options
+                method,
+                { ...options, includeDeleted: !isSoft }
             );
 
             if( !finalMatch )
@@ -1065,7 +1647,7 @@ extends AbstractBaseModel<
                         this._invalidateCache( targetIds, false );
                     }
 
-                    this._emitMutation( 'deleteMany', 0,
+                    this._emitMutation( method, 0,
                     {
                         deletedCount    : 0,
                         ids             : targetIds.length > 0 ? targetIds : undefined,
@@ -1080,15 +1662,45 @@ extends AbstractBaseModel<
             }
 
             const start = Date.now();
-            let res: { deletedCount: number };
+            const resolvedSession = this._resolveSession( session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+
+            await this._runBeforeHook( 'beforeDelete',
+            {
+                operation   : 'delete',
+                method,
+                ids         : targetIds.length > 0 ? targetIds : undefined,
+                filter      : finalMatch,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
+            let deletedCount = 0;
 
             try
             {
-                res = await this.collection.deleteMany( finalMatch, ...this._sessionArg( session ));
+                if( isSoft )
+                {
+                    const softUpdate = buildSoftDeleteUpdate( this._softDelete!, this._timestamps );
+                    const res = await this.collection.updateMany(
+                        finalMatch,
+                        softUpdate as UpdateFilter<DBE>,
+                        ...this._sessionArg( session )
+                    );
+
+                    deletedCount = res.modifiedCount ?? res.matchedCount ?? 0;
+                }
+                else
+                {
+                    const res = await this.collection.deleteMany( finalMatch, ...this._sessionArg( session ));
+
+                    deletedCount = res.deletedCount;
+                }
             }
             catch( e )
             {
-                this._emitError( e, 'deleteMany', Date.now() - start,
+                this._emitError( e, method, Date.now() - start,
                 {
                     filter      : finalMatch,
                     smartFilter,
@@ -1101,16 +1713,28 @@ extends AbstractBaseModel<
 
             if( targetIds.length > 0 )
             {
-                this._invalidateCache( targetIds, res.deletedCount > 0 );
+                this._invalidateCache( targetIds, deletedCount > 0 );
             }
-            else if( res.deletedCount > 0 )
+            else if( deletedCount > 0 )
             {
                 this._clearCache();
             }
 
-            this._emitMutation( 'deleteMany', Date.now() - start,
+            await this._runAfterHook( 'afterDelete',
             {
-                deletedCount    : res.deletedCount,
+                operation   : 'delete',
+                method,
+                ids         : targetIds.length > 0 ? targetIds : undefined,
+                filter      : finalMatch,
+                deletedCount,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
+            this._emitMutation( method, Date.now() - start,
+            {
+                deletedCount,
                 ids             : targetIds.length > 0 ? targetIds : undefined,
                 filter          : finalMatch,
                 smartFilter,
@@ -1118,7 +1742,644 @@ extends AbstractBaseModel<
                 traceID
             });
 
-            return res.deletedCount;
+            return deletedCount;
+        });
+    }
+
+    public async restore( id: DTO['id'] | DBE['_id'], options?: Omit<ModelDeleteOptions, 'hard'> ): Promise<boolean>
+    {
+        return this.runOperation( async() =>
+        {
+            if( !this._softDelete ){ return false }
+
+            const baseMatch = await this._access.match(
+                resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
+                { operation: 'update', method: 'restore', access: options?.access }
+            );
+
+            if( !baseMatch ){ return false }
+
+            const match = combineMongoFilters( baseMatch, { [this._softDelete.field]: { $nin: [ null, false ] } } as Filter<DBE> )!;
+            const start = Date.now();
+            const session = this._resolveSession( options?.session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            const restoreUpdate = buildRestoreUpdate( this._softDelete, this._timestamps );
+
+            await this._runBeforeHook( 'beforeUpdate',
+            {
+                operation   : 'update',
+                method      : 'restore',
+                id,
+                filter      : match,
+                update      : restoreUpdate,
+                context     : options?.context,
+                traceID     : options?.traceID,
+                session
+            }, pendingAfterCommit );
+
+            let res: { matchedCount: number, modifiedCount: number };
+
+            try
+            {
+                res = await this.collection.updateOne(
+                    match,
+                    restoreUpdate as UpdateFilter<DBE>,
+                    ...this._sessionArg( options?.session )
+                );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'restore', Date.now() - start,
+                {
+                    filter  : match,
+                    context : options?.context,
+                    traceID : options?.traceID
+                });
+
+                throw e;
+            }
+
+            const modifiedCount = res.modifiedCount ?? res.matchedCount ?? 0;
+
+            this._invalidateCache([ id ], modifiedCount > 0 );
+            await this._runAfterHook( 'afterUpdate',
+            {
+                operation       : 'update',
+                method          : 'restore',
+                id,
+                filter          : match,
+                update          : restoreUpdate,
+                matchedCount    : res.matchedCount,
+                modifiedCount,
+                context         : options?.context,
+                traceID         : options?.traceID,
+                session
+            }, pendingAfterCommit );
+            this._emitMutation( 'restore', Date.now() - start,
+            {
+                matchedCount    : res.matchedCount,
+                modifiedCount,
+                ids             : [ id ],
+                filter          : match,
+                context         : options?.context,
+                traceID         : options?.traceID
+            });
+
+            return modifiedCount === 1;
+        });
+    }
+
+    public async restoreMany(
+        idsOrFilter: DTO['id'][] | DBE['_id'][] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+        options?: Omit<ModelDeleteOptions, 'hard'>
+    ): Promise<number>
+    {
+        return this.runOperation( async() =>
+        {
+            if( !this._softDelete ){ return 0 }
+
+            const isIdArray = Array.isArray( idsOrFilter );
+
+            if( isIdArray && idsOrFilter.length === 0 ){ return 0 }
+
+            const deletedOnlyFilter = { [this._softDelete.field]: { $nin: [ null, false ] } } as Filter<DBE>;
+            const restoreUpdate = buildRestoreUpdate( this._softDelete, this._timestamps );
+            const normalizedFilter = isIdArray
+                ? resolveBSONObject({ _id: { $in: idsOrFilter.map( id => this.dbeID( id )) } }) as Filter<DBE>
+                : idsOrFilter;
+
+            const { finalMatch: resolvedMatch, targetIds, smartFilter, context, traceID, session } = await this.#resolveFilterMatch(
+                normalizedFilter,
+                'update',
+                'restoreMany',
+                { ...options, includeDeleted: true }
+            );
+
+            if( !resolvedMatch ){ return 0 }
+
+            const effectiveIds = isIdArray ? idsOrFilter.map( id => String( this.dtoID( id ))) : targetIds;
+            const finalMatch = combineMongoFilters( resolvedMatch, deletedOnlyFilter )!;
+            const start = Date.now();
+            const resolvedSession = this._resolveSession( session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+
+            await this._runBeforeHook( 'beforeUpdate',
+            {
+                operation   : 'update',
+                method      : 'restoreMany',
+                ids         : effectiveIds.length > 0 ? effectiveIds : undefined,
+                filter      : finalMatch,
+                update      : restoreUpdate,
+                context,
+                traceID,
+                session     : resolvedSession
+            }, pendingAfterCommit );
+
+            let res: { matchedCount: number, modifiedCount: number };
+
+            try
+            {
+                res = await this.collection.updateMany(
+                    finalMatch,
+                    restoreUpdate as UpdateFilter<DBE>,
+                    ...this._sessionArg( session )
+                );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'restoreMany', Date.now() - start,
+                {
+                    filter      : finalMatch,
+                    smartFilter,
+                    context,
+                    traceID
+                });
+
+                throw e;
+            }
+
+            const modifiedCount = res.modifiedCount ?? res.matchedCount ?? 0;
+
+            if( effectiveIds.length > 0 )
+            {
+                this._invalidateCache( effectiveIds, modifiedCount > 0 );
+            }
+            else if( modifiedCount > 0 )
+            {
+                this._clearCache();
+            }
+
+            await this._runAfterHook( 'afterUpdate',
+            {
+                operation       : 'update',
+                method          : 'restoreMany',
+                ids             : effectiveIds.length > 0 ? effectiveIds : undefined,
+                filter          : finalMatch,
+                update          : restoreUpdate,
+                matchedCount    : res.matchedCount,
+                modifiedCount,
+                context,
+                traceID,
+                session         : resolvedSession
+            }, pendingAfterCommit );
+            this._emitMutation( 'restoreMany', Date.now() - start,
+            {
+                matchedCount    : res.matchedCount,
+                modifiedCount,
+                ids             : effectiveIds.length > 0 ? effectiveIds : undefined,
+                filter          : finalMatch,
+                smartFilter,
+                context,
+                traceID
+            });
+
+            return modifiedCount;
+        });
+    }
+
+    public async bulkWrite(
+        operations: Array<ModelBulkWriteOperation<DBE, DTO['id'], ExtractSmartFilters<Extensions>>>,
+        options?: ModelBulkWriteOptions
+    ): Promise<ModelBulkWriteResult<DTO['id']>>
+    {
+        return this.runOperation( async() =>
+        {
+            if( operations.length === 0 )
+            {
+                this._emitMutation( 'bulkWrite', 0,
+                {
+                    insertedCount   : 0,
+                    matchedCount    : 0,
+                    modifiedCount   : 0,
+                    deletedCount    : 0,
+                    upsertedCount   : 0,
+                    ids             : [],
+                    context         : options?.context,
+                    traceID         : options?.traceID
+                });
+
+                return {
+                    insertedCount   : 0,
+                    matchedCount    : 0,
+                    modifiedCount   : 0,
+                    deletedCount    : 0,
+                    upsertedCount   : 0,
+                    insertedIds     : [],
+                    upsertedIds     : {}
+                };
+            }
+
+            const start = Date.now();
+            const now = new Date();
+            const session = this._resolveSession( options?.session );
+            const pendingAfterCommit: Array<() => void | Promise<void>> = [];
+            const pendingAfterHooks: Array<{ hook: 'afterCreate' | 'afterUpdate' | 'afterDelete', ctx: any }> = [];
+            const rawOps: AnyBulkWriteOperation<DBE>[] = [];
+            const insertedIds: DTO['id'][] = [];
+            const targetedIds: string[] = [];
+            let hasBroadMutation = false;
+
+            for( const op of operations )
+            {
+                if( 'create' in op || 'insertOne' in op )
+                {
+                    const access = await this._access.resolveOrDeny({ operation: 'create', method: 'bulkWrite', access: options?.access });
+
+                    if( access.denied )
+                    {
+                        throw new ModelAccessDeniedError( this );
+                    }
+
+                    const createPayload: any = 'create' in op ? op.create : op.insertOne.document;
+                    const isWrappedCreate = 'create' in op && createPayload && typeof createPayload === 'object' && 'data' in createPayload && typeof createPayload.data === 'object';
+                    const rawDoc: any = isWrappedCreate ? createPayload.data : createPayload;
+                    const explicitId = 'create' in op ? ( ( op as any ).id ?? ( isWrappedCreate ? createPayload.id : undefined )) : undefined;
+                    const dtoId = ( explicitId ?? ( rawDoc._id !== undefined ? this.dtoID( rawDoc._id ) : await this.id())) as DTO['id'];
+                    let initialDoc = this._applyCreateTimestamps({ ...rawDoc, _id: this.dbeID( dtoId ) }, now ) as Partial<DBE>;
+
+                    if( this._softDelete && ( initialDoc as any )[this._softDelete.field] === undefined )
+                    {
+                        initialDoc = { ...initialDoc, [this._softDelete.field]: null };
+                    }
+
+                    const hookedData = await this._runBeforeHook( 'beforeCreate',
+                    {
+                        operation   : 'create',
+                        method      : 'bulkWrite',
+                        id          : dtoId,
+                        data        : initialDoc,
+                        context     : options?.context,
+                        traceID     : options?.traceID,
+                        session
+                    }, pendingAfterCommit );
+
+                    const validated = await this._validateWrite(
+                        { ...hookedData, _id: this.dbeID( dtoId ) } as Partial<DBE>,
+                        { operation: 'create', method: 'bulkWrite', id: dtoId },
+                        start,
+                        options
+                    );
+
+                    insertedIds.push( dtoId );
+                    targetedIds.push( String( dtoId ));
+                    pendingAfterHooks.push({
+                        hook    : 'afterCreate',
+                        ctx     :
+                        {
+                            operation       : 'create',
+                            method          : 'bulkWrite',
+                            id              : dtoId,
+                            data            : validated,
+                            result          : dtoId,
+                            insertedCount   : 1,
+                            context         : options?.context,
+                            traceID         : options?.traceID,
+                            session
+                        }
+                    });
+                    rawOps.push({
+                        insertOne : {
+                            document : resolveBSONObject({ ...validated, _id: this.dbeID( dtoId ) }) as any
+                        }
+                    });
+                }
+                else if( 'update' in op )
+                {
+                    const baseMatch = await this._access.match(
+                        resolveBSONObject({ _id: this.dbeID( op.update.id ) }) as Filter<DBE>,
+                        { operation: 'update', method: 'bulkWrite', access: options?.access }
+                    );
+
+                    if( !baseMatch ){ continue }
+
+                    const match = combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!;
+                    const timestamped = this._applyUpdateTimestamps( op.update.update as Record<string, any>, now );
+                    const hooked = await this._runBeforeHook( 'beforeUpdate',
+                    {
+                        operation   : 'update',
+                        method      : 'bulkWrite',
+                        id          : op.update.id,
+                        filter      : match,
+                        update      : timestamped,
+                        context     : options?.context,
+                        traceID     : options?.traceID,
+                        session
+                    }, pendingAfterCommit );
+                    const validated = await this._validateWrite( hooked, { operation: 'update', method: 'bulkWrite', id: op.update.id }, start, options, match );
+
+                    targetedIds.push( String( this.dtoID( op.update.id )));
+                    pendingAfterHooks.push({
+                        hook    : 'afterUpdate',
+                        ctx     :
+                        {
+                            operation   : 'update',
+                            method      : 'bulkWrite',
+                            id          : op.update.id,
+                            filter      : match,
+                            update      : validated as Document,
+                            context     : options?.context,
+                            traceID     : options?.traceID,
+                            session
+                        }
+                    });
+                    rawOps.push({
+                        updateOne : {
+                            filter  : match,
+                            update  : toUpdateOperations( validated ) as UpdateFilter<DBE>
+                        }
+                    });
+                }
+                else if( 'updateOne' in op || 'updateMany' in op || 'upsert' in op )
+                {
+                    const isMany = 'updateMany' in op;
+                    const isUpsert = 'upsert' in op || Boolean(( 'updateOne' in op ? op.updateOne.upsert : ( 'updateMany' in op ? op.updateMany.upsert : false )));
+                    const spec = 'updateOne' in op ? op.updateOne : ( 'updateMany' in op ? op.updateMany : op.upsert );
+                    const normalizedFilter = Array.isArray( spec.filter )
+                        ? { _id: { $in: spec.filter.map( id => this.dbeID( id )) } } as Filter<DBE>
+                        : spec.filter;
+                    const { finalMatch, targetIds } = await this.#resolveFilterMatch(
+                        normalizedFilter,
+                        'update',
+                        'bulkWrite',
+                        options,
+                        isMany ? undefined : 1
+                    );
+
+                    if( !finalMatch ){ continue }
+
+                    const timestamped = this._applyUpdateTimestamps( spec.update as Record<string, any>, now, isUpsert );
+                    const hooked = await this._runBeforeHook( 'beforeUpdate',
+                    {
+                        operation   : 'update',
+                        method      : 'bulkWrite',
+                        ids         : targetIds.length > 0 ? targetIds : undefined,
+                        filter      : finalMatch,
+                        update      : timestamped,
+                        context     : options?.context,
+                        traceID     : options?.traceID,
+                        session
+                    }, pendingAfterCommit );
+                    const validated = await this._validateWrite( hooked, { operation: 'update', method: 'bulkWrite', filter: finalMatch }, start, options, finalMatch );
+                    const updateOps = toUpdateOperations( validated ) as Record<string, any>;
+
+                    if( isUpsert && this._softDelete )
+                    {
+                        updateOps.$setOnInsert = { [this._softDelete.field]: null, ...( updateOps.$setOnInsert ?? {} ) };
+                    }
+
+                    if( targetIds.length > 0 ){ targetedIds.push( ...targetIds ) }
+                    else { hasBroadMutation = true }
+
+                    pendingAfterHooks.push({
+                        hook    : 'afterUpdate',
+                        ctx     :
+                        {
+                            operation   : 'update',
+                            method      : 'bulkWrite',
+                            ids         : targetIds.length > 0 ? targetIds : undefined,
+                            filter      : finalMatch,
+                            update      : updateOps as Document,
+                            context     : options?.context,
+                            traceID     : options?.traceID,
+                            session
+                        }
+                    });
+
+                    if( isMany )
+                    {
+                        rawOps.push({
+                            updateMany : {
+                                filter  : finalMatch,
+                                update  : updateOps as UpdateFilter<DBE>,
+                                ...( isUpsert ? { upsert: true } : {} )
+                            }
+                        });
+                    }
+                    else
+                    {
+                        rawOps.push({
+                            updateOne : {
+                                filter  : finalMatch,
+                                update  : updateOps as UpdateFilter<DBE>,
+                                ...( isUpsert ? { upsert: true } : {} )
+                            }
+                        });
+                    }
+                }
+                else if( 'delete' in op )
+                {
+                    const baseMatch = await this._access.match(
+                        resolveBSONObject({ _id: this.dbeID( op.delete.id ) }) as Filter<DBE>,
+                        { operation: 'delete', method: 'bulkWrite', access: options?.access }
+                    );
+
+                    if( !baseMatch ){ continue }
+
+                    const isSoft = Boolean( this._softDelete && !op.delete.hard );
+                    const match = isSoft
+                        ? combineMongoFilters( baseMatch, this._softDeleteFilter( false ) as Filter<DBE> | undefined )!
+                        : baseMatch;
+
+                    await this._runBeforeHook( 'beforeDelete',
+                    {
+                        operation   : 'delete',
+                        method      : 'bulkWrite',
+                        id          : op.delete.id,
+                        filter      : match,
+                        context     : options?.context,
+                        traceID     : options?.traceID,
+                        session
+                    }, pendingAfterCommit );
+
+                    targetedIds.push( String( this.dtoID( op.delete.id )));
+                    pendingAfterHooks.push({
+                        hook    : 'afterDelete',
+                        ctx     :
+                        {
+                            operation   : 'delete',
+                            method      : 'bulkWrite',
+                            id          : op.delete.id,
+                            filter      : match,
+                            context     : options?.context,
+                            traceID     : options?.traceID,
+                            session
+                        }
+                    });
+
+                    if( isSoft )
+                    {
+                        rawOps.push({
+                            updateOne : {
+                                filter  : match,
+                                update  : buildSoftDeleteUpdate( this._softDelete!, this._timestamps, now ) as UpdateFilter<DBE>
+                            }
+                        });
+                    }
+                    else
+                    {
+                        rawOps.push({
+                            deleteOne : { filter: match }
+                        });
+                    }
+                }
+                else if( 'deleteOne' in op || 'deleteMany' in op )
+                {
+                    const isMany = 'deleteMany' in op;
+                    const spec = 'deleteOne' in op ? op.deleteOne : op.deleteMany;
+                    const isSoft = Boolean( this._softDelete && !spec.hard );
+                    const normalizedFilter = Array.isArray( spec.filter )
+                        ? { _id: { $in: spec.filter.map( id => this.dbeID( id )) } } as Filter<DBE>
+                        : spec.filter;
+                    const { finalMatch, targetIds } = await this.#resolveFilterMatch(
+                        normalizedFilter,
+                        'delete',
+                        'bulkWrite',
+                        { ...options, includeDeleted: !isSoft },
+                        isMany ? undefined : 1
+                    );
+
+                    if( !finalMatch ){ continue }
+
+                    await this._runBeforeHook( 'beforeDelete',
+                    {
+                        operation   : 'delete',
+                        method      : 'bulkWrite',
+                        ids         : targetIds.length > 0 ? targetIds : undefined,
+                        filter      : finalMatch,
+                        context     : options?.context,
+                        traceID     : options?.traceID,
+                        session
+                    }, pendingAfterCommit );
+
+                    if( targetIds.length > 0 ){ targetedIds.push( ...targetIds ) }
+                    else { hasBroadMutation = true }
+
+                    pendingAfterHooks.push({
+                        hook    : 'afterDelete',
+                        ctx     :
+                        {
+                            operation   : 'delete',
+                            method      : 'bulkWrite',
+                            ids         : targetIds.length > 0 ? targetIds : undefined,
+                            filter      : finalMatch,
+                            context     : options?.context,
+                            traceID     : options?.traceID,
+                            session
+                        }
+                    });
+
+                    if( isSoft )
+                    {
+                        const softUpdate = buildSoftDeleteUpdate( this._softDelete!, this._timestamps, now ) as UpdateFilter<DBE>;
+
+                        rawOps.push( isMany
+                            ? { updateMany: { filter: finalMatch, update: softUpdate } }
+                            : { updateOne: { filter: finalMatch, update: softUpdate } }
+                        );
+                    }
+                    else
+                    {
+                        rawOps.push( isMany
+                            ? { deleteMany: { filter: finalMatch } }
+                            : { deleteOne: { filter: finalMatch } }
+                        );
+                    }
+                }
+            }
+
+            if( rawOps.length === 0 )
+            {
+                return {
+                    insertedCount   : 0,
+                    matchedCount    : 0,
+                    modifiedCount   : 0,
+                    deletedCount    : 0,
+                    upsertedCount   : 0,
+                    insertedIds     : [],
+                    upsertedIds     : {}
+                };
+            }
+
+            const bulkOpts = this._withSession(
+                options?.ordered !== undefined ? { ordered: options.ordered } : {},
+                options?.session
+            );
+            let res: any;
+
+            try
+            {
+                res = Object.keys( bulkOpts ).length > 0
+                    ? await this.collection.bulkWrite( rawOps, bulkOpts )
+                    : await this.collection.bulkWrite( rawOps );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'bulkWrite', Date.now() - start,
+                {
+                    context : options?.context,
+                    traceID : options?.traceID
+                });
+
+                throw e;
+            }
+
+            if( hasBroadMutation )
+            {
+                this._clearCache();
+            }
+            else if( targetedIds.length > 0 )
+            {
+                this._invalidateCache( targetedIds, true );
+            }
+            else if( insertedIds.length > 0 )
+            {
+                this._notifySiblingCacheInvalidation();
+            }
+
+            for( const item of pendingAfterHooks )
+            {
+                await this._runAfterHook( item.hook, item.ctx, pendingAfterCommit );
+            }
+
+            for( const cb of pendingAfterCommit )
+            {
+                await cb();
+            }
+
+            const upsertedIds: Record<number, DTO['id']> = {};
+
+            if( res?.upsertedIds && typeof res.upsertedIds === 'object' )
+            {
+                for( const [ idx, val ] of Object.entries( res.upsertedIds ) )
+                {
+                    upsertedIds[Number( idx )] = this.dtoID( val as any );
+                }
+            }
+
+            const result: ModelBulkWriteResult<DTO['id']> =
+            {
+                insertedCount   : res?.insertedCount ?? insertedIds.length,
+                matchedCount    : res?.matchedCount ?? 0,
+                modifiedCount   : res?.modifiedCount ?? 0,
+                deletedCount    : res?.deletedCount ?? 0,
+                upsertedCount   : res?.upsertedCount ?? 0,
+                insertedIds,
+                upsertedIds
+            };
+
+            this._emitMutation( 'bulkWrite', Date.now() - start,
+            {
+                insertedCount   : result.insertedCount,
+                matchedCount    : result.matchedCount,
+                modifiedCount   : result.modifiedCount,
+                deletedCount    : result.deletedCount,
+                upsertedCount   : result.upsertedCount,
+                ids             : targetedIds.length > 0 ? targetedIds : undefined,
+                context         : options?.context,
+                traceID         : options?.traceID
+            });
+
+            return result;
         });
     }
 }

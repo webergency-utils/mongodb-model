@@ -29,9 +29,16 @@ export function getActiveSession( explicitSession?: ClientSession ): ClientSessi
     return explicitSession ?? flowGet<ClientSession | undefined>( TRANSACTION_SESSION_KEY );
 }
 
-export function registerTransactionPostCommit( callback: () => void ): void
+export function registerTransactionPostCommit( callback: () => void | Promise<void> ): boolean
 {
-    const set = flowGet<Set<() => void> | undefined>( TRANSACTION_POST_COMMIT_KEY );
+    const set = flowGet<Set<() => void | Promise<void>> | undefined>( TRANSACTION_POST_COMMIT_KEY );
 
-    set?.add( callback );
+    if( !set )
+    {
+        return false;
+    }
+
+    set.add( callback );
+
+    return true;
 }

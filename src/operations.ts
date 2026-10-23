@@ -1,4 +1,4 @@
-import { ClientSession, Document, ObjectId, UpdateFilter, UpdateOptions } from 'mongodb';
+import { ClientSession, Document, Filter, ObjectId, UpdateFilter, UpdateOptions } from 'mongodb';
 import { getCursor, isForeignObjectIdLike, isLibraryObjectId, isUpdateOperator, propertyModelTargetUpdateParams } from './helpers/mongo.js';
 import { ConverterManager } from './converters.js';
 import { ModelValidationError } from './errors.js';
@@ -8,15 +8,37 @@ import
     GetOptions,
     ListResult,
     ModelCreateOptions,
+    ModelIndexDefinition,
+    ModelIndexSpecification,
+    ModelSoftDeleteConfig,
+    ModelTimestampsConfig,
     ModelValidationContext,
     ModelValidationOperation,
     ModelValidatorConfig,
     ModelValidatorFn,
     ModelValidatorInput,
+    NormalizedModelIndex,
     PropertyModelUpdateResponse,
     WithTotal
 }
 from './types/external.js';
+
+export function combineMongoFilters<T = Document>( ...filters: Array<Filter<T> | Document | undefined | null> ): Filter<T> | undefined
+{
+    const nonEmpty = filters.filter(( f ): f is Filter<T> => Boolean( f && typeof f === 'object' && Object.keys( f ).length > 0 ));
+
+    if( nonEmpty.length === 0 )
+    {
+        return undefined;
+    }
+
+    if( nonEmpty.length === 1 )
+    {
+        return nonEmpty[0];
+    }
+
+    return { $and: nonEmpty } as unknown as Filter<T>;
+}
 
 export function attachListMetadata<T>(
     items: T[],
@@ -81,7 +103,7 @@ export function attachCursorToItem<T>( dto: T, dbe: Document, sort: Document ): 
     return dto as T & { $cursor?: string };
 }
 
-const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'cursor', 'after', 'before', 'access', 'context', 'traceID', 'session' ]);
+const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'cursor', 'after', 'before', 'includeDeleted', 'access', 'context', 'traceID', 'session' ]);
 
 export function isCreateOptionsObject( v: unknown ): v is ModelCreateOptions
 {
@@ -133,7 +155,7 @@ export function resolveCreateFromArgs<ID>(
     };
 }
 
-export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, cursor?: string, after?: string, before?: string, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
 {
     return Boolean(
         match
@@ -147,15 +169,16 @@ export function isFindOptionsObject( match: unknown ): match is { filter?: unkno
             || 'cursor' in match
             || 'after' in match
             || 'before' in match
+            || 'includeDeleted' in match
             || (( 'access' in match || 'session' in match ) && Object.keys( match ).every( k => FIND_OPTION_KEYS.has( k ) ))
         )
     );
 }
 
 export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilterType = any>(
-    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, cursor?: string, after?: string, before?: string, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession },
-    optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
-): { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession },
+    optionsOrAccess?: string | { includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+): { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
 {
     const opts = typeof optionsOrAccess === 'string' ? { access: optionsOrAccess } : optionsOrAccess;
 
@@ -166,6 +189,7 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
             : ( opts?.context ?? match.context );
         const traceID = opts?.traceID ?? match.traceID;
         const session = opts?.session ?? match.session;
+        const includeDeleted = opts?.includeDeleted ?? match.includeDeleted;
         const cursor = normalizeCursorOption( match );
 
         return {
@@ -173,6 +197,7 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
             smartFilter : match.smartFilter as SmartFilterType | undefined,
             access      : opts?.access ?? match.access,
             ...( cursor !== undefined ? { cursor } : {} ),
+            ...( includeDeleted !== undefined ? { includeDeleted } : {} ),
             ...( context !== undefined ? { context } : {} ),
             ...( traceID !== undefined ? { traceID } : {} ),
             ...( session !== undefined ? { session } : {} )
@@ -182,6 +207,7 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
     return {
         filter : ( match ?? {} ) as FilterType,
         access : opts?.access,
+        ...( opts?.includeDeleted !== undefined ? { includeDeleted: opts.includeDeleted } : {} ),
         ...( opts?.context !== undefined ? { context: opts.context } : {} ),
         ...( opts?.traceID !== undefined ? { traceID: opts.traceID } : {} ),
         ...( opts?.session !== undefined ? { session: opts.session } : {} )
@@ -192,8 +218,8 @@ export function normalizeExistsOptions<FilterType = Record<string, any>, SmartFi
     idOrFilter: unknown,
     idKey: '_id' | 'id',
     dbeID: ( id: any ) => any,
-    optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
-): { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession, isPrimitiveId?: boolean }
+    optionsOrAccess?: string | { includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+): { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession, isPrimitiveId?: boolean }
 {
     if( idOrFilter === undefined || idOrFilter === null )
     {
@@ -476,4 +502,248 @@ export async function convertDocuments
 
     return entries;
 }
+
+export type ResolvedTimestampsConfig =
+{
+    createdAt?  : string
+    updatedAt?  : string
+};
+
+export type ResolvedSoftDeleteConfig =
+{
+    field           : string
+    deletedAtField? : string
+};
+
+export function resolveTimestampsConfig( config?: ModelTimestampsConfig ): ResolvedTimestampsConfig | undefined
+{
+    if( !config )
+    {
+        return undefined;
+    }
+
+    if( config === true )
+    {
+        return { createdAt: 'createdAt', updatedAt: 'updatedAt' };
+    }
+
+    const createdAt = config.createdAt === false ? undefined : ( config.createdAt ?? 'createdAt' );
+    const updatedAt = config.updatedAt === false ? undefined : ( config.updatedAt ?? 'updatedAt' );
+
+    if( !createdAt && !updatedAt )
+    {
+        return undefined;
+    }
+
+    return { createdAt, updatedAt };
+}
+
+export function resolveSoftDeleteConfig( config?: ModelSoftDeleteConfig ): ResolvedSoftDeleteConfig | undefined
+{
+    if( !config )
+    {
+        return undefined;
+    }
+
+    if( config === true )
+    {
+        return { field: 'deleted', deletedAtField: 'deletedAt' };
+    }
+
+    const field = config.field ?? 'deleted';
+    const deletedAtField = config.deletedAtField === false ? undefined : ( config.deletedAtField ?? 'deletedAt' );
+
+    return { field, deletedAtField };
+}
+
+export function applyCreateTimestamps<T extends Record<string, any>>(
+    doc: T,
+    timestamps?: ResolvedTimestampsConfig,
+    now: Date = new Date()
+): T
+{
+    if( !timestamps )
+    {
+        return doc;
+    }
+
+    const out: Record<string, any> = { ...doc };
+
+    if( timestamps.createdAt && out[timestamps.createdAt] === undefined )
+    {
+        out[timestamps.createdAt] = now;
+    }
+
+    if( timestamps.updatedAt && out[timestamps.updatedAt] === undefined )
+    {
+        out[timestamps.updatedAt] = now;
+    }
+
+    return out as T;
+}
+
+export function applyUpdateTimestamps<T extends Record<string, any>>(
+    update: T,
+    timestamps?: ResolvedTimestampsConfig,
+    now: Date = new Date(),
+    isUpsert: boolean = false
+): T
+{
+    if( !timestamps || ( !timestamps.updatedAt && ( !isUpsert || !timestamps.createdAt )) )
+    {
+        return update;
+    }
+
+    if( isUpdateOperator( update ) )
+    {
+        const out: Record<string, any> = { ...update };
+
+        if( timestamps.updatedAt )
+        {
+            const existingSet = ( out.$set && typeof out.$set === 'object' ) ? out.$set : {};
+
+            if( existingSet[timestamps.updatedAt] === undefined )
+            {
+                out.$set = { ...existingSet, [timestamps.updatedAt]: now };
+            }
+        }
+
+        if( isUpsert && timestamps.createdAt && out.$set?.[timestamps.createdAt] === undefined )
+        {
+            const existingSetOnInsert = ( out.$setOnInsert && typeof out.$setOnInsert === 'object' ) ? out.$setOnInsert : {};
+
+            if( existingSetOnInsert[timestamps.createdAt] === undefined )
+            {
+                out.$setOnInsert = { ...existingSetOnInsert, [timestamps.createdAt]: now };
+            }
+        }
+
+        return out as T;
+    }
+
+    const out: Record<string, any> = { ...update };
+
+    if( timestamps.updatedAt && out[timestamps.updatedAt] === undefined )
+    {
+        out[timestamps.updatedAt] = now;
+    }
+
+    if( isUpsert && timestamps.createdAt && out[timestamps.createdAt] === undefined )
+    {
+        return {
+            $set            : out,
+            $setOnInsert    : { [timestamps.createdAt]: now }
+        } as unknown as T;
+    }
+
+    return out as T;
+}
+
+export function buildSoftDeleteFilter<T = Document>( softDelete?: ResolvedSoftDeleteConfig, includeDeleted?: boolean ): Filter<T> | undefined
+{
+    if( !softDelete || includeDeleted )
+    {
+        return undefined;
+    }
+
+    return { [softDelete.field]: { $in: [ null, false ] } } as unknown as Filter<T>;
+}
+
+export function buildSoftDeleteUpdate<T = Document>(
+    softDelete: ResolvedSoftDeleteConfig,
+    timestamps?: ResolvedTimestampsConfig,
+    now: Date = new Date()
+): UpdateFilter<T>
+{
+    const setFields: Record<string, any> =
+    {
+        [softDelete.field]: softDelete.field === softDelete.deletedAtField ? now : true
+    };
+
+    if( softDelete.deletedAtField )
+    {
+        setFields[softDelete.deletedAtField] = now;
+    }
+
+    if( timestamps?.updatedAt )
+    {
+        setFields[timestamps.updatedAt] = now;
+    }
+
+    return { $set: setFields } as unknown as UpdateFilter<T>;
+}
+
+export function buildRestoreUpdate<T = Document>(
+    softDelete: ResolvedSoftDeleteConfig,
+    timestamps?: ResolvedTimestampsConfig,
+    now: Date = new Date()
+): UpdateFilter<T>
+{
+    const setFields: Record<string, any> =
+    {
+        [softDelete.field]: softDelete.field === softDelete.deletedAtField ? null : false
+    };
+
+    if( softDelete.deletedAtField && softDelete.deletedAtField !== softDelete.field )
+    {
+        setFields[softDelete.deletedAtField] = null;
+    }
+
+    if( timestamps?.updatedAt )
+    {
+        setFields[timestamps.updatedAt] = now;
+    }
+
+    return { $set: setFields } as unknown as UpdateFilter<T>;
+}
+
+export function defaultIndexName( keys: ModelIndexSpecification ): string
+{
+    return Object.entries( keys ).map(([ field, dir ]) => `${field}_${String( dir )}`).join( '_' );
+}
+
+export function normalizeModelIndexes(
+    indexes: ModelIndexDefinition<any>[] | undefined,
+    prefix?: string
+): NormalizedModelIndex[]
+{
+    if( !indexes?.length )
+    {
+        return [];
+    }
+
+    return indexes.map(( def: any ) =>
+    {
+        const hasKeyProp = def && typeof def === 'object' && ( ( 'key' in def && typeof def.key === 'object' ) || ( 'keys' in def && typeof def.keys === 'object' ) );
+        const rawKeySpec: ModelIndexSpecification = hasKeyProp ? ( def.key ?? def.keys ) : def;
+        const { key: _k, keys: _ks, options: nestedOptions, ...topLevelOptions } = hasKeyProp ? def : { key: undefined, keys: undefined, options: undefined };
+        const mergedOptions = { ...topLevelOptions, ...( nestedOptions ?? {} ) };
+        const key: ModelIndexSpecification = {};
+
+        for( const [ field, dir ] of Object.entries( rawKeySpec ) )
+        {
+            if( prefix )
+            {
+                const normalizedKey = field === '_root' || field.startsWith( '_root.' )
+                    ? field.replace( /^_root\.?/, '' )
+                    : ( field.startsWith( `${prefix}.` ) ? field : `${prefix}.${field}` );
+
+                key[normalizedKey] = dir;
+            }
+            else
+            {
+                key[field] = dir;
+            }
+        }
+
+        const name = mergedOptions.name ?? defaultIndexName( key );
+
+        return {
+            key,
+            name,
+            options : { ...mergedOptions, name }
+        };
+    });
+}
+
 

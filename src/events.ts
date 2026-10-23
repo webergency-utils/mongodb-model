@@ -3,9 +3,23 @@ import { flowGet } from './flow.js';
 import { isSet } from './helpers/mongo.js';
 import { EMIT_OBSERVABILITY_EVENT, GET_OBSERVABILITY_OPTIONS, RESOLVED_OPERATION_FILTER } from './symbols.js';
 
-export type ModelQueryOperation = 'get' | 'getMany' | 'list' | 'stream' | 'aggregate' | 'count' | 'find' | 'exists';
+export type ModelQueryOperation = 'get' | 'getMany' | 'list' | 'stream' | 'aggregate' | 'count' | 'find' | 'exists' | 'distinct';
 
-export type ModelMutationOperation = 'create' | 'createFrom' | 'createMany' | 'update' | 'updateOne' | 'updateMany' | 'delete' | 'deleteMany';
+export type ModelMutationOperation =
+    | 'create'
+    | 'createFrom'
+    | 'createMany'
+    | 'update'
+    | 'updateOne'
+    | 'updateMany'
+    | 'upsert'
+    | 'delete'
+    | 'deleteMany'
+    | 'restore'
+    | 'restoreMany'
+    | 'hardDelete'
+    | 'hardDeleteMany'
+    | 'bulkWrite';
 
 export type ObservabilityOperationCategory = 'query' | 'mutation' | 'create' | 'update' | 'delete' | 'cache' | 'error' | 'slowQuery' | 'internal';
 
@@ -55,6 +69,7 @@ export type ModelMutationEvent =
     modifiedCount?      : number
     deletedCount?       : number
     insertedCount?      : number
+    upsertedCount?      : number
     ids?                : unknown[]
     parentID?           : unknown
     filter?             : Document
@@ -145,11 +160,27 @@ export type ObservabilityOptions =
 
 export type ObservabilityConfig = boolean | ObservabilityOptions;
 
-const ALL_QUERY_OPS: ModelQueryOperation[] = [ 'get', 'getMany', 'list', 'stream', 'aggregate', 'count', 'find', 'exists' ];
-const ALL_MUTATION_OPS: ModelMutationOperation[] = [ 'create', 'createFrom', 'createMany', 'update', 'updateOne', 'updateMany', 'delete', 'deleteMany' ];
-const CREATE_OPS: ModelMutationOperation[] = [ 'create', 'createFrom', 'createMany' ];
-const UPDATE_OPS: ModelMutationOperation[] = [ 'update', 'updateOne', 'updateMany' ];
-const DELETE_OPS: ModelMutationOperation[] = [ 'delete', 'deleteMany' ];
+const ALL_QUERY_OPS: ModelQueryOperation[] = [ 'get', 'getMany', 'list', 'stream', 'aggregate', 'count', 'find', 'exists', 'distinct' ];
+const ALL_MUTATION_OPS: ModelMutationOperation[] =
+[
+    'create',
+    'createFrom',
+    'createMany',
+    'update',
+    'updateOne',
+    'updateMany',
+    'upsert',
+    'delete',
+    'deleteMany',
+    'restore',
+    'restoreMany',
+    'hardDelete',
+    'hardDeleteMany',
+    'bulkWrite'
+];
+const CREATE_OPS: ModelMutationOperation[] = [ 'create', 'createFrom', 'createMany', 'upsert', 'bulkWrite' ];
+const UPDATE_OPS: ModelMutationOperation[] = [ 'update', 'updateOne', 'updateMany', 'upsert', 'restore', 'restoreMany', 'bulkWrite' ];
+const DELETE_OPS: ModelMutationOperation[] = [ 'delete', 'deleteMany', 'hardDelete', 'hardDeleteMany', 'bulkWrite' ];
 const QUERY_OP_SET = new Set<string>( ALL_QUERY_OPS );
 const MUTATION_OP_SET = new Set<string>( ALL_MUTATION_OPS );
 

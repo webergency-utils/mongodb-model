@@ -19,7 +19,11 @@ function buildExtensions<DBE extends MongoRootDocument>(
         access              : config.access,
         optimizer           : config.optimizer,
         observability       : config.observability,
-        validate            : config.validate
+        validate            : config.validate,
+        indexes             : config.indexes,
+        timestamps          : config.timestamps,
+        softDelete          : config.softDelete,
+        hooks               : config.hooks
     };
 }
 

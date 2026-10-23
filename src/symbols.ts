@@ -9,6 +9,8 @@ export const INVALIDATE_COLLECTION_CACHE = Symbol( 'INVALIDATE_COLLECTION_CACHE'
 export const CLEAR_LOCAL_CACHE = Symbol( 'CLEAR_LOCAL_CACHE' );
 export const RESOLVED_ACCESS = Symbol( 'RESOLVED_ACCESS' );
 export const RESOLVED_SESSION = Symbol( 'RESOLVED_SESSION' );
+export const INCLUDE_DELETED = Symbol( 'INCLUDE_DELETED' );
+export const GET_MANAGED_INDEXES = Symbol( 'GET_MANAGED_INDEXES' );
 
 
 

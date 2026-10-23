@@ -8,6 +8,10 @@ import
     ModelAccessConfig,
     ModelCacheConfig,
     ModelExtensions,
+    ModelHooksConfig,
+    ModelIndexDefinition,
+    ModelSoftDeleteConfig,
+    ModelTimestampsConfig,
     ModelValidatorConfig,
     MongoPropertyDocument,
     MongoRootDocument,
@@ -103,6 +107,10 @@ export type RootModelDefinition
     optimizer?           : OptimizerConfig
     observability?       : ObservabilityConfig
     validate?            : ModelValidatorConfig<DBE>
+    indexes?             : ModelIndexDefinition[]
+    timestamps?          : ModelTimestampsConfig
+    softDelete?          : ModelSoftDeleteConfig
+    hooks?               : ModelHooksConfig<DBE>
     dtoID?               : ( id: unknown ) => string
 }
 
@@ -124,6 +132,10 @@ export type PropertyModelDefinition
     optimizer?           : OptimizerConfig
     observability?       : ObservabilityConfig
     validate?            : ModelValidatorConfig<DBE>
+    indexes?             : ModelIndexDefinition[]
+    timestamps?          : ModelTimestampsConfig
+    softDelete?          : ModelSoftDeleteConfig
+    hooks?               : ModelHooksConfig<DBE>
     dtoID?               : ( id: unknown ) => string
 }
 
