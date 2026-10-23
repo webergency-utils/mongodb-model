@@ -40,9 +40,9 @@ describe( 'mongo helpers', () =>
         expect( optimizeMatch({ $and: [{ a: 1 }, { b: 2 }] })).toEqual({ a: 1, b: 2 });
     });
 
-    test( 'optimizeMatch collapses $in with one value to $eq', () =>
+    test( 'optimizeMatch collapses $in with one value to implicit equality', () =>
     {
-        expect( optimizeMatch({ status: { $in: [ 'active' ] } })).toEqual({ status: { $eq: 'active' } });
+        expect( optimizeMatch({ status: { $in: [ 'active' ] } })).toEqual({ status: 'active' });
     });
 
     test( 'addPrefixToFilter prefixes keys and preserves foreign ObjectId values', () =>

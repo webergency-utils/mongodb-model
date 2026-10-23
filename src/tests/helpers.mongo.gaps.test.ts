@@ -5,6 +5,7 @@ import
 {
     addPrefixToFilter,
     addPrefixToPipeline,
+    collectAddedFields,
     convert,
     getSubPaths,
     getUsedFields,
@@ -157,6 +158,33 @@ describe( 'mongo helper coverage gaps', () =>
         ]);
 
         expect( used.used.length ).toBeGreaterThan( 0 );
+    });
+
+    test( 'collectAddedFields and getUsedFields support all 25 optimizer stages ($sort, $limit, $skip, $setWindowFields)', () =>
+    {
+        const added = collectAddedFields(
+        [
+            { $addFields: { a: 1, b: 2 } },
+            { $sort: { a: -1 } },
+            { $skip: 5 },
+            { $limit: 10 },
+            { $setWindowFields: { sortBy: { a: 1 }, output: { rank: { $rank: {} } } } },
+            { $unset: [ 'b' ] }
+        ]);
+
+        expect( added ).toEqual([ 'a', 'rank' ]);
+
+        const used = getUsedFields(
+        [
+            { $addFields: { computed: '$sourceField' } },
+            { $sort: { computed: 1, sortField: -1 } },
+            { $skip: 2 },
+            { $limit: 5 }
+        ]);
+
+        expect( used.used ).toEqual( expect.arrayContaining([ 'sourceField', 'sortField' ]));
+        expect( used.used ).not.toContain( 'computed' );
+        expect( used.ignored ).toContain( 'computed' );
     });
 
     test( 'getSubPaths keeps trailing non-array segments', () =>

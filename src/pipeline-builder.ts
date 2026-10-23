@@ -18,7 +18,7 @@ export type PipelineParams<DBE extends MongoRootDocument> =
     countLimit?         : number
 }
 
-const COUNT_IGNORE_STAGES = [ '$limit', '$skip', '$sample', '$sort', '$project', '$addFields', '$set', '$unset' ];
+const COUNT_IGNORE_STAGES = [ '$limit', '$skip', '$sample', '$sort', '$project', '$addFields', '$set', '$unset', '$replaceWith', '$replaceRoot' ];
 
 export class PipelineBuilder<DBE extends MongoRootDocument = MongoRootDocument>
 {

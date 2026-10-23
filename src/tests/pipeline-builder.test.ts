@@ -48,6 +48,27 @@ describe( 'PipelineBuilder', () =>
         ]);
     });
 
+    test( 'buildCountPipeline strips trailing $replaceWith and $replaceRoot stages', () =>
+    {
+        const builder = new PipelineBuilder();
+        const count = builder.buildCountPipeline(
+        [
+            { $match: { a: 1 } },
+            { $unwind: '$items' },
+            { $replaceWith: { $mergeObjects: [ '$items', {} ] } },
+            { $replaceRoot: { newRoot: '$items' } },
+            { $sort: { id: -1 } },
+            { $limit: 5 }
+        ]);
+
+        expect( count ).toEqual(
+        [
+            { $match: { a: 1 } },
+            { $unwind: '$items' },
+            { $count: 'count' }
+        ]);
+    });
+
     test( 'buildCountPipeline inserts countLimit before $count', () =>
     {
         const builder = new PipelineBuilder();

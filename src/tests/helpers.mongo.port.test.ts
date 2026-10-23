@@ -1000,7 +1000,7 @@ describe('optimizeMatch', () =>
     it('should keep all properties inside $and if any conflicts with $match root', () =>
     {
         const match = {c: 'a', $and: [{a: 1, b: 1, c: { $in: ['a', 'b']}}]};
-        assert.deepStrictEqual(optimizeMatch(match), match);
+        assert.deepStrictEqual(optimizeMatch(match), { a: 1, b: 1, c: 'a', $and: [{ c: { $in: ['a', 'b'] } }] });
     })
 
     it('should extract properties from nested $and/$or', () =>
@@ -1067,8 +1067,7 @@ describe('optimizeMatch', () =>
                 { a: 2 },
                 { b: 5 },
                 { a: { gte: 6 } },
-                { b: 7 },
-                { a: 2 }
+                { b: 7 }
             ]
         });
     })
@@ -1087,7 +1086,6 @@ describe('optimizeMatch', () =>
             $or: [
                 { $or: [{ a: 1, b: 4}, {b: 2}], a: 4 },
                 { a: 2 },
-                { a: 2, b: 5 },
                 { a: {gte: 6} },
                 { b: 7 },
             ].sort()
@@ -1129,7 +1127,7 @@ describe('optimizeMatch', () =>
             ]
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, match);
+        assert.deepStrictEqual(optimized, { a: 1, $and: [{ a: 2 }] });
     })
 
     it('should merge object properties', () => {
@@ -1140,7 +1138,7 @@ describe('optimizeMatch', () =>
             ]
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, { a: { $lt: 4, $eq: 1 }, b: 4 });
+        assert.deepStrictEqual(optimized, { a: 1, b: 4, $and: [{ a: { $lt: 4 } }] });
     })
 
     it('should keep basic object intact', () => {
@@ -1168,12 +1166,12 @@ describe('optimizeMatch', () =>
         assert.deepStrictEqual(optimized, match);
     })
 
-    it('should keep unknown properties intact ($nor)', () => {
+    it('should simplify single-branch $nor to $ne', () => {
         const match = {
             $nor: [{ a: 1 }]
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, match);
+        assert.deepStrictEqual(optimized, { a: { $ne: 1 } });
     })
 
     it('should keep nested $and with conflicting properties intact', () => {
@@ -1185,7 +1183,7 @@ describe('optimizeMatch', () =>
             ]
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, { $and: [{ a: 1, b: 2 }, { a: 4 }, { d: 3 }] });
+        assert.deepStrictEqual(optimized, { a: 1, b: 2, d: 3, $and: [{ a: 4 }] });
     })
 
     it('should merge $and with conflicting properties but different conditions', () => {
@@ -1197,7 +1195,7 @@ describe('optimizeMatch', () =>
             ]
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, { a: { $eq: 1, $gte: 4, $in: [1, 2, 3, 4] }, b: 2 });
+        assert.deepStrictEqual(optimized, { a: 1, b: 2, $and: [{ a: { $gte: 4 } }, { a: { $in: [ 1, 2, 3, 4 ] } }] });
     })
 
     it('should process ObjectId values', () => {
@@ -1210,7 +1208,13 @@ describe('optimizeMatch', () =>
             ]
         };
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, match);
+        assert.deepStrictEqual(optimized, {
+            a: new ObjectId('5f4d6f9e6f0a4d001f9a2a4d'),
+            $and: [
+                { a: new ObjectId('5f4d6f9e6f0a4d001f9a2a4a') },
+                { a: { $gte: new ObjectId('5f4d6f9e6f0a4d001f9a2a4b') } }
+            ]
+        });
     });
 
     it('should not optimize $elemMatch with single condition', () => {
@@ -1221,8 +1225,8 @@ describe('optimizeMatch', () =>
             ]
         }
         const result = {
+            a: { $elemMatch: { b: 1 } },
             $and: [
-                { a: { $elemMatch: { b: 1 } } },
                 { a: { $elemMatch: { c: 2 } } },
             ]
         }
@@ -1238,7 +1242,10 @@ describe('optimizeMatch', () =>
             ]
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, match);
+        assert.deepStrictEqual(optimized, {
+            a: { $elemMatch: { b: 1, c: 2 } },
+            $and: [{ a: { $elemMatch: { d: 3 } } }]
+        });
     });
 
     it('should optimize $in, $nin, $not $in with single condition', () => {
@@ -1248,7 +1255,7 @@ describe('optimizeMatch', () =>
             c: { $not: { $in: [5] } },
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, { a: { $eq: 1 }, b: { $ne: 3 }, c: { $ne: 5 } });
+        assert.deepStrictEqual(optimized, { a: 1, b: { $nin: [3] }, c: { $nin: [5] } });
     })
 
     it('should not optimize $in, $nin, $not $in with single RegExp condition', () => {
@@ -1258,7 +1265,11 @@ describe('optimizeMatch', () =>
             c: { $not: { $in: [new RegExp('test')] } },
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, match);
+        assert.deepStrictEqual(optimized, {
+            a: { $in: [new RegExp('test')] },
+            b: { $nin: [new RegExp('test')] },
+            c: { $nin: [new RegExp('test')] }
+        });
     })
 
     it('should not optimize $in, $nin, $not $in with multiple conditions', () => {
@@ -1268,7 +1279,11 @@ describe('optimizeMatch', () =>
             c: { $not: { $in: [5, 6] } },
         }
         const optimized = optimizeMatch(match);
-        assert.deepStrictEqual(optimized, match);
+        assert.deepStrictEqual(optimized, {
+            a: { $in: [1, 2] },
+            b: { $nin: [3, 4] },
+            c: { $nin: [5, 6] }
+        });
     })
 
     it('should keep both $in and $nin and other properties within filter', () => {
@@ -1286,7 +1301,7 @@ describe('optimizeMatch', () =>
         assert.deepStrictEqual(optimized, {
             _id: {
                 $in: match['_id']['$in'],
-                $ne: match['_id']['$nin'][0]
+                $nin: match['_id']['$nin']
             }
         });
     });
@@ -1559,7 +1574,7 @@ describe('extractFields', () =>
         const expected = {
             used: [
                 '_id', 'programmeID', 'positions.events.opened', 'positions.events.closed', 'positions.events.hired', 'positions.id',
-                '$ROOT._id', 'events', 'engagements.id', 'mapInput', 'filterInput', 'merge1', 'arrayElemAt'
+                'events', 'engagements.id', 'mapInput', 'mapInput.id', 'mapInput.status', 'filterInput', 'merge1', 'arrayElemAt'
             ].sort(),
             ignored: [ 'id', 'jobID', 'statusAt', '_id', 'placedJobs', 'positions', 'mapped', 'filtered', 'merged', 'elemAt' ].sort()
         }
@@ -1573,10 +1588,10 @@ describe('extractFields', () =>
         assert.throws(() => getUsedFields(pipeline), /Unsupported pipeline stage: "\$unsupported"/);
     });
 
-    it('should throw error for unsupported operators', () =>
+    it('should handle unknown operators gracefully in getUsedFields', () =>
     {
         const pipeline = [{ $match: { $unsupported: {} } }];
-        assert.throws(() => getUsedFields(pipeline), /Unsupported operator: "\$unsupported"/);
+        assert.deepStrictEqual(getUsedFields(pipeline), { used: [], ignored: [] });
     });
 })
 

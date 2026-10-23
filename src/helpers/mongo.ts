@@ -1,4 +1,5 @@
 import { Document, Filter as MongoFilter, FindOptions, ObjectId, Sort, UpdateFilter, OnlyFieldsOfType } from 'mongodb';
+import { getStageInfo, optimizeFilter } from '@webergency-utils/mongodb-query-optimizer';
 import { deleteUndefinedProperties, objectGet, objectHash, objectSet } from './object.js';
 import { ModelConverterError } from '../errors.js';
 import { AbstractModelConverter, SyncComputedPropertyMethod } from '../types/index.js';
@@ -532,167 +533,127 @@ export function collectAddedFields( pipeline: any[] ): string[]
 {
     const fields = new Set<string>();
 
-    for( const stage of pipeline )
+    for( let i = 0; i < pipeline.length; i++ )
     {
-        const addedFields = stage.$addFields || stage.$set;
-        if ( addedFields )
+        const stage = pipeline[i];
+        const info = getStageInfo( stage, i );
+
+        if( info.isUnknown )
         {
-            Object.keys( addedFields ).forEach(prop => fields.add(prop));
+            const addedFields = stage?.$addFields || stage?.$set;
+
+            if( addedFields && typeof addedFields === 'object' && !Array.isArray( addedFields ) )
+            {
+                Object.keys( addedFields ).forEach( prop => fields.add( prop ));
+                continue;
+            }
+
+            if( stage?.$lookup && typeof stage.$lookup.as === 'string' )
+            {
+                fields.add( stage.$lookup.as );
+                continue;
+            }
+
+            if( stage?.$unset && Array.isArray( stage.$unset ) && stage.$unset.length === 0 )
+            {
+                continue;
+            }
+
+            throw new Error( `Unsupported pipeline stage: "${Object.keys( stage || {} )[0]}"` );
         }
-        else if( stage.$lookup )
+
+        for( const field of info.producedFields )
         {
-            fields.add(stage.$lookup.as);
+            if( field !== '*' )
+            {
+                fields.add( field );
+            }
         }
-        else if( stage.$unset )
+
+        for( const field of info.removedFields )
         {
-            stage.$unset.forEach((prop: string) => fields.delete(prop));
-        }
-        else if ( !stage.$match )
-        {
-            throw new Error(`Unsupported pipeline stage: "${Object.keys(stage)[0]}"`);
+            fields.delete( field );
         }
     }
 
-    return [...fields];
+    return [ ...fields ];
 }
 
-/**
- * Optimizes match filter by merging conditions and removing unnecessary operators
- * @param obj - filter to optimize
- * @returns optimized filter
- */
-export function optimizeMatch( obj: MongoFilter<any> ): MongoFilter<any> | undefined {
-    if ( !obj ) { return undefined }
-
-    let result: any = {};
-
-    for ( const [key, value] of Object.entries(obj) )
+function cleanFilterForOptimizer( obj: any ): any
+{
+    if( !obj || typeof obj !== 'object' )
     {
-        if ( value === undefined )
+        return obj;
+    }
+
+    if( Array.isArray( obj ) )
+    {
+        return obj
+            .map( item => cleanFilterForOptimizer( item ))
+            .filter( item => item !== undefined && item !== null && ( typeof item !== 'object' || Object.keys( item ).length > 0 ));
+    }
+
+    if( isLibraryObjectId( obj ) || isForeignObjectIdLike( obj ) || obj instanceof Date || obj instanceof RegExp )
+    {
+        return obj;
+    }
+
+    const result: Record<string, any> = {};
+
+    for( const [ key, value ] of Object.entries( obj ) )
+    {
+        if( value === undefined )
         {
             continue;
         }
 
-        if ( key === '$and' || key === '$or' )
+        if( key === '$and' || key === '$or' )
         {
-            const filteredArray = value
-                .map( (item: any) => optimizeMatch(item) )
-                .filter( (optimizedItem: any) => optimizedItem && Object.keys(optimizedItem).length );
+            const cleanedArr = Array.isArray( value ) ? cleanFilterForOptimizer( value ) : [];
 
-            if ( filteredArray.length > 1 )
+            if( cleanedArr.length > 0 )
             {
-                if ( key === '$and' )
-                {
-                    // TODO: combo $and + key na jednej úrovni
-                    if ( filteredArray.every( ( item: any ) => Object.keys(item).every( (itemKey: string) => !itemKey.startsWith('$') ))
-                        || filteredArray.every( ( item: any ) => Object.keys(item).every( (itemKey: string) => itemKey === '$and' )))
-                    {
-                        const merged = mergeProperties(...filteredArray);
-                        if ( merged === false )
-                        {
-                            result[key] = filteredArray;
-                        }
-                        else
-                        {
-                            result = { ...result, ...merged }
-                        }
-                    }
-                    else
-                    {
-                        result[key] = filteredArray
-                    }
-                }
-                else if ( key === '$or' )
-                {
-                    if ( filteredArray.every( ( item: any ) => (Object.keys(item).length === 1 && item.$or) || Object.keys(item).every( itemKey => !itemKey.startsWith('$'))) )
-                    {
-                        const merged = [];
-                        for ( const item of filteredArray )
-                        {
-                            if ( item.$or )
-                            {
-                                merged.push(...item.$or);
-                            }
-                            else
-                            {
-                                merged.push(item);
-                            }
-                        }
-                        result = { ...result, $or: merged }
-                    }
-                    else
-                    {
-                        const or = filteredArray.filter( (el: MongoFilter<any>) => Object.keys(el).length === 1 && el.$or );
-                        const rest = filteredArray.filter( (el: MongoFilter<any>) => Object.keys(el).length > 1 || !el.$or );
-                        result[key] = [ ...rest, ...(or[0]?.$or || []) ]
-                    }
-                }
-                else
-                {
-                    result[key] = filteredArray
-                }
+                result[key] = cleanedArr;
+            }
 
-            }
-            else if ( filteredArray.length === 1 )
-            {
-                const isInRoot = Object.keys( filteredArray[0] ).some( key => result[key] );
-                const properties = mergeProperties( filteredArray[0] );
-                result = { ...result, ...( isInRoot ? { [key]: [ filteredArray[0] ] } : properties ) }
-            }
+            continue;
         }
-        else
+
+        if( value !== null && typeof value === 'object' && !Array.isArray( value ) && !isLibraryObjectId( value ) && !isForeignObjectIdLike( value ) && !( value instanceof Date ) && !( value instanceof RegExp ) )
         {
-            if ( typeof value === 'object' && !Array.isArray(value) && value !== null )
-            {
-                if ( (value instanceof ObjectId) || (value instanceof Date)  || (value instanceof RegExp) )
-                {
-                    result[key] = value;
-                    continue;
-                }
+            const cleanedSub = cleanFilterForOptimizer( value );
 
-                // iterate all keys and optimize them
-                for ( const operator in value )
-                {
-                    if ( operator === '$in' && value.$in && value.$in.length === 1 && !(value.$in[0] instanceof RegExp) )
-                    {
-                        result[key] = { ...result[key], $eq: value.$in[0] };
-                    }
-                    else if ( operator === '$nin' && value.$nin && value.$nin.length === 1 && !(value.$nin[0] instanceof RegExp) )
-                    {
-                        result[key] = { ...result[key], $ne: value.$nin[0] };
-                    }
-                    else if ( operator === '$not' && value.$not && value.$not.$in && value.$not.$in.length === 1 && !(value.$not.$in[0] instanceof RegExp) )
-                    {
-                        result[key] = { ...result[key], $ne: value.$not.$in[0] };
-                    }
-                    else if ( operator === '$elemMatch' )
-                    {
-                        // not possible in negative cases - $exists: false, $nin, $not, $ne...
-                        // const elemMatch = optimizeMatch(value.$elemMatch);
-                        // if ( elemMatch && Object.keys(elemMatch).length === 1 && !Object.keys(elemMatch).every( key => key.startsWith('$')) )
-                        // {
-                        //     const [elemMatchKey, elemMatchValue] = Object.entries(elemMatch)[0];
-                        //     result[key + '.' + elemMatchKey] = elemMatchValue;
-                        // }
-                        // else
-                        // {
-                            result[key] = value;
-                        // }
-                    }
-                    else
-                    {
-                        result[key] = { ...result[key], [operator]: value[operator] };
-                    }
-                }
-            }
-            else
+            if( Object.keys( cleanedSub ).length > 0 || Object.keys( value ).length === 0 )
             {
-                result[key] = value
+                result[key] = cleanedSub;
             }
+
+            continue;
         }
+
+        result[key] = value;
     }
 
     return result;
+}
+
+/**
+ * Optimizes match filter by delegating to @webergency-utils/mongodb-query-optimizer
+ * @param obj - filter to optimize
+ * @returns optimized filter
+ */
+export function optimizeMatch( obj: MongoFilter<any> ): MongoFilter<any> | undefined
+{
+    if( !obj ){ return undefined }
+
+    const cleaned = cleanFilterForOptimizer( obj );
+
+    if( !cleaned || typeof cleaned !== 'object' )
+    {
+        return undefined;
+    }
+
+    return optimizeFilter( cleaned );
 }
 
 /**
@@ -939,164 +900,93 @@ function isEq( obj: any )
 }
 
 /**
- * Extracts fields used in the pipeline
+ * Extracts fields used in the pipeline by delegating to @webergency-utils/mongodb-query-optimizer
  * @param pipeline
  */
-export function getUsedFields( pipeline: Document[] ): {used: string[], ignored: string[]}
+export function getUsedFields( pipeline: Document[] ): { used: string[], ignored: string[] }
 {
-    const usedFields: Set<string> = new Set();
-    const ignoredFields: Set<string> = new Set();
+    const usedFields = new Set<string>();
+    const ignoredFields = new Set<string>();
 
-    for ( const el of pipeline )
+    for( let i = 0; i < pipeline.length; i++ )
     {
-        const stage = Object.keys(el)[0];
+        const el = pipeline[i];
+        const stage = Object.keys( el || {} )[0];
+        const info = getStageInfo( el, i );
 
-        switch ( stage )
+        if( info.isUnknown )
         {
-            case '$match':
-                const extracted = extractRecursively( el.$match );
-                for ( const field of extracted )
-                {
-                    // TODO: doesn't have to be full match - startsWith
-                    if ( ignoredFields.has(field) ) { continue; }
+            if( stage === '$group' && el.$group && typeof el.$group === 'object' )
+            {
+                const withId = getStageInfo({ $group: { _id: null, ...el.$group } }, i );
 
-                    usedFields.add(field);
+                if( !withId.isUnknown )
+                {
+                    for( const field of withId.usedFields )
+                    {
+                        if( field !== '*' && !ignoredFields.has( field ) )
+                        {
+                            usedFields.add( field );
+                        }
+                    }
+
+                    for( const key of Object.keys( el.$group ) )
+                    {
+                        ignoredFields.add( key );
+                    }
+
+                    continue;
                 }
-                break;
-            case '$project':
-            case '$addFields':
-            case '$set':
-            case '$group':
-                for ( const [key, value] of Object.entries(el[stage]) )
+            }
+
+            throw new Error( `Unsupported pipeline stage: "${stage}"` );
+        }
+
+        for( const field of info.usedFields )
+        {
+            if( field === '*' || ignoredFields.has( field ) )
+            {
+                continue;
+            }
+
+            if( stage === '$project' && el.$project?.[field] === 1 )
+            {
+                continue;
+            }
+
+            usedFields.add( field );
+        }
+
+        if( stage === '$replaceWith' && el.$replaceWith && typeof el.$replaceWith === 'object' && !Array.isArray( el.$replaceWith ) )
+        {
+            for( const key of Object.keys( el.$replaceWith ) )
+            {
+                if( !key.startsWith( '$' ) )
                 {
                     ignoredFields.add( key );
-                    if ( typeof value === 'object' || (typeof value === 'string' && value.startsWith('$')) )
-                    {
-                        extractRecursively( value ).forEach(key => usedFields.add(key));
-                    }
                 }
-                break;
-            case '$lookup':
-                ignoredFields.add( el.$lookup.as );
-                !ignoredFields.has( el.$lookup.localField ) && usedFields.add( el.$lookup.localField )
-                break;
-            case '$replaceWith':
-                if ( typeof el.$replaceWith === 'object' )
-                {
-                    Object.entries(el.$replaceWith).forEach(
-                        ([key, value]) =>
-                            ignoredFields.add(key)
-                            && extractRecursively( value ).forEach(key => usedFields.add(key))
-                    );
-                }
-                break;
-            case '$unwind': break;
-            default:
-                throw new Error(`Unsupported pipeline stage: "${stage}"`);
+            }
         }
-    }
-
-    return { used: Array.from(usedFields), ignored: Array.from(ignoredFields) };
-}
-
-const MATHEMATICAL_OPERATORS = ['$sum', '$subtract', '$multiply', '$divide', '$mod', '$abs', '$ceil', '$floor', '$ln', '$log', '$log10', '$pow', '$sqrt', '$trunc'];
-function extractRecursively( obj: any /* TODO: ignoredFields? */ ): Set<string>
-{
-    const fields: Set<string> = new Set();
-
-    if ( !obj ) { return fields; }
-
-    if ( typeof obj !== 'object' )
-    {
-        if ( typeof obj === 'string' && obj.startsWith('$') )
+        else if( stage === '$project' && el.$project && typeof el.$project === 'object' )
         {
-            fields.add(obj);
+            for( const key of Object.keys( el.$project ) )
+            {
+                ignoredFields.add( key );
+            }
         }
-    }
-    else
-    {
-        for ( const [key, value] of Object.entries(obj) )
+        else
         {
-            if ( key === '$and' || key === '$or' )
+            for( const field of info.producedFields )
             {
-                for ( const item of value as any[] )
+                if( field !== '*' )
                 {
-                    extractRecursively( item ).forEach(key => fields.add(key));
+                    ignoredFields.add( field );
                 }
-            }
-            else if ( key === '$expr' )
-            {
-                extractRecursively( value ).forEach(key => fields.add(key));
-            }
-            else if ( key === '$map' || key === '$filter' )
-            {
-                fields.add((value as any).input);
-            }
-            else if ( key === '$mergeObjects' )
-            {
-                for ( const item of value as any[] )
-                {
-                    if ( typeof item === 'string' && item.startsWith('$') )
-                    {
-                        extractRecursively( item ).forEach(key => fields.add(key));
-                    }
-                }
-            }
-            else if ( key === '$arrayElemAt' )
-            {
-                fields.add((value as any[])[0]);
-            }
-            else if ( key === '$function' )
-            {
-                (value as any).args
-                    .filter( (arg: any) => typeof arg === 'string' && arg.startsWith('$'))
-                    .forEach( (arg: string) => fields.add(arg));
-            }
-            else if ( key === '$switch' )
-            {
-                for ( const branch of (value as any).branches )
-                {
-                    extractRecursively( branch.case ).forEach(key => fields.add(key));
-                }
-                extractRecursively( (value as any).default ).forEach(key => fields.add(key));
-            }
-            else if ( MATHEMATICAL_OPERATORS.includes(key) )
-            {
-                extractRecursively( value ).forEach(key => fields.add(key));
-            }
-            else if ( ['$size'].includes(key) )
-            {
-                if ( typeof value === 'string' )
-                {
-                    fields.add( value );
-                }
-                else if ( value && typeof value === 'object' && Object.keys( value ).length === 1 && Object.keys( value )[0].startsWith('$') )
-                {
-                    extractRecursively( value ).forEach(key => fields.add(key));
-                }
-            }
-            else if ( Array.isArray( value ) )
-            {
-                value.forEach( (item: any) => typeof item === 'string' && item.startsWith('$') && fields.add(item) );
-            }
-            else if ( !key.startsWith('$') )
-            {
-                fields.add(key);
-            }
-            else
-            {
-                throw new Error(`Unsupported operator: "${key}"`);
             }
         }
     }
 
-    const result: Set<string> = new Set();
-    for ( const field of fields )
-    {
-        result.add(field.startsWith('$') ? field.replace(/^\$/, '') : field);
-    }
-
-    return result;
+    return { used: Array.from( usedFields ), ignored: Array.from( ignoredFields ) };
 }
 
 /**
