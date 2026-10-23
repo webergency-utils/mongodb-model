@@ -11,6 +11,7 @@ from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { extractTargetIdsFromFilter } from './cache.js';
 import { ModelAccessDeniedError, ModelError } from './errors.js';
+import { ModelMutationOperation, ModelQueryContext } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
@@ -61,6 +62,7 @@ import
     GetOptions,
     ModelCreateOptions,
     ModelDeleteOptions,
+    ModelExistsOptions,
     ModelUpdateOptions,
     MongoPropertyDocument,
     MongoRootDocument,
@@ -304,16 +306,37 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             const operation = this.#paths[this.#paths.length - 1].array ? '$push' : '$set';
             const start = Date.now();
 
-            await this.collection.updateOne(
-                resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
-                resolveBSONObject({ [operation]: { [updatePath]: { id: this.dbeID( _id ), ...dbe } } }),
-                resolveBSONObject({ arrayFilters })
-            );
+            try
+            {
+                await this.collection.updateOne(
+                    resolveBSONObject({ [parentIDPath]: parentModel.dbeID( parentID ) }) as any,
+                    resolveBSONObject({ [operation]: { [updatePath]: { id: this.dbeID( _id ), ...dbe } } }),
+                    resolveBSONObject({ arrayFilters })
+                );
 
-            this._notifySiblingCacheInvalidation();
-            this._emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
+                this._notifySiblingCacheInvalidation();
+                this._emitMutation( 'create', Date.now() - start,
+                {
+                    insertedCount   : 1,
+                    ids             : [ _id ],
+                    parentID,
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                });
 
-            return _id;
+                return _id;
+            }
+            catch( e )
+            {
+                this._emitError( e, 'create', Date.now() - start,
+                {
+                    parentID,
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                });
+
+                throw e;
+            }
         }
         finally
         {
@@ -347,7 +370,12 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             }
             catch( e )
             {
-                this._emitError( e, 'createFrom', Date.now() - start );
+                this._emitError( e, 'createFrom', Date.now() - start,
+                {
+                    parentID,
+                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                });
 
                 throw e;
             }
@@ -355,7 +383,14 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             const resolvedId = explicitId ?? ( dbe.id !== undefined ? this.dtoID( dbe.id ) as DTO['id'] : undefined );
             const createdId = await this.create( parentID, dbe, resolvedId, resolvedOptions );
 
-            this._emitMutation( 'createFrom', Date.now() - start, { insertedCount: 1, ids: [ createdId ] });
+            this._emitMutation( 'createFrom', Date.now() - start,
+            {
+                insertedCount   : 1,
+                ids             : [ createdId ],
+                parentID,
+                ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+            });
 
             return createdId;
         });
@@ -390,7 +425,14 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
             if( items.length === 0 )
             {
-                this._emitMutation( 'createMany', 0, { insertedCount: 0, ids: [] });
+                this._emitMutation( 'createMany', 0,
+                {
+                    insertedCount   : 0,
+                    ids             : [],
+                    parentID,
+                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                });
 
                 return [];
             }
@@ -424,13 +466,25 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 );
 
                 this._notifySiblingCacheInvalidation();
-                this._emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
+                this._emitMutation( 'createMany', Date.now() - start,
+                {
+                    insertedCount   : docs.length,
+                    ids,
+                    parentID,
+                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                });
 
                 return ids;
             }
             catch( e: any )
             {
-                this._emitError( e, 'createMany', Date.now() - start );
+                this._emitError( e, 'createMany', Date.now() - start,
+                {
+                    parentID,
+                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                });
 
                 throw e;
             }
@@ -469,7 +523,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         options: ModelUpdateOptions | undefined,
         access: { denied: boolean, filter?: Filter<any> },
         accessVerified: boolean,
-        method: 'update' | 'updateOne'
+        method: 'update' | 'updateOne',
+        callerFilter?: { filter?: Document, smartFilter?: Record<string, unknown> }
     ): Promise<PropertyModelUpdateResponse<DBE>>
     {
         const path = `${this.#prefix}.id`;
@@ -477,12 +532,31 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         if( !accessVerified && this.#hasEffectiveSubdocAccessFilter( access.filter ) )
         {
-            const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: dbeId } as any, access: options?.access }, access.filter, 1 );
+            const matchedIds = await this.#findMatchingSubdocIds(
+                {
+                    filter  : { id: dbeId } as any,
+                    access  : options?.access,
+                    context : options?.context,
+                    traceID : options?.traceID
+                },
+                access.filter,
+                1,
+                method
+            );
 
             if( matchedIds.length === 0 )
             {
                 this._invalidateCache([ id ], false );
-                this._emitMutation( method, 0, { matchedCount: 0, modifiedCount: 0, ids: [ id ] });
+                this._emitMutation( method, 0,
+                {
+                    matchedCount    : 0,
+                    modifiedCount   : 0,
+                    ids             : [ id ],
+                    ...( callerFilter?.filter !== undefined ? { filter: callerFilter.filter } : {} ),
+                    ...( callerFilter?.smartFilter !== undefined ? { smartFilter: callerFilter.smartFilter } : {} ),
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                });
 
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
@@ -498,24 +572,46 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
-        const documentBefore = options?.documentBefore ? ( await this.get( id, { as: 'dbe' as any }) as DBE ) || undefined : undefined;
+        const documentBefore = options?.documentBefore ? ( await this.get( id, { as: 'dbe' as any, context: options.context, traceID: options.traceID }) as DBE ) || undefined : undefined;
         const start = Date.now();
-        const res = await this.collection.updateOne(
-            resolveBSONObject( match ) as Filter<RootDBE>,
-            toUpdateOperations( operations ),
-            resolveBSONObject( updateOptions )
-        );
+        let res: { matchedCount: number, modifiedCount: number };
+
+        try
+        {
+            res = await this.collection.updateOne(
+                resolveBSONObject( match ) as Filter<RootDBE>,
+                toUpdateOperations( operations ),
+                resolveBSONObject( updateOptions )
+            );
+        }
+        catch( e )
+        {
+            this._emitError( e, method, Date.now() - start,
+            {
+                filter : callerFilter?.filter ?? match,
+                ...( callerFilter?.smartFilter !== undefined ? { smartFilter: callerFilter.smartFilter } : {} ),
+                ...( options?.context !== undefined ? { context: options.context } : {} ),
+                ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+            });
+
+            throw e;
+        }
+
         const duration = Date.now() - start;
 
         this._invalidateCache([ id ], res.matchedCount > 0 );
 
-        const documentAfter = options?.documentAfter ? ( await this.get( id, { as: 'dbe' as any }) as DBE ) || undefined : undefined;
+        const documentAfter = options?.documentAfter ? ( await this.get( id, { as: 'dbe' as any, context: options.context, traceID: options.traceID }) as DBE ) || undefined : undefined;
 
         this._emitMutation( method, duration,
         {
             matchedCount    : res.matchedCount,
             modifiedCount   : res.modifiedCount,
-            ids             : [ id ]
+            ids             : [ id ],
+            ...( callerFilter?.filter !== undefined ? { filter: callerFilter.filter } : {} ),
+            ...( callerFilter?.smartFilter !== undefined ? { smartFilter: callerFilter.smartFilter } : {} ),
+            ...( options?.context !== undefined ? { context: options.context } : {} ),
+            ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
         });
 
         flowGet( 'log' ) && LOG({ res });
@@ -526,7 +622,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
     async #findMatchingSubdocIds(
         findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
         accessFilter?: Filter<any>,
-        limit?: number
+        limit?: number,
+        parentOperation: ModelMutationOperation = 'updateMany'
     ): Promise<Array<DBE['id']>>
     {
         const combinedFilter: PropertyModelFilter<RootDBE, DBE> = accessFilter
@@ -547,7 +644,50 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         pipeline = this._optimizePipeline( pipeline );
 
-        const docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as Array<{ id: DBE['id'] }>;
+        const preStart = Date.now();
+        let docs: Array<{ id: DBE['id'] }>;
+
+        try
+        {
+            docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as Array<{ id: DBE['id'] }>;
+        }
+        catch( e )
+        {
+            this._emitError( e, parentOperation, Date.now() - preStart,
+            {
+                ...( findOptions.filter !== undefined ? { filter: findOptions.filter } : {} ),
+                ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                query :
+                {
+                    ...( findOptions.filter !== undefined ? { filter: findOptions.filter } : {} ),
+                    ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                    ...( limit !== undefined ? { limit } : {} ),
+                    ...( findOptions.access !== undefined ? { access: findOptions.access } : {} )
+                },
+                ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
+                ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
+            });
+
+            throw e;
+        }
+
+        const preDuration = Date.now() - preStart;
+
+        this._emitQuery( 'aggregate', pipeline, preDuration, () => (
+        {
+            resultCount     : docs.length,
+            internal        : true,
+            parentOperation,
+            query           :
+            {
+                ...( findOptions.filter !== undefined ? { filter: findOptions.filter } : {} ),
+                ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                ...( limit !== undefined ? { limit } : {} ),
+                ...( findOptions.access !== undefined ? { access: findOptions.access } : {} )
+            },
+            ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
+            ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
+        }), { internal: true, parentOperation });
 
         return docs.map( d => d.id ).filter( id => id !== undefined );
     }
@@ -555,7 +695,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
     async #resolveBatchTargetIds(
         idsOrFilter: DBE['id'][] | DTO['id'][] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
         findOptions: PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>> | undefined,
-        accessFilter?: Filter<any>
+        accessFilter?: Filter<any>,
+        parentOperation: 'updateMany' | 'deleteMany' = 'updateMany',
+        options?: { access?: string, context?: Record<string, unknown>, traceID?: string }
     ): Promise<{ dbeIds: Array<DBE['id']>, cacheIdsToInvalidate: Array<DBE['id'] | DTO['id'] | string> | null }>
     {
         const hasSubdocAccess = this.#hasEffectiveSubdocAccessFilter( accessFilter );
@@ -566,7 +708,17 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
             if( hasSubdocAccess && idsOrFilter.length > 0 )
             {
-                const matchedDbeIds = await this.#findMatchingSubdocIds({ filter: { id: { $in: dbeIds } } as any }, accessFilter );
+                const matchedDbeIds = await this.#findMatchingSubdocIds(
+                    {
+                        filter  : { id: { $in: dbeIds } } as any,
+                        access  : options?.access,
+                        context : options?.context,
+                        traceID : options?.traceID
+                    },
+                    accessFilter,
+                    undefined,
+                    parentOperation
+                );
 
                 return { dbeIds: matchedDbeIds, cacheIdsToInvalidate: idsOrFilter };
             }
@@ -587,7 +739,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             };
         }
 
-        const matchedDbeIds = await this.#findMatchingSubdocIds( findOptions!, accessFilter );
+        const matchedDbeIds = await this.#findMatchingSubdocIds( findOptions!, accessFilter, undefined, parentOperation );
 
         return {
             cacheIdsToInvalidate    : extractedCacheIds.length > 0 ? extractedCacheIds : matchedDbeIds,
@@ -603,7 +755,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
     {
         return this.runOperation( async() =>
         {
-            const findOptions = normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( match, options?.access );
+            const findOptions = normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( match, options );
             const access = await this._access.resolveOrDeny({ operation: 'update', method: 'updateOne', access: findOptions.access });
 
             if( access.denied )
@@ -626,7 +778,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
             if( targetId === undefined )
             {
-                const matchedIds = await this.#findMatchingSubdocIds( findOptions, access.filter, 1 );
+                const matchedIds = await this.#findMatchingSubdocIds( findOptions, access.filter, 1, 'updateOne' );
                 targetId = matchedIds[0];
             }
 
@@ -637,7 +789,16 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     this._invalidateCache( cacheIds, false );
                 }
 
-                this._emitMutation( 'updateOne', 0, { matchedCount: 0, modifiedCount: 0, ids: cacheIds.length > 0 ? cacheIds : undefined });
+                this._emitMutation( 'updateOne', 0,
+                {
+                    matchedCount    : 0,
+                    modifiedCount   : 0,
+                    ids             : cacheIds.length > 0 ? cacheIds : undefined,
+                    filter          : findOptions.filter,
+                    ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                    ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
+                    ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
+                });
 
                 return attachPropertyUpdateMetadata<DBE>({ matchedCount: 0, modifiedCount: 0 });
             }
@@ -645,10 +806,11 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             const res = await this.#updateById(
                 targetId,
                 update,
-                { ...options, access: findOptions.access },
+                { ...options, access: findOptions.access, context: findOptions.context, traceID: findOptions.traceID },
                 access,
                 !isDirectSingleId,
-                'updateOne'
+                'updateOne',
+                { filter: findOptions.filter, smartFilter: findOptions.smartFilter as Record<string, unknown> | undefined }
             );
 
             const targetDtoId = String( this.dtoID( targetId ));
@@ -681,8 +843,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         {
             const path = `${this.#prefix}.id`;
             const isIdArray = Array.isArray( idsOrFilter );
-            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options?.access ) : undefined;
+            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options ) : undefined;
             const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
+            const effectiveContext = isIdArray ? options?.context : findOptions?.context;
+            const effectiveTraceID = isIdArray ? options?.traceID : findOptions?.traceID;
 
             const access = await this._access.resolveOrDeny({ operation: 'update', method: 'updateMany', access: effectiveAccess });
 
@@ -691,7 +855,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
 
-            const { dbeIds, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds( idsOrFilter, findOptions, access.filter );
+            const { dbeIds, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds(
+                idsOrFilter,
+                findOptions,
+                access.filter,
+                'updateMany',
+                options
+            );
 
             if( dbeIds.length === 0 )
             {
@@ -700,7 +870,16 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     this._invalidateCache( cacheIdsToInvalidate, false );
                 }
 
-                this._emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: cacheIdsToInvalidate ?? undefined });
+                this._emitMutation( 'updateMany', 0,
+                {
+                    matchedCount    : 0,
+                    modifiedCount   : 0,
+                    ids             : cacheIdsToInvalidate ?? undefined,
+                    ...( findOptions?.filter !== undefined ? { filter: findOptions.filter } : {} ),
+                    ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                    ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
+                    ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                });
 
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
             }
@@ -716,11 +895,28 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
             const start = Date.now();
-            const res = await this.collection.updateMany(
-                resolveBSONObject( match ) as Filter<RootDBE>,
-                toUpdateOperations( operations ),
-                resolveBSONObject( updateOptions )
-            );
+            let res: { matchedCount: number, modifiedCount: number };
+
+            try
+            {
+                res = await this.collection.updateMany(
+                    resolveBSONObject( match ) as Filter<RootDBE>,
+                    toUpdateOperations( operations ),
+                    resolveBSONObject( updateOptions )
+                );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'updateMany', Date.now() - start,
+                {
+                    filter : findOptions?.filter ?? match,
+                    ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                    ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
+                    ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                });
+
+                throw e;
+            }
 
             if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
             {
@@ -731,7 +927,11 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
-                ids             : cacheIdsToInvalidate ?? undefined
+                ids             : cacheIdsToInvalidate ?? undefined,
+                ...( findOptions?.filter !== undefined ? { filter: findOptions.filter } : {} ),
+                ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
+                ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
             });
 
             flowGet( 'log' ) && LOG({ res });
@@ -807,6 +1007,23 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         return super.find( options, conversion, sort );
     }
 
+    #buildListQueryContext( options: any, sort?: Document ): ModelQueryContext
+    {
+        const query: ModelQueryContext = {};
+
+        if( options?.filter !== undefined ){ query.filter = options.filter }
+        if( options?.smartFilter !== undefined ){ query.smartFilter = options.smartFilter as Record<string, unknown> }
+        if( Array.isArray( options?.computedProperties ) ){ query.computedProperties = options.computedProperties }
+        else if( options?.computedProperties && typeof options.computedProperties === 'object' ){ query.computedProperties = Object.keys( options.computedProperties ) }
+        if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
+        if( options?.limit !== undefined ){ query.limit = options.limit }
+        if( options?.skip !== undefined ){ query.skip = options.skip }
+        if( options?.cursor !== undefined ){ query.cursor = options.cursor }
+        if( options?.access !== undefined ){ query.access = options.access }
+
+        return query;
+    }
+
     public async list<K extends keyof Extensions['converters']>(
         options: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
         conversion: K = 'dto' as K
@@ -816,6 +1033,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         try
         {
+            const { context, traceID, ...bsonInput } = options;
             const { projection } = this.converters[conversion];
             const prev = options.cursor?.startsWith( 'prev:' );
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
@@ -836,7 +1054,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 throw e;
             }
 
-            const resolvedList = resolveBSONObject( options );
+            const resolvedList = resolveBSONObject( bsonInput );
             // Strip cursor/count from the count path — count is not page-scoped, and must not
             // re-apply cursor against a different default sort than the list pipeline.
             let { sort = { id: 1 }, countLimit, cursor: _cursor, count: _count, ...countRest } = resolvedList;
@@ -861,32 +1079,57 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
             const start = Date.now();
             let queryDuration = 0;
-            const [ entries, total ] = await Promise.all(
-            [
-                this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
-                {
-                    queryDuration = Date.now() - start;
+            let entries: Document[];
+            let total: number | undefined;
 
-                    LOG_FILE( `Collection: ${this._collectionLabel}` );
-                    LOG_FILE( `TIME: ${queryDuration} ms` );
-                    LOG_FILE( pipeline, true );
-
-                    return r;
-                }),
-                countPipeline
-                    ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+            try
+            {
+                [ entries, total ] = await Promise.all(
+                [
+                    this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
                     {
-                        const duration = Date.now() - start;
+                        queryDuration = Date.now() - start;
 
                         LOG_FILE( `Collection: ${this._collectionLabel}` );
-                        LOG_FILE( `TIME: ${duration} ms` );
-                        LOG_FILE( countPipeline, true );
-                        this._emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
+                        LOG_FILE( `TIME: ${queryDuration} ms` );
+                        LOG_FILE( pipeline, true );
 
-                        return r[0]?.count ?? 0;
-                    })
-                    : undefined
-            ]);
+                        return r;
+                    }),
+                    countPipeline
+                        ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+                        {
+                            const duration = Date.now() - start;
+
+                            LOG_FILE( `Collection: ${this._collectionLabel}` );
+                            LOG_FILE( `TIME: ${duration} ms` );
+                            LOG_FILE( countPipeline, true );
+                            this._emitQuery( 'count', countPipeline!, duration, () => (
+                            {
+                                resultCount : r[0]?.count ?? 0,
+                                query       : this.#buildListQueryContext( options, sort ),
+                                ...( context !== undefined ? { context } : {} ),
+                                ...( traceID !== undefined ? { traceID } : {} )
+                            }));
+
+                            return r[0]?.count ?? 0;
+                        })
+                        : undefined
+                ]);
+            }
+            catch( e )
+            {
+                this._emitError( e, 'list', Date.now() - start,
+                {
+                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
+                    query : this.#buildListQueryContext( options, sort ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                });
+
+                throw e;
+            }
 
             benchmark?.step( 'QUERY' );
 
@@ -900,12 +1143,15 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             }));
             const converterDuration = Date.now() - convStart;
 
-            this._emitQuery( 'list', pipeline, queryDuration,
+            this._emitQuery( 'list', pipeline, queryDuration, () => (
             {
                 converterDuration,
                 resultCount : items.length,
-                conversion  : String( conversion )
-            });
+                conversion  : String( conversion ),
+                query       : this.#buildListQueryContext( options, sort ),
+                ...( context !== undefined ? { context } : {} ),
+                ...( traceID !== undefined ? { traceID } : {} )
+            }));
 
             benchmark?.step( 'CONVERTER' );
 
@@ -936,6 +1182,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         try
         {
+            const { context, traceID, ...bsonInput } = options;
             const { projection } = this.converters[conversion];
             const prev = options.cursor?.startsWith( 'prev:' );
 
@@ -955,7 +1202,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 throw e;
             }
 
-            const resolvedList = resolveBSONObject( options );
+            const resolvedList = resolveBSONObject( bsonInput );
             let { sort = { id: 1 } } = resolvedList;
 
             if( !sort.id )
@@ -968,47 +1215,74 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             pipeline = this._optimizePipeline( pipeline );
 
             const start = Date.now();
-            const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
-
-            if( prev )
+            const emitStreamQuery = ( duration: number ) =>
             {
-                const entries = await cursorDocs.toArray();
-                const duration = Date.now() - start;
-
-                LOG_FILE( `Collection: ${this._collectionLabel}` );
-                LOG_FILE( `TIME: ${duration} ms` );
-                LOG_FILE( pipeline, true );
-                this._emitQuery( 'stream', pipeline, duration );
-
-                for( const dbe of entries.reverse() )
+                this._emitQuery( 'stream', pipeline, duration, () => (
                 {
-                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-                }
+                    conversion  : String( conversion ),
+                    query       : this.#buildListQueryContext( options, sort ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                }));
+            };
 
-                return;
-            }
-
-            let emitted = false;
-
-            for await( const dbe of cursorDocs )
+            try
             {
-                if( !emitted )
+                const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
+
+                if( prev )
                 {
-                    emitted = true;
+                    const entries = await cursorDocs.toArray();
                     const duration = Date.now() - start;
 
                     LOG_FILE( `Collection: ${this._collectionLabel}` );
                     LOG_FILE( `TIME: ${duration} ms` );
                     LOG_FILE( pipeline, true );
-                    this._emitQuery( 'stream', pipeline, duration );
+                    emitStreamQuery( duration );
+
+                    for( const dbe of entries.reverse() )
+                    {
+                        yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                    }
+
+                    return;
                 }
 
-                yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-            }
+                let emitted = false;
 
-            if( !emitted )
+                for await( const dbe of cursorDocs )
+                {
+                    if( !emitted )
+                    {
+                        emitted = true;
+                        const duration = Date.now() - start;
+
+                        LOG_FILE( `Collection: ${this._collectionLabel}` );
+                        LOG_FILE( `TIME: ${duration} ms` );
+                        LOG_FILE( pipeline, true );
+                        emitStreamQuery( duration );
+                    }
+
+                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                }
+
+                if( !emitted )
+                {
+                    emitStreamQuery( Date.now() - start );
+                }
+            }
+            catch( e )
             {
-                this._emitQuery( 'stream', pipeline, Date.now() - start );
+                this._emitError( e, 'stream', Date.now() - start,
+                {
+                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
+                    query : this.#buildListQueryContext( options, sort ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                });
+
+                throw e;
             }
         }
         finally
@@ -1042,7 +1316,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
     public override async exists(
         idOrFilter?: DTO['id'] | DBE['id'] | PropertyModelFilter<RootDBE, DBE> | PropertyModelFindOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>>,
-        options?: { access?: string }
+        options?: ModelExistsOptions
     ): Promise<boolean>
     {
         return super.exists( idOrFilter, options );
@@ -1073,7 +1347,17 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
             if( this.#hasEffectiveSubdocAccessFilter( access.filter ) )
             {
-                const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: dbeId } as any, access: options?.access }, access.filter, 1 );
+                const matchedIds = await this.#findMatchingSubdocIds(
+                    {
+                        filter  : { id: dbeId } as any,
+                        access  : options?.access,
+                        context : options?.context,
+                        traceID : options?.traceID
+                    },
+                    access.filter,
+                    1,
+                    'delete'
+                );
 
                 if( matchedIds.length === 0 )
                 {
@@ -1083,7 +1367,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                         matchedCount    : 0,
                         modifiedCount   : 0,
                         deletedCount    : 0,
-                        ids             : [ id ]
+                        ids             : [ id ],
+                        ...( options?.context !== undefined ? { context: options.context } : {} ),
+                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
                     });
 
                     return false;
@@ -1098,11 +1384,27 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             const { operations, updateOptions } = buildPropertyDeleteOperation<RootDBE>( this.#paths, dbeId );
 
             const start = Date.now();
-            const res = await this.collection.updateOne(
-                resolveBSONObject( match ) as Filter<RootDBE>,
-                resolveBSONObject( operations ) as UpdateFilter<RootDBE>,
-                resolveBSONObject( updateOptions )
-            );
+            let res: { matchedCount: number, modifiedCount: number };
+
+            try
+            {
+                res = await this.collection.updateOne(
+                    resolveBSONObject( match ) as Filter<RootDBE>,
+                    resolveBSONObject( operations ) as UpdateFilter<RootDBE>,
+                    resolveBSONObject( updateOptions )
+                );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'delete', Date.now() - start,
+                {
+                    filter : match,
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                });
+
+                throw e;
+            }
 
             this._invalidateCache([ id ], res.modifiedCount > 0 );
             this._emitMutation( 'delete', Date.now() - start,
@@ -1110,7 +1412,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
                 deletedCount    : res.modifiedCount,
-                ids             : [ id ]
+                ids             : [ id ],
+                ...( options?.context !== undefined ? { context: options.context } : {} ),
+                ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
             });
 
             return res.modifiedCount > 0;
@@ -1125,8 +1429,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         return this.runOperation( async() =>
         {
             const isIdArray = Array.isArray( idsOrFilter );
-            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options?.access ) : undefined;
+            const findOptions = !isIdArray ? normalizeFindMatch<PropertyModelFilter<RootDBE, DBE>>( idsOrFilter, options ) : undefined;
             const effectiveAccess = isIdArray ? options?.access : findOptions?.access;
+            const effectiveContext = isIdArray ? options?.context : findOptions?.context;
+            const effectiveTraceID = isIdArray ? options?.traceID : findOptions?.traceID;
 
             const access = await this._access.resolveOrDeny({ operation: 'delete', method: 'deleteMany', access: effectiveAccess });
 
@@ -1135,7 +1441,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 return 0;
             }
 
-            const { dbeIds, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds( idsOrFilter, findOptions, access.filter );
+            const { dbeIds, cacheIdsToInvalidate } = await this.#resolveBatchTargetIds(
+                idsOrFilter,
+                findOptions,
+                access.filter,
+                'deleteMany',
+                options
+            );
 
             if( dbeIds.length === 0 )
             {
@@ -1144,7 +1456,15 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     this._invalidateCache( cacheIdsToInvalidate, false );
                 }
 
-                this._emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: cacheIdsToInvalidate ?? undefined });
+                this._emitMutation( 'deleteMany', 0,
+                {
+                    deletedCount : 0,
+                    ids          : cacheIdsToInvalidate ?? undefined,
+                    ...( findOptions?.filter !== undefined ? { filter: findOptions.filter } : {} ),
+                    ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                    ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
+                    ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                });
 
                 return 0;
             }
@@ -1157,11 +1477,28 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             const { operations, updateOptions } = buildPropertyDeleteOperation<RootDBE>( this.#paths, { $in: dbeIds });
 
             const start = Date.now();
-            const res = await this.collection.updateMany(
-                resolveBSONObject( match ) as Filter<RootDBE>,
-                resolveBSONObject( operations ) as UpdateFilter<RootDBE>,
-                resolveBSONObject( updateOptions )
-            );
+            let res: { matchedCount: number, modifiedCount: number };
+
+            try
+            {
+                res = await this.collection.updateMany(
+                    resolveBSONObject( match ) as Filter<RootDBE>,
+                    resolveBSONObject( operations ) as UpdateFilter<RootDBE>,
+                    resolveBSONObject( updateOptions )
+                );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'deleteMany', Date.now() - start,
+                {
+                    filter : findOptions?.filter ?? match,
+                    ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                    ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
+                    ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                });
+
+                throw e;
+            }
 
             if( cacheIdsToInvalidate && cacheIdsToInvalidate.length > 0 )
             {
@@ -1173,7 +1510,11 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
                 deletedCount    : res.modifiedCount,
-                ids             : cacheIdsToInvalidate ?? undefined
+                ids             : cacheIdsToInvalidate ?? undefined,
+                ...( findOptions?.filter !== undefined ? { filter: findOptions.filter } : {} ),
+                ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
+                ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
+                ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
             });
 
             return res.modifiedCount;

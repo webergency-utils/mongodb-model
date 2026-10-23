@@ -11,7 +11,7 @@ from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { ModelCacheConfig, extractTargetIdsFromFilter } from './cache.js';
 import { ModelAccessDeniedError } from './errors.js';
-import { ObservabilityConfig } from './events.js';
+import { ModelMutationOperation, ModelQueryContext, ObservabilityConfig } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
@@ -43,6 +43,7 @@ import
     ModelAggregateOptions,
     ModelCreateOptions,
     ModelDeleteOptions,
+    ModelExistsOptions,
     ModelExtensions,
     ModelFindOptions,
     ModelListOptions,
@@ -154,19 +155,67 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 await this.collection.insertOne( resolveBSONObject({ ...dbe, _id: this.dbeID( _id ) }) as OptionalUnlessRequiredId<DBE> );
                 this._notifySiblingCacheInvalidation();
-                this._emitMutation( 'create', Date.now() - start, { insertedCount: 1, ids: [ _id ] });
+                this._emitMutation( 'create', Date.now() - start,
+                {
+                    insertedCount   : 1,
+                    ids             : [ _id ],
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                });
             }
             catch( e: any )
             {
                 if( options?.duplicateIgnore === true && e.code === 11000 )
                 {
-                    const existingId = this.dtoID( await this.collection.findOne( e.keyValue, { projection: { _id: 1 }, collation: { locale: 'en' } }).then( r => r?._id ));
-                    this._emitMutation( 'create', Date.now() - start, { insertedCount: 0, ids: [ existingId ] });
+                    const findStart = Date.now();
+                    let existingDoc: Document | null;
+
+                    try
+                    {
+                        existingDoc = await this.collection.findOne( e.keyValue, { projection: { _id: 1 }, collation: { locale: 'en' } });
+                    }
+                    catch( findErr )
+                    {
+                        this._emitError( findErr, 'create', Date.now() - start,
+                        {
+                            filter : e.keyValue,
+                            ...( options?.context !== undefined ? { context: options.context } : {} ),
+                            ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        });
+
+                        throw findErr;
+                    }
+
+                    const findDuration = Date.now() - findStart;
+
+                    this._emitQuery( 'get', [{ $match: e.keyValue }, { $project: { _id: 1 } }], findDuration, () => (
+                    {
+                        resultCount     : existingDoc ? 1 : 0,
+                        internal        : true,
+                        parentOperation : 'create',
+                        query           : { filter: e.keyValue },
+                        ...( options?.context !== undefined ? { context: options.context } : {} ),
+                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    }), { internal: true, parentOperation: 'create' });
+
+                    const existingId = this.dtoID( existingDoc?._id );
+
+                    this._emitMutation( 'create', Date.now() - start,
+                    {
+                        insertedCount   : 0,
+                        ids             : [ existingId ],
+                        ...( options?.context !== undefined ? { context: options.context } : {} ),
+                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    });
 
                     return existingId;
                 }
 
-                this._emitError( e, 'create', Date.now() - start );
+                this._emitError( e, 'create', Date.now() - start,
+                {
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                });
 
                 throw e;
             }
@@ -204,7 +253,11 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             }
             catch( e )
             {
-                this._emitError( e, 'createFrom', Date.now() - start );
+                this._emitError( e, 'createFrom', Date.now() - start,
+                {
+                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                });
 
                 throw e;
             }
@@ -212,7 +265,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             const resolvedId = explicitId ?? ( dbe._id !== undefined ? this.dtoID( dbe._id ) as DTO['id'] : undefined );
             const createdId = await this.create( dbe, resolvedId, resolvedOptions );
 
-            this._emitMutation( 'createFrom', Date.now() - start, { insertedCount: 1, ids: [ createdId ] });
+            this._emitMutation( 'createFrom', Date.now() - start,
+            {
+                insertedCount   : 1,
+                ids             : [ createdId ],
+                ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+            });
 
             return createdId;
         });
@@ -238,7 +297,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             if( items.length === 0 )
             {
-                this._emitMutation( 'createMany', 0, { insertedCount: 0, ids: [] });
+                this._emitMutation( 'createMany', 0,
+                {
+                    insertedCount   : 0,
+                    ids             : [],
+                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                });
 
                 return [];
             }
@@ -262,13 +327,23 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 await this.collection.insertMany( docs );
                 this._notifySiblingCacheInvalidation();
-                this._emitMutation( 'createMany', Date.now() - start, { insertedCount: docs.length, ids });
+                this._emitMutation( 'createMany', Date.now() - start,
+                {
+                    insertedCount   : docs.length,
+                    ids,
+                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                });
 
                 return ids;
             }
             catch( e: any )
             {
-                this._emitError( e, 'createMany', Date.now() - start );
+                this._emitError( e, 'createMany', Date.now() - start,
+                {
+                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
+                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                });
 
                 throw e;
             }
@@ -293,40 +368,60 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             const start = Date.now();
 
-            if( options?.documentBefore || options?.documentAfter )
+            try
             {
-                const snapshot = await this.#findOneAndUpdateWithSnapshots( match, update, options );
+                if( options?.documentBefore || options?.documentAfter )
+                {
+                    const snapshot = await this.#findOneAndUpdateWithSnapshots( match, update, options, 'update' );
 
-                this._invalidateCache([ id ], snapshot.matchedCount > 0 );
+                    this._invalidateCache([ id ], snapshot.matchedCount > 0 );
+                    this._emitMutation( 'update', Date.now() - start,
+                    {
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        ids             : [ id ],
+                        filter          : match,
+                        ...( options?.context !== undefined ? { context: options.context } : {} ),
+                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    });
+
+                    return {
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        documentBefore  : snapshot.documentBefore,
+                        documentAfter   : snapshot.documentAfter
+                    };
+                }
+
+                const res = await this.collection.updateOne( match, toUpdateOperations( update ));
+
+                this._invalidateCache([ id ], res.matchedCount > 0 );
                 this._emitMutation( 'update', Date.now() - start,
                 {
-                    matchedCount    : snapshot.matchedCount,
-                    modifiedCount   : snapshot.modifiedCount,
-                    ids             : [ id ]
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount,
+                    ids             : [ id ],
+                    filter          : match,
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
                 });
 
                 return {
-                    matchedCount    : snapshot.matchedCount,
-                    modifiedCount   : snapshot.modifiedCount,
-                    documentBefore  : snapshot.documentBefore,
-                    documentAfter   : snapshot.documentAfter
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount
                 };
             }
-
-            const res = await this.collection.updateOne( match, toUpdateOperations( update ));
-
-            this._invalidateCache([ id ], res.matchedCount > 0 );
-            this._emitMutation( 'update', Date.now() - start,
+            catch( e )
             {
-                matchedCount    : res.matchedCount,
-                modifiedCount   : res.modifiedCount,
-                ids             : [ id ]
-            });
+                this._emitError( e, 'update', Date.now() - start,
+                {
+                    filter : match,
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                });
 
-            return {
-                matchedCount    : res.matchedCount,
-                modifiedCount   : res.modifiedCount
-            };
+                throw e;
+            }
         }
         finally
         {
@@ -337,7 +432,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
     async #findOneAndUpdateWithSnapshots(
         match: Filter<DBE>,
         update: Partial<DBE> | UpdateFilter<DBE>,
-        options: ModelUpdateOptions
+        options: ModelUpdateOptions,
+        parentOperation: 'update' | 'updateOne'
     ): Promise<{ document?: DBE, documentBefore?: DBE, documentAfter?: DBE, matchedCount: number, modifiedCount: number }>
     {
         let beforeDoc: DBE | undefined;
@@ -345,7 +441,21 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
         if( options.documentBefore && options.documentAfter )
         {
+            const preStart = Date.now();
+
             beforeDoc = ( await this.collection.findOne( match, { collation: { locale: 'en' } }) as DBE | null ) || undefined;
+
+            const preDuration = Date.now() - preStart;
+
+            this._emitQuery( 'get', [{ $match: match }], preDuration, () => (
+            {
+                resultCount     : beforeDoc ? 1 : 0,
+                internal        : true,
+                parentOperation,
+                query           : { filter: match },
+                ...( options.context !== undefined ? { context: options.context } : {} ),
+                ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+            }), { internal: true, parentOperation });
 
             if( !beforeDoc )
             {
@@ -389,12 +499,20 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
     async #resolveFilterMatch(
         matchInput: Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
         operation: 'update' | 'delete',
-        method: string,
-        optionsAccess?: string,
+        method: ModelMutationOperation,
+        options?: { access?: string, context?: Record<string, unknown>, traceID?: string },
         limit?: number
-    ): Promise<{ finalMatch: Filter<DBE> | null, targetIds: string[] | null, empty?: boolean }>
+    ): Promise<{
+        finalMatch  : Filter<DBE> | null
+        targetIds   : string[] | null
+        empty?      : boolean
+        rawFilter   : Filter<DBE>
+        smartFilter?: Record<string, unknown>
+        context?    : Record<string, unknown>
+        traceID?    : string
+    }>
     {
-        const { filter: rawFilter, smartFilter, access } = normalizeFindMatch<Filter<DBE>, any>( matchInput, optionsAccess );
+        const { filter: rawFilter, smartFilter, access, context, traceID } = normalizeFindMatch<Filter<DBE>, any>( matchInput, options );
         const targetIds = extractTargetIdsFromFilter( matchInput, '_id', id => String( this.dtoID( id )));
         const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
 
@@ -404,7 +522,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             if( accessResult.denied )
             {
-                return { finalMatch: null, targetIds };
+                return { finalMatch: null, targetIds, rawFilter, smartFilter, context, traceID };
             }
 
             let pipeline = await this._pipelineBuilder.pipeline(
@@ -418,20 +536,64 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             pipeline = this._optimizePipeline( pipeline );
 
-            const docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as Array<{ _id: DBE['_id'] }>;
+            const preStart = Date.now();
+            let docs: Array<{ _id: DBE['_id'] }>;
+
+            try
+            {
+                docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as Array<{ _id: DBE['_id'] }>;
+            }
+            catch( e )
+            {
+                this._emitError( e, method, Date.now() - preStart,
+                {
+                    filter : rawFilter,
+                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                    query  :
+                    {
+                        filter : rawFilter,
+                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                        ...( limit !== undefined ? { limit } : {} ),
+                        ...( access !== undefined ? { access } : {} )
+                    },
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                });
+
+                throw e;
+            }
+
+            const preDuration = Date.now() - preStart;
+
+            this._emitQuery( 'aggregate', pipeline, preDuration, () => (
+            {
+                resultCount     : docs.length,
+                internal        : true,
+                parentOperation : method,
+                query           :
+                {
+                    filter : rawFilter,
+                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                    ...( limit !== undefined ? { limit } : {} ),
+                    ...( access !== undefined ? { access } : {} )
+                },
+                ...( context !== undefined ? { context } : {} ),
+                ...( traceID !== undefined ? { traceID } : {} )
+            }), { internal: true, parentOperation: method });
+
             const matchedDbeIds = docs.map( d => d._id ).filter( id => id !== undefined );
             const matchedDtoIds = matchedDbeIds.map( id => String( this.dtoID( id )));
 
             if( matchedDbeIds.length === 0 )
             {
-                return { finalMatch: null, targetIds: targetIds ?? matchedDtoIds, empty: true };
+                return { finalMatch: null, targetIds: targetIds ?? matchedDtoIds, empty: true, rawFilter, smartFilter, context, traceID };
             }
 
             const finalMatch = ( limit === 1
                 ? { _id: matchedDbeIds[0] }
                 : { _id: { $in: matchedDbeIds } } ) as Filter<DBE>;
 
-            return { finalMatch, targetIds: matchedDtoIds };
+            return { finalMatch, targetIds: matchedDtoIds, rawFilter, smartFilter, context, traceID };
         }
 
         const combinedFilter = resolvedSmart?.filter
@@ -443,7 +605,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             { operation, method, access }
         );
 
-        return { finalMatch, targetIds };
+        return { finalMatch, targetIds, rawFilter, smartFilter, context, traceID };
     }
 
     public async updateMany(
@@ -470,20 +632,46 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
                 if( idsOrFilter.length === 0 )
                 {
-                    this._emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: [] });
+                    this._emitMutation( 'updateMany', 0,
+                    {
+                        matchedCount    : 0,
+                        modifiedCount   : 0,
+                        ids             : [],
+                        ...( options?.context !== undefined ? { context: options.context } : {} ),
+                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    });
 
                     return { matchedCount: 0, modifiedCount: 0 };
                 }
 
                 const start = Date.now();
-                const res = await this.collection.updateMany( match, toUpdateOperations( update ));
+                let res: { matchedCount: number, modifiedCount: number };
+
+                try
+                {
+                    res = await this.collection.updateMany( match, toUpdateOperations( update ));
+                }
+                catch( e )
+                {
+                    this._emitError( e, 'updateMany', Date.now() - start,
+                    {
+                        filter : match,
+                        ...( options?.context !== undefined ? { context: options.context } : {} ),
+                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    });
+
+                    throw e;
+                }
 
                 this._invalidateCache( idsOrFilter, res.matchedCount > 0 );
                 this._emitMutation( 'updateMany', Date.now() - start,
                 {
                     matchedCount    : res.matchedCount,
                     modifiedCount   : res.modifiedCount,
-                    ids             : idsOrFilter
+                    ids             : idsOrFilter,
+                    filter          : match,
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
                 });
 
                 return {
@@ -492,7 +680,12 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 };
             }
 
-            const { finalMatch, targetIds, empty } = await this.#resolveFilterMatch( idsOrFilter, 'update', 'updateMany', options?.access );
+            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID } = await this.#resolveFilterMatch(
+                idsOrFilter,
+                'update',
+                'updateMany',
+                options
+            );
 
             if( !finalMatch )
             {
@@ -503,14 +696,40 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         this._invalidateCache( targetIds, false );
                     }
 
-                    this._emitMutation( 'updateMany', 0, { matchedCount: 0, modifiedCount: 0, ids: targetIds ?? undefined });
+                    this._emitMutation( 'updateMany', 0,
+                    {
+                        matchedCount    : 0,
+                        modifiedCount   : 0,
+                        ids             : targetIds ?? undefined,
+                        filter          : rawFilter,
+                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                        ...( context !== undefined ? { context } : {} ),
+                        ...( traceID !== undefined ? { traceID } : {} )
+                    });
                 }
 
                 return { matchedCount: 0, modifiedCount: 0 };
             }
 
             const start = Date.now();
-            const res = await this.collection.updateMany( finalMatch, toUpdateOperations( update ));
+            let res: { matchedCount: number, modifiedCount: number };
+
+            try
+            {
+                res = await this.collection.updateMany( finalMatch, toUpdateOperations( update ));
+            }
+            catch( e )
+            {
+                this._emitError( e, 'updateMany', Date.now() - start,
+                {
+                    filter : finalMatch,
+                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                });
+
+                throw e;
+            }
 
             if( targetIds && targetIds.length > 0 )
             {
@@ -526,7 +745,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
                 ids             : targetIds ?? undefined,
-                filter          : finalMatch
+                filter          : finalMatch,
+                ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                ...( context !== undefined ? { context } : {} ),
+                ...( traceID !== undefined ? { traceID } : {} )
             });
 
             return {
@@ -548,7 +770,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
     {
         return this.runOperation( async() =>
         {
-            const { finalMatch, targetIds, empty } = await this.#resolveFilterMatch( match, 'update', 'updateOne', options?.access, 1 );
+            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID } = await this.#resolveFilterMatch(
+                match,
+                'update',
+                'updateOne',
+                options,
+                1
+            );
 
             if( !finalMatch )
             {
@@ -559,7 +787,16 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         this._invalidateCache( targetIds, false );
                     }
 
-                    this._emitMutation( 'updateOne', 0, { matchedCount: 0, modifiedCount: 0, ids: targetIds ?? undefined });
+                    this._emitMutation( 'updateOne', 0,
+                    {
+                        matchedCount    : 0,
+                        modifiedCount   : 0,
+                        ids             : targetIds ?? undefined,
+                        filter          : rawFilter,
+                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                        ...( context !== undefined ? { context } : {} ),
+                        ...( traceID !== undefined ? { traceID } : {} )
+                    });
                 }
 
                 return { matchedCount: 0, modifiedCount: 0 };
@@ -567,61 +804,87 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             const start = Date.now();
 
-            if( options?.documentBefore || options?.documentAfter )
+            try
             {
-                const snapshot = await this.#findOneAndUpdateWithSnapshots( finalMatch, update, options );
-                const idsToEvict = targetIds && targetIds.length > 0
-                    ? targetIds
-                    : ( snapshot.document?._id !== undefined ? [ String( this.dtoID( snapshot.document._id )) ] : null );
-
-                if( idsToEvict && idsToEvict.length > 0 )
+                if( options?.documentBefore || options?.documentAfter )
                 {
-                    this._invalidateCache( idsToEvict, snapshot.matchedCount > 0 );
+                    const snapshot = await this.#findOneAndUpdateWithSnapshots(
+                        finalMatch,
+                        update,
+                        { ...options, context, traceID },
+                        'updateOne'
+                    );
+                    const idsToEvict = targetIds && targetIds.length > 0
+                        ? targetIds
+                        : ( snapshot.document?._id !== undefined ? [ String( this.dtoID( snapshot.document._id )) ] : null );
+
+                    if( idsToEvict && idsToEvict.length > 0 )
+                    {
+                        this._invalidateCache( idsToEvict, snapshot.matchedCount > 0 );
+                    }
+                    else if( snapshot.matchedCount > 0 || snapshot.modifiedCount > 0 )
+                    {
+                        this._clearCache();
+                    }
+
+                    this._emitMutation( 'updateOne', Date.now() - start,
+                    {
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        ids             : idsToEvict ?? undefined,
+                        filter          : finalMatch,
+                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                        ...( context !== undefined ? { context } : {} ),
+                        ...( traceID !== undefined ? { traceID } : {} )
+                    });
+
+                    return {
+                        matchedCount    : snapshot.matchedCount,
+                        modifiedCount   : snapshot.modifiedCount,
+                        documentBefore  : snapshot.documentBefore,
+                        documentAfter   : snapshot.documentAfter
+                    };
                 }
-                else if( snapshot.matchedCount > 0 || snapshot.modifiedCount > 0 )
+
+                const res = await this.collection.updateOne( finalMatch, toUpdateOperations( update ));
+
+                if( targetIds && targetIds.length > 0 )
+                {
+                    this._invalidateCache( targetIds, res.matchedCount > 0 );
+                }
+                else if( res.matchedCount > 0 || res.modifiedCount > 0 )
                 {
                     this._clearCache();
                 }
 
                 this._emitMutation( 'updateOne', Date.now() - start,
                 {
-                    matchedCount    : snapshot.matchedCount,
-                    modifiedCount   : snapshot.modifiedCount,
-                    ids             : idsToEvict ?? undefined,
-                    filter          : finalMatch
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount,
+                    ids             : targetIds ?? undefined,
+                    filter          : finalMatch,
+                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
                 });
 
                 return {
-                    matchedCount    : snapshot.matchedCount,
-                    modifiedCount   : snapshot.modifiedCount,
-                    documentBefore  : snapshot.documentBefore,
-                    documentAfter   : snapshot.documentAfter
+                    matchedCount    : res.matchedCount,
+                    modifiedCount   : res.modifiedCount
                 };
             }
-
-            const res = await this.collection.updateOne( finalMatch, toUpdateOperations( update ));
-
-            if( targetIds && targetIds.length > 0 )
+            catch( e )
             {
-                this._invalidateCache( targetIds, res.matchedCount > 0 );
+                this._emitError( e, 'updateOne', Date.now() - start,
+                {
+                    filter : finalMatch,
+                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                });
+
+                throw e;
             }
-            else if( res.matchedCount > 0 || res.modifiedCount > 0 )
-            {
-                this._clearCache();
-            }
-
-            this._emitMutation( 'updateOne', Date.now() - start,
-            {
-                matchedCount    : res.matchedCount,
-                modifiedCount   : res.modifiedCount,
-                ids             : targetIds ?? undefined,
-                filter          : finalMatch
-            });
-
-            return {
-                matchedCount    : res.matchedCount,
-                modifiedCount   : res.modifiedCount
-            };
         });
     }
 
@@ -688,6 +951,23 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         return super.find( options, conversion, sort );
     }
 
+    #buildListQueryContext( options: any, sort?: Document ): ModelQueryContext
+    {
+        const query: ModelQueryContext = {};
+
+        if( options?.filter !== undefined ){ query.filter = options.filter }
+        if( options?.smartFilter !== undefined ){ query.smartFilter = options.smartFilter as Record<string, unknown> }
+        if( Array.isArray( options?.computedProperties ) ){ query.computedProperties = options.computedProperties }
+        else if( options?.computedProperties && typeof options.computedProperties === 'object' ){ query.computedProperties = Object.keys( options.computedProperties ) }
+        if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
+        if( options?.limit !== undefined ){ query.limit = options.limit }
+        if( options?.skip !== undefined ){ query.skip = options.skip }
+        if( options?.cursor !== undefined ){ query.cursor = options.cursor }
+        if( options?.access !== undefined ){ query.access = options.access }
+
+        return query;
+    }
+
     public async list<K extends keyof Extensions['converters']>(
         options: ModelListOptions<DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
         conversion: K = 'dto' as K
@@ -697,8 +977,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
         try
         {
+            const { context, traceID, ...bsonInput } = options;
             const { projection: convProjection, computedProperties: compProps } = this.converters[conversion];
-            let { filter = {}, sort = { _id: 1 }, cursor, limit, countLimit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( options );
+            let { filter = {}, sort = { _id: 1 }, cursor, limit, countLimit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( bsonInput );
             const prev = cursor?.startsWith( 'prev:' );
 
             if( !sort._id )
@@ -761,30 +1042,55 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             const start = Date.now();
             let queryDuration = 0;
-            const [ entries, total ] = await Promise.all(
-            [
-                this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+            let entries: Document[];
+            let total: number | undefined;
+
+            try
+            {
+                [ entries, total ] = await Promise.all(
+                [
+                    this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+                    {
+                        queryDuration = Date.now() - start;
+
+                        LOG_FILE( `Collection: ${this._collectionLabel}` );
+                        LOG_FILE( `TIME: ${queryDuration} ms` );
+                        LOG_FILE( pipeline, true );
+
+                        return r;
+                    }),
+                    options.count ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+                    {
+                        const duration = Date.now() - start;
+
+                        LOG_FILE( `Collection: ${this._collectionLabel}` );
+                        LOG_FILE( `TIME: ${duration} ms` );
+                        LOG_FILE( countPipeline, true );
+                        this._emitQuery( 'count', countPipeline!, duration, () => (
+                        {
+                            resultCount : r[0]?.count ?? 0,
+                            query       : this.#buildListQueryContext( options, sort ),
+                            ...( context !== undefined ? { context } : {} ),
+                            ...( traceID !== undefined ? { traceID } : {} )
+                        }));
+
+                        return r[0]?.count ?? 0;
+                    }) : undefined
+                ]);
+            }
+            catch( e )
+            {
+                this._emitError( e, 'list', Date.now() - start,
                 {
-                    queryDuration = Date.now() - start;
+                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
+                    query : this.#buildListQueryContext( options, sort ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                });
 
-                    LOG_FILE( `Collection: ${this._collectionLabel}` );
-                    LOG_FILE( `TIME: ${queryDuration} ms` );
-                    LOG_FILE( pipeline, true );
-
-                    return r;
-                }),
-                options.count ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
-                {
-                    const duration = Date.now() - start;
-
-                    LOG_FILE( `Collection: ${this._collectionLabel}` );
-                    LOG_FILE( `TIME: ${duration} ms` );
-                    LOG_FILE( countPipeline, true );
-                    this._emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
-
-                    return r[0]?.count ?? 0;
-                }) : undefined
-            ]);
+                throw e;
+            }
 
             benchmark?.step( 'QUERY' );
 
@@ -799,12 +1105,15 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             }));
             const converterDuration = Date.now() - convStart;
 
-            this._emitQuery( 'list', pipeline, queryDuration,
+            this._emitQuery( 'list', pipeline, queryDuration, () => (
             {
                 converterDuration,
                 resultCount : items.length,
-                conversion  : String( conversion )
-            });
+                conversion  : String( conversion ),
+                query       : this.#buildListQueryContext( options, sort ),
+                ...( context !== undefined ? { context } : {} ),
+                ...( traceID !== undefined ? { traceID } : {} )
+            }));
 
             benchmark?.step( 'CONVERTER' );
 
@@ -835,8 +1144,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
         try
         {
+            const { context, traceID, ...bsonInput } = options;
             const { projection: convProjection, computedProperties: compProps } = this.converters[conversion];
-            let { filter = {}, sort = { _id: 1 }, cursor, limit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( options );
+            let { filter = {}, sort = { _id: 1 }, cursor, limit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( bsonInput );
             const prev = cursor?.startsWith( 'prev:' );
 
             if( !sort._id )
@@ -887,47 +1197,74 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             flowGet( 'log' ) && DUMP( pipeline );
 
             const start = Date.now();
-            const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
-
-            if( prev )
+            const emitStreamQuery = ( duration: number ) =>
             {
-                const entries = await cursorDocs.toArray();
-                const duration = Date.now() - start;
-
-                LOG_FILE( `Collection: ${this._collectionLabel}` );
-                LOG_FILE( `TIME: ${duration} ms` );
-                LOG_FILE( pipeline, true );
-                this._emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
-
-                for( const dbe of entries.reverse() )
+                this._emitQuery( 'stream', pipeline, duration, () => (
                 {
-                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-                }
+                    conversion  : String( conversion ),
+                    query       : this.#buildListQueryContext( options, sort ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                }));
+            };
 
-                return;
-            }
-
-            let emitted = false;
-
-            for await( const dbe of cursorDocs )
+            try
             {
-                if( !emitted )
+                const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
+
+                if( prev )
                 {
-                    emitted = true;
+                    const entries = await cursorDocs.toArray();
                     const duration = Date.now() - start;
 
                     LOG_FILE( `Collection: ${this._collectionLabel}` );
                     LOG_FILE( `TIME: ${duration} ms` );
                     LOG_FILE( pipeline, true );
-                    this._emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
+                    emitStreamQuery( duration );
+
+                    for( const dbe of entries.reverse() )
+                    {
+                        yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                    }
+
+                    return;
                 }
 
-                yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-            }
+                let emitted = false;
 
-            if( !emitted )
+                for await( const dbe of cursorDocs )
+                {
+                    if( !emitted )
+                    {
+                        emitted = true;
+                        const duration = Date.now() - start;
+
+                        LOG_FILE( `Collection: ${this._collectionLabel}` );
+                        LOG_FILE( `TIME: ${duration} ms` );
+                        LOG_FILE( pipeline, true );
+                        emitStreamQuery( duration );
+                    }
+
+                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                }
+
+                if( !emitted )
+                {
+                    emitStreamQuery( Date.now() - start );
+                }
+            }
+            catch( e )
             {
-                this._emitQuery( 'stream', pipeline, Date.now() - start, { conversion: String( conversion ) });
+                this._emitError( e, 'stream', Date.now() - start,
+                {
+                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
+                    query : this.#buildListQueryContext( options, sort ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                });
+
+                throw e;
             }
         }
         finally
@@ -961,7 +1298,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
     public override async exists(
         idOrFilter?: DTO['id'] | DBE['_id'] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
-        options?: { access?: string }
+        options?: ModelExistsOptions
     ): Promise<boolean>
     {
         return super.exists( idOrFilter, options );
@@ -989,13 +1326,32 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             if( !match ){ return false }
 
             const start = Date.now();
-            const res = await this.collection.deleteOne( match );
+            let res: { deletedCount: number };
+
+            try
+            {
+                res = await this.collection.deleteOne( match );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'delete', Date.now() - start,
+                {
+                    filter : match,
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                });
+
+                throw e;
+            }
 
             this._invalidateCache([ id ], res.deletedCount > 0 );
             this._emitMutation( 'delete', Date.now() - start,
             {
                 deletedCount    : res.deletedCount,
-                ids             : [ id ]
+                ids             : [ id ],
+                filter          : match,
+                ...( options?.context !== undefined ? { context: options.context } : {} ),
+                ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
             });
 
             return res.deletedCount === 1;
@@ -1020,25 +1376,55 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
                 if( idsOrFilter.length === 0 )
                 {
-                    this._emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: [] });
+                    this._emitMutation( 'deleteMany', 0,
+                    {
+                        deletedCount    : 0,
+                        ids             : [],
+                        ...( options?.context !== undefined ? { context: options.context } : {} ),
+                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    });
 
                     return 0;
                 }
 
                 const start = Date.now();
-                const res = await this.collection.deleteMany( match );
+                let res: { deletedCount: number };
+
+                try
+                {
+                    res = await this.collection.deleteMany( match );
+                }
+                catch( e )
+                {
+                    this._emitError( e, 'deleteMany', Date.now() - start,
+                    {
+                        filter : match,
+                        ...( options?.context !== undefined ? { context: options.context } : {} ),
+                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    });
+
+                    throw e;
+                }
 
                 this._invalidateCache( idsOrFilter, res.deletedCount > 0 );
                 this._emitMutation( 'deleteMany', Date.now() - start,
                 {
                     deletedCount    : res.deletedCount,
-                    ids             : idsOrFilter
+                    ids             : idsOrFilter,
+                    filter          : match,
+                    ...( options?.context !== undefined ? { context: options.context } : {} ),
+                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
                 });
 
                 return res.deletedCount;
             }
 
-            const { finalMatch, targetIds, empty } = await this.#resolveFilterMatch( idsOrFilter, 'delete', 'deleteMany', options?.access );
+            const { finalMatch, targetIds, empty, rawFilter, smartFilter, context, traceID } = await this.#resolveFilterMatch(
+                idsOrFilter,
+                'delete',
+                'deleteMany',
+                options
+            );
 
             if( !finalMatch )
             {
@@ -1049,14 +1435,39 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         this._invalidateCache( targetIds, false );
                     }
 
-                    this._emitMutation( 'deleteMany', 0, { deletedCount: 0, ids: targetIds ?? undefined });
+                    this._emitMutation( 'deleteMany', 0,
+                    {
+                        deletedCount    : 0,
+                        ids             : targetIds ?? undefined,
+                        filter          : rawFilter,
+                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                        ...( context !== undefined ? { context } : {} ),
+                        ...( traceID !== undefined ? { traceID } : {} )
+                    });
                 }
 
                 return 0;
             }
 
             const start = Date.now();
-            const res = await this.collection.deleteMany( finalMatch );
+            let res: { deletedCount: number };
+
+            try
+            {
+                res = await this.collection.deleteMany( finalMatch );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'deleteMany', Date.now() - start,
+                {
+                    filter : finalMatch,
+                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                });
+
+                throw e;
+            }
 
             if( targetIds && targetIds.length > 0 )
             {
@@ -1071,7 +1482,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 deletedCount    : res.deletedCount,
                 ids             : targetIds ?? undefined,
-                filter          : finalMatch
+                filter          : finalMatch,
+                ...( smartFilter !== undefined ? { smartFilter } : {} ),
+                ...( context !== undefined ? { context } : {} ),
+                ...( traceID !== undefined ? { traceID } : {} )
             });
 
             return res.deletedCount;
