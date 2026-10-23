@@ -75,18 +75,20 @@ export class PipelineBuilder<DBE extends MongoRootDocument = MongoRootDocument>
 
     buildCountPipeline( pipeline: Document[], countLimit?: number )
     {
-        while( pipeline.length > 0 && COUNT_IGNORE_STAGES.includes( Object.keys( pipeline[pipeline.length - 1] )[0] ) )
+        const countPipeline = [ ...pipeline ];
+
+        while( countPipeline.length > 0 && COUNT_IGNORE_STAGES.includes( Object.keys( countPipeline[countPipeline.length - 1] )[0] ) )
         {
-            pipeline = pipeline.slice( 0, -1 );
+            countPipeline.pop();
         }
 
         if( countLimit )
         {
-            pipeline.push({ $limit: countLimit + 1 });
+            countPipeline.push({ $limit: countLimit + 1 });
         }
 
-        pipeline.push({ $count: 'count' });
+        countPipeline.push({ $count: 'count' });
 
-        return pipeline;
+        return countPipeline;
     }
 }

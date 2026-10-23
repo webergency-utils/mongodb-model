@@ -150,7 +150,8 @@ export abstract class AbstractBaseModel
         {
             try
             {
-                const normalizedIds = this._idField === 'id' ? ids.map( id => this.dtoID( id )) : ids;
+                const dtoIds = ids.map( id => this.dtoID( id ));
+                const normalizedIds = this._idField === 'id' ? dtoIds : ids;
                 const dbeIds = normalizedIds.map( id => this.dbeID( id ));
 
                 let pipeline = await this.pipeline(
@@ -183,7 +184,7 @@ export abstract class AbstractBaseModel
                 });
 
                 return map(
-                    normalizedIds.map( id => this.dtoID( id )),
+                    dtoIds,
                     documents,
                     ( dbe: DBE ) => this.dtoID(( dbe as any )[this._idField] )
                 );
@@ -354,10 +355,7 @@ export abstract class AbstractBaseModel
 
     protected _notifySiblingCacheInvalidation(): void
     {
-        if( typeof ( this._models as any )[INVALIDATE_COLLECTION_CACHE] === 'function' )
-        {
-            ( this._models as any )[INVALIDATE_COLLECTION_CACHE]( this, this.collection.collectionName );
-        }
+        this._models[INVALIDATE_COLLECTION_CACHE]?.( this, this.collection.collectionName );
     }
 
     protected _invalidateCache( ids: Array<any>, notifySiblings: boolean = true ): void
@@ -643,12 +641,11 @@ export abstract class AbstractBaseModel
     {
         return this.runOperation( async() =>
         {
-            if( this._idField === '_id' )
-            {
-                const access = await this._access.resolveOrDeny({ operation: 'read', method: 'find', access: options.access });
+            const access = this._idField === '_id'
+                ? await this._access.resolveOrDeny({ operation: 'read', method: 'find', access: options.access })
+                : undefined;
 
-                if( access.denied ){ return null }
-            }
+            if( access?.denied ){ return null }
 
             const { projection } = this.converters[conversion];
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':find(' + String( conversion ) + ')' ) : undefined;
@@ -660,7 +657,8 @@ export abstract class AbstractBaseModel
                 projection,
                 sort,
                 limit       : 1,
-                access      : options.access
+                access      : options.access,
+                ...( access ? { [RESOLVED_ACCESS]: access } : {})
             }, conversion, 'find' );
 
             pipeline = this._optimizePipeline( pipeline );

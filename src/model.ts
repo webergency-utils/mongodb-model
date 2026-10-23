@@ -111,10 +111,14 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         const { computedProperties: converterComputedProperties } = this.converters[conversion ?? 'dto'];
         const { filter, sort, limit, skip, pipeline, projection, computedProperties: optionsComputedProperties, smartFilter, access } = resolveBSONObject( options ) as ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>;
 
-        const converterProperties = { '': await this.resolveComputedProperties( converterComputedProperties ) };
-        const optionsProperties = { '': await this.resolveComputedProperties( optionsComputedProperties ) };
-        const computedProperties = mergeComputedProperties( converterProperties, optionsProperties )[''];
-        const accessResult = preResolvedAccess ?? await this._access.resolveOrDeny({ operation: 'read', method, access });
+        const [ convProps, optProps, accessResult, resolvedSmartFilter ] = await Promise.all(
+        [
+            this.resolveComputedProperties( converterComputedProperties ),
+            this.resolveComputedProperties( optionsComputedProperties ),
+            preResolvedAccess ?? this._access.resolveOrDeny({ operation: 'read', method, access }),
+            smartFilter ? this.resolveSmartFilter( smartFilter ) : undefined
+        ]);
+        const computedProperties = mergeComputedProperties({ '': convProps }, { '': optProps })[''];
         const accessFilter = accessResult.denied ? ({ _id: { $exists: false } } as Filter<DBE>) : accessResult.filter;
 
         return this._pipelineBuilder.pipeline(
@@ -126,7 +130,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             limit,
             skip,
             pipeline,
-            smartFilter : smartFilter && await this.resolveSmartFilter( smartFilter ) || undefined,
+            smartFilter : resolvedSmartFilter || undefined,
             accessFilter
         });
     }
@@ -292,38 +296,21 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             if( options?.documentBefore || options?.documentAfter )
             {
-                const beforeDoc = options.documentBefore && options.documentAfter
-                    ? ( await this.collection.findOne( match, { collation: { locale: 'en' } }) as DBE | null ) || undefined
-                    : undefined;
-
-                const result = await this.collection.findOneAndUpdate(
-                    match,
-                    toUpdateOperations( update ),
-                    {
-                        returnDocument  : options.documentAfter ? 'after' : 'before',
-                        collation       : { locale: 'en' }
-                    }
-                );
-
-                const document = ( result as DBE | null ) || undefined;
-                const matchedCount = document ? 1 : 0;
-                const modifiedCount = document ? 1 : 0;
+                const snapshot = await this.#findOneAndUpdateWithSnapshots( match, update, options );
 
                 this._invalidateCache([ id ]);
                 this._emitMutation( 'update', Date.now() - start,
                 {
-                    matchedCount,
-                    modifiedCount,
-                    ids: [ id ]
+                    matchedCount    : snapshot.matchedCount,
+                    modifiedCount   : snapshot.modifiedCount,
+                    ids             : [ id ]
                 });
 
                 return {
-                    matchedCount,
-                    modifiedCount,
-                    documentBefore  : options.documentBefore
-                        ? ( options.documentAfter ? beforeDoc : document )
-                        : undefined,
-                    documentAfter   : options.documentAfter ? document : undefined
+                    matchedCount    : snapshot.matchedCount,
+                    modifiedCount   : snapshot.modifiedCount,
+                    documentBefore  : snapshot.documentBefore,
+                    documentAfter   : snapshot.documentAfter
                 };
             }
 
@@ -346,6 +333,40 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         {
             release();
         }
+    }
+
+    async #findOneAndUpdateWithSnapshots(
+        match: Filter<DBE>,
+        update: Partial<DBE> | UpdateFilter<DBE>,
+        options: ModelUpdateOptions
+    ): Promise<{ document?: DBE, documentBefore?: DBE, documentAfter?: DBE, matchedCount: number, modifiedCount: number }>
+    {
+        const beforeDoc = options.documentBefore && options.documentAfter
+            ? ( await this.collection.findOne( match, { collation: { locale: 'en' } }) as DBE | null ) || undefined
+            : undefined;
+
+        const result = await this.collection.findOneAndUpdate(
+            match,
+            toUpdateOperations( update ),
+            {
+                returnDocument  : options.documentAfter ? 'after' : 'before',
+                collation       : { locale: 'en' }
+            }
+        );
+
+        const document = ( result as DBE | null ) || undefined;
+        const matchedCount = document ? 1 : 0;
+        const modifiedCount = document ? 1 : 0;
+
+        return {
+            document,
+            matchedCount,
+            modifiedCount,
+            documentBefore  : options.documentBefore
+                ? ( options.documentAfter ? beforeDoc : document )
+                : undefined,
+            documentAfter   : options.documentAfter ? document : undefined
+        };
     }
 
     async #resolveFilterMatch(
@@ -531,50 +552,33 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             if( options?.documentBefore || options?.documentAfter )
             {
-                const beforeDoc = options.documentBefore && options.documentAfter
-                    ? ( await this.collection.findOne( finalMatch, { collation: { locale: 'en' } }) as DBE | null ) || undefined
-                    : undefined;
-
-                const result = await this.collection.findOneAndUpdate(
-                    finalMatch,
-                    toUpdateOperations( update ),
-                    {
-                        returnDocument  : options.documentAfter ? 'after' : 'before',
-                        collation       : { locale: 'en' }
-                    }
-                );
-
-                const document = ( result as DBE | null ) || undefined;
-                const matchedCount = document ? 1 : 0;
-                const modifiedCount = document ? 1 : 0;
+                const snapshot = await this.#findOneAndUpdateWithSnapshots( finalMatch, update, options );
                 const idsToEvict = targetIds && targetIds.length > 0
                     ? targetIds
-                    : ( document?._id !== undefined ? [ String( this.dtoID( document._id )) ] : null );
+                    : ( snapshot.document?._id !== undefined ? [ String( this.dtoID( snapshot.document._id )) ] : null );
 
                 if( idsToEvict && idsToEvict.length > 0 )
                 {
                     this._invalidateCache( idsToEvict );
                 }
-                else if( matchedCount > 0 || modifiedCount > 0 )
+                else if( snapshot.matchedCount > 0 || snapshot.modifiedCount > 0 )
                 {
                     this._clearCache();
                 }
 
                 this._emitMutation( 'updateOne', Date.now() - start,
                 {
-                    matchedCount,
-                    modifiedCount,
-                    ids     : idsToEvict ?? undefined,
-                    filter  : finalMatch
+                    matchedCount    : snapshot.matchedCount,
+                    modifiedCount   : snapshot.modifiedCount,
+                    ids             : idsToEvict ?? undefined,
+                    filter          : finalMatch
                 });
 
                 return {
-                    matchedCount,
-                    modifiedCount,
-                    documentBefore  : options.documentBefore
-                        ? ( options.documentAfter ? beforeDoc : document )
-                        : undefined,
-                    documentAfter   : options.documentAfter ? document : undefined
+                    matchedCount    : snapshot.matchedCount,
+                    modifiedCount   : snapshot.modifiedCount,
+                    documentBefore  : snapshot.documentBefore,
+                    documentAfter   : snapshot.documentAfter
                 };
             }
 
@@ -703,10 +707,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 throw e;
             }
 
-            const smartFilter = options.smartFilter && await this.resolveSmartFilter( options.smartFilter );
-            const converterProperties = { '': await this.resolveComputedProperties( compProps ) };
-            const optionsProperties = { '': await this.resolveComputedProperties( optionsCompProps ) };
-            const computedProperties = mergeComputedProperties( converterProperties, optionsProperties )[''];
+            const [ smartFilter, convProps, optProps ] = await Promise.all(
+            [
+                options.smartFilter ? this.resolveSmartFilter( options.smartFilter ) : undefined,
+                this.resolveComputedProperties( compProps ),
+                this.resolveComputedProperties( optionsCompProps )
+            ]);
+            const computedProperties = mergeComputedProperties({ '': convProps }, { '': optProps })[''];
 
             const params =
             {
@@ -743,7 +750,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     queryDuration = Date.now() - start;
 
-                    LOG_FILE( `Collection: ${this.collection.collectionName}` );
+                    LOG_FILE( `Collection: ${this._collectionLabel}` );
                     LOG_FILE( `TIME: ${queryDuration} ms` );
                     LOG_FILE( pipeline, true );
 
@@ -753,7 +760,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     const duration = Date.now() - start;
 
-                    LOG_FILE( `Collection: ${this.collection.collectionName}` );
+                    LOG_FILE( `Collection: ${this._collectionLabel}` );
                     LOG_FILE( `TIME: ${duration} ms` );
                     LOG_FILE( countPipeline, true );
                     this._emitQuery( 'count', countPipeline!, duration, { resultCount: r[0]?.count ?? 0 });
@@ -836,10 +843,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 throw e;
             }
 
-            const smartFilter = options.smartFilter && await this.resolveSmartFilter( options.smartFilter );
-            const converterProperties = { '': await this.resolveComputedProperties( compProps ) };
-            const optionsProperties = { '': await this.resolveComputedProperties( optionsCompProps ) };
-            const computedProperties = mergeComputedProperties( converterProperties, optionsProperties )[''];
+            const [ smartFilter, convProps, optProps ] = await Promise.all(
+            [
+                options.smartFilter ? this.resolveSmartFilter( options.smartFilter ) : undefined,
+                this.resolveComputedProperties( compProps ),
+                this.resolveComputedProperties( optionsCompProps )
+            ]);
+            const computedProperties = mergeComputedProperties({ '': convProps }, { '': optProps })[''];
 
             let pipeline = await this._pipelineBuilder.pipeline(
             {
@@ -867,7 +877,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 const entries = await cursorDocs.toArray();
                 const duration = Date.now() - start;
 
-                LOG_FILE( `Collection: ${this.collection.collectionName}` );
+                LOG_FILE( `Collection: ${this._collectionLabel}` );
                 LOG_FILE( `TIME: ${duration} ms` );
                 LOG_FILE( pipeline, true );
                 this._emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
@@ -889,7 +899,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     emitted = true;
                     const duration = Date.now() - start;
 
-                    LOG_FILE( `Collection: ${this.collection.collectionName}` );
+                    LOG_FILE( `Collection: ${this._collectionLabel}` );
                     LOG_FILE( `TIME: ${duration} ms` );
                     LOG_FILE( pipeline, true );
                     this._emitQuery( 'stream', pipeline, duration, { conversion: String( conversion ) });
@@ -944,12 +954,12 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
     public override async resolveSmartFilter( smartFilter: Record<string, any> )
     {
-        return this._smartFilters.resolve( smartFilter ) as Promise<{ filter?: Filter<DBE>, pipeline?: Document[] }>;
+        return super.resolveSmartFilter( smartFilter ) as Promise<{ filter?: Filter<DBE>, pipeline?: Document[] }>;
     }
 
     public override async resolveComputedProperties( properties?: ComputedPropertiesParam<any> ): Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>
     {
-        return this._computedProperties.resolve( properties ) as Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>;
+        return super.resolveComputedProperties( properties ) as Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>;
     }
 
     public async delete( id: DTO['id'] | DBE['_id'], options?: ModelDeleteOptions ): Promise<boolean>

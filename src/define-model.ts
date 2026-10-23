@@ -35,19 +35,7 @@ export function defineModel
     config: DefineModelConfig<DBE, SmartFilters, ComputedProperties, Recipes> = {} as any
 ): AbstractModel<DBE, DTO, InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
 {
-    const dtoIDOverride = config.dtoID;
-
-    class DefinedRootModel extends AbstractModel<DBE, DTO, InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
-    {
-        constructor( m: AbstractModels, c: Collection<DBE> )
-        {
-            const dtoIDRef = createDtoIDRef( dtoIDOverride );
-            const extensions = buildExtensions( config, ( id ) => dtoIDRef.current( id )) as unknown as InferredModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>;
-
-            super( m, c, extensions );
-            bindInstanceDtoID( dtoIDRef, this, dtoIDOverride );
-        }
-    }
+    const DefinedRootModel = Model<DBE, DTO, SmartFilters, ComputedProperties, Recipes>( config );
 
     return new DefinedRootModel( models, collection );
 }

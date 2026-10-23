@@ -42,22 +42,9 @@ export function definePropertyModel
     config: DefinePropertyModelConfig<DBE, SmartFilters, ComputedProperties, Recipes>
 ): AbstractPropertyModel<RootDBE, DBE, DTO, InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
 {
-    const { path, ...rest } = config;
-    const dtoIDOverride = rest.dtoID;
+    const DefinedPropertyModel = PropertyModel<RootDBE, DBE, DTO, SmartFilters, ComputedProperties, Recipes>( config );
 
-    class DefinedPropertyModel extends AbstractPropertyModel<RootDBE, DBE, DTO, InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>
-    {
-        constructor( m: AbstractModels, c: Collection<RootDBE>, p: string )
-        {
-            const dtoIDRef = createDtoIDRef( dtoIDOverride );
-            const extensions = buildPropertyExtensions( rest, ( id ) => dtoIDRef.current( id )) as unknown as ConstructorExtensions<InferredPropertyModelExtensions<DBE, DTO, SmartFilters, ComputedProperties, Recipes>>;
-
-            super( m, c, p, extensions );
-            bindInstanceDtoID( dtoIDRef, this, dtoIDOverride );
-        }
-    }
-
-    return new DefinedPropertyModel( models, collection, path );
+    return new DefinedPropertyModel( models, collection );
 }
 
 export function PropertyModel

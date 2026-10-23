@@ -579,6 +579,11 @@ export function collectAddedFields( pipeline: any[] ): string[]
     return [ ...fields ];
 }
 
+function isNonPlainOptimizerValue( value: unknown ): boolean
+{
+    return isLibraryObjectId( value ) || isForeignObjectIdLike( value ) || value instanceof Date || value instanceof RegExp;
+}
+
 function cleanFilterForOptimizer( obj: any ): any
 {
     if( !obj || typeof obj !== 'object' )
@@ -593,7 +598,7 @@ function cleanFilterForOptimizer( obj: any ): any
             .filter( item => item !== undefined && item !== null && ( typeof item !== 'object' || Object.keys( item ).length > 0 ));
     }
 
-    if( isLibraryObjectId( obj ) || isForeignObjectIdLike( obj ) || obj instanceof Date || obj instanceof RegExp )
+    if( isNonPlainOptimizerValue( obj ) )
     {
         return obj;
     }
@@ -619,7 +624,7 @@ function cleanFilterForOptimizer( obj: any ): any
             continue;
         }
 
-        if( value !== null && typeof value === 'object' && !Array.isArray( value ) && !isLibraryObjectId( value ) && !isForeignObjectIdLike( value ) && !( value instanceof Date ) && !( value instanceof RegExp ) )
+        if( value !== null && typeof value === 'object' && !Array.isArray( value ) && !isNonPlainOptimizerValue( value ) )
         {
             const cleanedSub = cleanFilterForOptimizer( value );
 

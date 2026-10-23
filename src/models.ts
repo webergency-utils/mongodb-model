@@ -23,8 +23,7 @@ import
     REGISTER_MODEL
 }
 from './symbols.js';
-import type { AbstractModel } from './model.js';
-import type { AbstractPropertyModel } from './property-model.js';
+import type { AbstractBaseModel } from './base-model.js';
 import type { ModelsOptions, OptimizerConfig, OptimizerOptions } from './types/external.js';
 
 const Clients = new Map<string, MongoClient>();
@@ -56,7 +55,7 @@ export type ModelsShutdownOptions =
     timeout?: number
 };
 
-type ModelInstance = AbstractModel<any, any, any> | AbstractPropertyModel<any, any, any, any>;
+type ModelInstance = AbstractBaseModel<any, any, any, any>;
 
 export class AbstractModels
 {
@@ -216,10 +215,7 @@ export class AbstractModels
 
             if( key === collection || key.startsWith( collection + '.' ) )
             {
-                if( typeof ( instance as any )[CLEAR_LOCAL_CACHE] === 'function' )
-                {
-                    ( instance as any )[CLEAR_LOCAL_CACHE]();
-                }
+                instance[CLEAR_LOCAL_CACHE]?.();
             }
         }
     }
