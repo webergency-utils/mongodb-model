@@ -86,6 +86,7 @@ See `example/` for a full domain (organizations → jobs → embedded applicatio
 - **Property models:** `AbstractPropertyModel` / `definePropertyModel` / `PropertyModel` — embedded array/object paths (e.g. `applications[]`) with the same read/write surface (`create(parentID, ...)`, `createFrom(parentID, ...)`, `createMany(parentID, ...)`, `update`, `updateOne`, `updateMany`, `delete`, `deleteMany`).
 - **Access:** Named policies in `access.filters`; `defaults` picks a policy from operation + Flow auth. Subdocument ID mutations verify subdocument predicates via pipeline before mutating.
 - **Caching:** Built-in `ModelCache` (`cache: true | ModelCacheOptions | ModelCacheInstance`) caches `get` / `getMany` results per conversion and access scope, automatically invalidating on ID mutations, clearing on filter mutations, and invalidating sibling models registered on the same collection.
+- **Observability:** Hierarchical `observability` configuration (`AbstractModels` -> `AbstractModel` -> `AbstractPropertyModel`) with O(1) fast-path operation filtering (`operations`), three-tier synchronous `context` resolution (`options.context` > `models.scope` `context` > `observability.context`), rich caller `query` / `mutation` metadata, and `internal: true` pre-query attribution.
 - **Pagination:** Opaque cursors from `list` (`next:` / `prev:`); `stream` yields one converted document at a time.
 - **Dual ObjectId installs:** BSON resolve / update / access / cursor paths coerce foreign ObjectId-like values.
 
@@ -148,6 +149,21 @@ In-memory TTL/LRU cache (`cache: true | ModelCacheOptions | ModelCacheInstance`)
 - **Options:** `{ ttl?: number, maxTTL?: number, sliding?: boolean, maxSize?: number, clone?: boolean }`
 - Automatically caches `get` / `getMany` responses by conversion and access filter hash.
 - Automatically invalidates affected IDs on `update`, `updateOne`, `updateMany`, `delete`, and `deleteMany`, clears on non-ID filter mutations, and invalidates sibling models registered on the same collection in `AbstractModels`.
+
+### Observability & Query Context
+
+Configure `observability` on `AbstractModels`, `AbstractModel`, or `AbstractPropertyModel` (`boolean | ObservabilityOptions`) and/or subscribe via `models.on(event, handler)` and `model.on(event, handler)`:
+
+- **Selective Operation Filtering (`operations`):** Pass an array of categories/operations (e.g. `['mutation']`, `['find', 'aggregate', 'update', 'delete']`) or a boolean override map (e.g. `{ mutation: true, delete: false }`, `{ internal: false }`). Supported category tokens: `'query'`, `'mutation'`, `'create'`, `'update'`, `'delete'`, `'cache'`, `'error'`, `'slowQuery'`, `'internal'`, plus exact operations (`'get'`, `'getMany'`, `'find'`, `'list'`, `'stream'`, `'aggregate'`, `'count'`, `'exists'`, `'create'`, `'createFrom'`, `'createMany'`, `'update'`, `'updateOne'`, `'updateMany'`, `'delete'`, `'deleteMany'`).
+- **Zero-Overhead Fast Path:** Disabled read queries skip payload construction and `@liqd-js/flow` lookups in O(1) unless `slowQueryMs` is exceeded (`slowQuery` event) or an `error` occurs (`error` event).
+- **Three-Tier Context Resolution (`context` & `traceID`):** Merged synchronously when an event is observed in priority order:
+  1. Per-call `options.context` (and `options.traceID`) on any read or mutation call
+  2. Scoped `context` object in `models.scope.execute(fn, { context: { route: 'POST /jobs' }, traceID: 'req-1' })`
+  3. `observability.context` configured as an array of `@liqd-js/flow` scope keys (e.g. `['userID', 'tenant']`) or a synchronous resolver `() => Record<string, unknown> | undefined`
+- **Rich Caller Metadata & Internal Pre-Queries:**
+  - `ModelQueryEvent`, `ModelSlowQueryEvent`, and `ModelErrorEvent` include `query?: ModelQueryContext` (`filter`, `smartFilter`, `computedProperties`, `sort`, `limit`, `skip`, `cursor`, `access`, `ids`).
+  - `ModelMutationEvent` includes `ids`, `parentID` (for `PropertyModel` creates), `filter`, and `smartFilter`.
+  - Internal pre-queries (pipeline smartFilter resolution, `documentBefore` + `documentAfter` snapshots, `duplicateIgnore` fallback, and `PropertyModel` subdocument ID resolution) emit `query` events with `internal: true` and `parentOperation`.
 
 ### Converters
 
