@@ -3,7 +3,6 @@ import
     Collection,
     Document,
     Filter,
-    FindOptions,
     OptionalUnlessRequiredId,
     UpdateFilter
 }
@@ -35,12 +34,9 @@ import
 {
     ExtractComputedProperties,
     ExtractSmartFilters,
-    GetManyOptions,
-    GetOptions,
     ModelAggregateOptions,
     ModelCreateOptions,
     ModelDeleteOptions,
-    ModelExistsOptions,
     ModelExtensions,
     ModelFindOptions,
     ModelListOptions,
@@ -52,7 +48,7 @@ import
     WithTotal
 }
 from './types/external.js';
-import { ComputedPropertiesParam, SyncComputedPropertyMethod } from './types/internal.js';
+import { SyncComputedPropertyMethod } from './types/internal.js';
 
 /**
  * Abstract model for root-level MongoDB documents.
@@ -63,7 +59,18 @@ export abstract class AbstractModel
     DTO extends Document,
     Extensions extends ModelExtensions<DBE, any, any> = ModelExtensions<DBE, any, any>
 >
-extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
+extends AbstractBaseModel<
+    DBE,
+    DTO,
+    Extensions,
+    DBE,
+    DBE,
+    DTO['id'] | DBE['_id'],
+    ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+    ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>,
+    DTO['id'] | DBE['_id'] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
+    Awaited<ReturnType<SyncComputedPropertyMethod>>
+>
 {
     public smartFilters?: ExtractSmartFilters<Extensions>;
 
@@ -857,69 +864,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         });
     }
 
-    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
-        id: DTO['id'] | DBE['_id'],
-        options?: GetOptions<K> | K
-    ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
-    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<DTO['id'] | DBE['_id']>,
-        conversion: K,
-        filtered: true
-    ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<DTO['id'] | DBE['_id']>,
-        options: GetManyOptions<K> & { filter: true }
-    ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<DTO['id'] | DBE['_id']>,
-        optionsOrConversion?: GetManyOptions<K> | K,
-        filtered?: boolean
-    ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>;
-    public override async get<K extends keyof Extensions['converters'] = 'dto'>(
-        idOrIds: DTO['id'] | DBE['_id'] | Array<DTO['id'] | DBE['_id']>,
-        optionsOrConversion?: GetOptions<K> | GetManyOptions<K> | K,
-        filtered?: boolean
-    ): Promise<
-        | Awaited<ReturnType<Extensions['converters'][K]['converter']>>
-        | null
-        | Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
-    >
-    {
-        return super.get( idOrIds, optionsOrConversion as any, filtered );
-    }
-
-    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<DTO['id'] | DBE['_id']>,
-        options: GetManyOptions<K> & { filter: true }
-    ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<DTO['id'] | DBE['_id']>,
-        conversion: K,
-        filtered: true
-    ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
-    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<DTO['id'] | DBE['_id']>,
-        optionsOrConversion?: GetManyOptions<K> | K,
-        filtered?: boolean
-    ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>;
-    public override async getMany<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<DTO['id'] | DBE['_id']>,
-        optionsOrConversion?: GetManyOptions<K> | K,
-        filtered?: boolean
-    ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>
-    {
-        return super.getMany( ids, optionsOrConversion as any, filtered );
-    }
-
-    public override async find<K extends keyof Extensions['converters']>(
-        options: ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
-        conversion: K = 'dto' as K,
-        sort?: FindOptions['sort']
-    ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
-    {
-        return super.find( options, conversion, sort );
-    }
-
     public async list<K extends keyof Extensions['converters']>(
         options: ModelListOptions<DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
         conversion: K = 'dto' as K
@@ -1040,47 +984,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         {
             release();
         }
-    }
-
-    public override async aggregate<T>(
-        pipeline: Document[],
-        options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
-    ): Promise<T[]>
-    {
-        return super.aggregate<T>( pipeline, options );
-    }
-
-    public override async count(
-        options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
-    ): Promise<number>;
-    public override async count(
-        pipeline: Document[],
-        options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
-    ): Promise<number>;
-    public override async count(
-        pipelineOrOptions?: Document[] | ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>,
-        options?: ModelAggregateOptions<DBE, Extensions['smartFilters'], Extensions['computedProperties']>
-    ): Promise<number>
-    {
-        return super.count( pipelineOrOptions as any, options );
-    }
-
-    public override async exists(
-        idOrFilter?: DTO['id'] | DBE['_id'] | Filter<DBE> | ModelFindOptions<DBE, ExtractSmartFilters<Extensions>>,
-        options?: ModelExistsOptions
-    ): Promise<boolean>
-    {
-        return super.exists( idOrFilter, options );
-    }
-
-    public override async resolveSmartFilter( smartFilter: Record<string, any> )
-    {
-        return super.resolveSmartFilter( smartFilter ) as Promise<{ filter?: Filter<DBE>, pipeline?: Document[] }>;
-    }
-
-    public override async resolveComputedProperties( properties?: ComputedPropertiesParam<any> ): Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>
-    {
-        return super.resolveComputedProperties( properties ) as Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>;
     }
 
     public async delete( id: DTO['id'] | DBE['_id'], options?: ModelDeleteOptions ): Promise<boolean>

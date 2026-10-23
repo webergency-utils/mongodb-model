@@ -7,14 +7,37 @@ const
     deleteNullishProperties,
     compileConverters,
     createDefaultConverters,
-    collectAddedFields,
-    getUsedFields,
-    optimizeMatch,
     ModelCache,
+    extractTargetIdsFromFilter,
     AccessControl,
     PipelineBuilder,
-    ModelAccessDeniedError
+    ModelAccessDeniedError,
+    ModelEventEmitter,
+    compileOperationFilter,
+    resolveObservabilityOptions,
+    isOperationObserved,
+    resolveObservabilityContext,
+    dispatchObservabilityEvent
 } = require( './dist/index.js' );
+const
+{
+    addPrefixToFilter,
+    addPrefixToPipeline,
+    addPrefixToUpdate,
+    collectAddedFields,
+    getUsedFields,
+    isExclusionProjection,
+    optimizeMatch,
+    projectionToProject,
+    projectionToReplace,
+    resolveBSONObject,
+    toUpdateOperations
+} = require( './dist/helpers/mongo.js' );
+const
+{
+    normalizeExistsOptions,
+    normalizeFindMatch
+} = require( './dist/operations.js' );
 
 function createFuzzedInput( provider, depth = 0, maxDepth = 3 )
 {
@@ -83,6 +106,53 @@ module.exports.fuzz = function( data )
         optimizeMatch( obj );
         collectAddedFields([{ $addFields: obj }]);
         getUsedFields([{ $match: obj }]);
+
+        resolveBSONObject( obj );
+        toUpdateOperations( obj );
+        addPrefixToFilter( obj, 'items' );
+        addPrefixToPipeline([{ $match: obj }], 'items' );
+        addPrefixToUpdate( obj, 'items' );
+
+        try
+        {
+            isExclusionProjection( obj );
+        }
+        catch
+        {
+            // Expected on mixed inclusion/exclusion fuzzed inputs
+        }
+
+        projectionToProject({ name: 1, status: 1 }, 'items' );
+        projectionToReplace({ name: 1, status: 1 }, 'items' );
+
+        normalizeFindMatch( obj, { access: 'open', context: obj, traceID: 'tr-1' });
+        normalizeExistsOptions( input, '_id', id => String( id ), { access: 'open', context: obj });
+        extractTargetIdsFromFilter( obj, '_id', id => String( id ));
+
+        compileOperationFilter([ provider.pickValue([ 'query', 'mutation', 'create', 'update', 'delete', 'cache', 'error', 'slowQuery', 'internal', 'find', 'list' ]) ]);
+        compileOperationFilter({ mutation: provider.consumeBoolean(), delete: provider.consumeBoolean(), internal: provider.consumeBoolean() });
+        const obsOptions = resolveObservabilityOptions(
+        {
+            enabled     : provider.consumeBoolean(),
+            slowQueryMs : provider.consumeIntegralInRange( 0, 100 ),
+            operations  : { mutation: true, delete: provider.consumeBoolean() },
+            context     : () => obj
+        });
+        isOperationObserved( obsOptions, provider.pickValue([ 'query', 'mutation', 'cache', 'error', 'slowQuery' ]), 'update', { internal: provider.consumeBoolean(), parentOperation: 'update' });
+        resolveObservabilityContext(() => obj, obj );
+
+        const emitter = new ModelEventEmitter();
+        const handler = () => {};
+        emitter.on( 'mutation', handler );
+        dispatchObservabilityEvent( emitter, obsOptions, 'mutation',
+        {
+            collection  : 'users',
+            operation   : 'update',
+            duration    : provider.consumeIntegralInRange( 0, 200 ),
+            filter      : obj,
+            context     : obj
+        });
+        emitter.off( 'mutation', handler );
 
         const cache = new ModelCache({ maxSize: 8, ttl: 1000 });
         cache.set( 'k', obj );

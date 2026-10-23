@@ -121,7 +121,12 @@ export abstract class AbstractBaseModel
     DTO extends Document,
     Extensions extends { converters: AbstractModelConverters<DBE>, smartFilters?: any, computedProperties?: any },
     CollectionDoc extends MongoRootDocument = DBE & MongoRootDocument,
-    AccessFilterDoc = DBE
+    AccessFilterDoc = DBE,
+    IdType = any,
+    FindOpts = any,
+    AggregateOpts = any,
+    ExistsInput = any,
+    ResolvedComputedProps = any
 >
 {
     protected _models: AbstractModels;
@@ -786,25 +791,25 @@ export abstract class AbstractBaseModel
     }
 
     public async get<K extends keyof Extensions['converters'] = 'dto'>(
-        id: any,
+        id: IdType,
         options?: GetOptions<K> | K
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
     public async get<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<any>,
+        ids: Array<IdType>,
         conversion: K,
         filtered: true
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
     public async get<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<any>,
+        ids: Array<IdType>,
         options: GetManyOptions<K> & { filter: true }
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
     public async get<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<any>,
+        ids: Array<IdType>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>;
     public async get<K extends keyof Extensions['converters'] = 'dto'>(
-        idOrIds: any,
+        idOrIds: IdType | Array<IdType>,
         optionsOrConversion?: GetOptions<K> | GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<
@@ -890,21 +895,21 @@ export abstract class AbstractBaseModel
     }
 
     public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<any>,
+        ids: Array<IdType>,
         options: GetManyOptions<K> & { filter: true }
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
     public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<any>,
+        ids: Array<IdType>,
         conversion: K,
         filtered: true
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>>;
     public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<any>,
+        ids: Array<IdType>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>;
     public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
-        ids: Array<any>,
+        ids: Array<IdType>,
         optionsOrConversion?: GetManyOptions<K> | K,
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>
@@ -1286,14 +1291,15 @@ export abstract class AbstractBaseModel
     }
 
     public async find<K extends keyof Extensions['converters']>(
-        options: any,
+        options: FindOpts,
         conversion: K = 'dto' as K,
         sort?: FindOptions['sort']
     ): Promise<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>
     {
         return this.runOperation( async() =>
         {
-            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'find', access: options.access });
+            const opts = options as any;
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'find', access: opts.access });
 
             if( access.denied ){ return null }
 
@@ -1302,12 +1308,12 @@ export abstract class AbstractBaseModel
 
             let pipeline = await this.pipeline(
             {
-                filter              : options.filter,
-                smartFilter         : options.smartFilter,
+                filter              : opts.filter,
+                smartFilter         : opts.smartFilter,
                 projection,
                 sort,
                 limit               : 1,
-                access              : options.access,
+                access              : opts.access,
                 [RESOLVED_ACCESS]   : access
             }, conversion, 'find' );
 
@@ -1326,11 +1332,11 @@ export abstract class AbstractBaseModel
             {
                 this._emitError( e, 'find', Date.now() - start, () => (
                 {
-                    filter      : options.filter,
-                    smartFilter : options.smartFilter,
-                    query       : this.#buildFindQueryContext( options, sort ),
-                    context     : options.context,
-                    traceID     : options.traceID
+                    filter      : opts.filter,
+                    smartFilter : opts.smartFilter,
+                    query       : this.#buildFindQueryContext( opts, sort ),
+                    context     : opts.context,
+                    traceID     : opts.traceID
                 }));
 
                 throw e;
@@ -1353,9 +1359,9 @@ export abstract class AbstractBaseModel
                 converterDuration,
                 resultCount : data ? 1 : 0,
                 conversion  : String( conversion ),
-                query       : this.#buildFindQueryContext( options, sort ),
-                context     : options.context,
-                traceID     : options.traceID
+                query       : this.#buildFindQueryContext( opts, sort ),
+                context     : opts.context,
+                traceID     : opts.traceID
             }));
 
             benchmark?.step( 'CONVERTER' );
@@ -1443,22 +1449,22 @@ export abstract class AbstractBaseModel
 
     public async aggregate<T>(
         pipeline: Document[],
-        options?: any
+        options?: AggregateOpts
     ): Promise<T[]>
     {
         return this.#executeAggregate<T>( pipeline, options, 'aggregate' );
     }
 
     public async count(
-        options?: any
+        options?: AggregateOpts
     ): Promise<number>;
     public async count(
         pipeline: Document[],
-        options?: any
+        options?: AggregateOpts
     ): Promise<number>;
     public async count(
-        pipelineOrOptions?: Document[] | any,
-        options?: any
+        pipelineOrOptions?: Document[] | AggregateOpts,
+        options?: AggregateOpts
     ): Promise<number>
     {
         if( Array.isArray( pipelineOrOptions ) )
@@ -1472,7 +1478,7 @@ export abstract class AbstractBaseModel
     }
 
     public async exists(
-        idOrFilter?: any,
+        idOrFilter?: ExistsInput,
         options?: ModelExistsOptions
     ): Promise<boolean>
     {
@@ -1538,13 +1544,13 @@ export abstract class AbstractBaseModel
 
     protected async accessFilter( _name: string ): Promise<AccessFilterResult<AccessFilterDoc>> {}
 
-    public async resolveSmartFilter( smartFilter: Record<string, any> ): Promise<any>
+    public async resolveSmartFilter( smartFilter: Record<string, any> ): Promise<{ filter?: Filter<AccessFilterDoc>, pipeline?: Document[] }>
     {
-        return this._smartFilters.resolve( smartFilter );
+        return this._smartFilters.resolve( smartFilter ) as Promise<{ filter?: Filter<AccessFilterDoc>, pipeline?: Document[] }>;
     }
 
-    public async resolveComputedProperties( properties?: ComputedPropertiesParam<any> ): Promise<any>
+    public async resolveComputedProperties( properties?: ComputedPropertiesParam<any> ): Promise<ResolvedComputedProps>
     {
-        return this._computedProperties.resolve( properties );
+        return this._computedProperties.resolve( properties ) as Promise<ResolvedComputedProps>;
     }
 }
