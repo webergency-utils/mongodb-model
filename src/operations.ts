@@ -1,15 +1,22 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { ClientSession, Document, Filter, ObjectId, UpdateFilter, UpdateOptions } from 'mongodb';
+import { isDeepStrictEqual } from 'node:util';
+import { ClientSession, CollationOptions, Collection, Document, Filter, ObjectId, ReadPreferenceLike, UpdateFilter, UpdateOptions } from 'mongodb';
 import { getCursor, isForeignObjectIdLike, isLibraryObjectId, isUpdateOperator, propertyModelTargetUpdateParams } from './helpers/mongo.js';
 import { ConverterManager } from './converters.js';
 import { ModelError, ModelValidationError } from './errors.js';
+import { resolveRedactFieldsSet } from './events.js';
 import
 {
     GetManyOptions,
     GetOptions,
     ListResult,
+    ModelAuditAction,
+    ModelAuditCallback,
+    ModelAuditConfig,
+    ModelAuditDiffChange,
     ModelChangeEvent,
     ModelChangeStream,
+    ModelCollationConfig,
     ModelCreateOptions,
     ModelExplainResult,
     ModelIdCollisionRiskLevel,
@@ -21,6 +28,9 @@ import
     ModelIdStrategy,
     ModelIndexDefinition,
     ModelIndexSpecification,
+    ModelQueryExecutionOptions,
+    ModelRetryConfig,
+    ModelRetryOptions,
     ModelSoftDeleteConfig,
     ModelTimestampsConfig,
     ModelValidationContext,
@@ -116,7 +126,7 @@ export function attachCursorToItem<T>( dto: T, dbe: Document, sort: Document ): 
     return dto as T & { $cursor?: string };
 }
 
-const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'populate', 'cursor', 'after', 'before', 'includeDeleted', 'access', 'context', 'traceID', 'session' ]);
+const FIND_OPTION_KEYS = new Set([ 'filter', 'smartFilter', 'populate', 'cursor', 'after', 'before', 'includeDeleted', 'access', 'context', 'traceID', 'session', 'collation', 'maxTimeMS', 'hint', 'readPreference' ]);
 
 export function isCreateOptionsObject( v: unknown ): v is ModelCreateOptions
 {
@@ -125,7 +135,7 @@ export function isCreateOptionsObject( v: unknown ): v is ModelCreateOptions
         && !Array.isArray( v )
         && !isLibraryObjectId( v )
         && !isForeignObjectIdLike( v )
-        && ( 'duplicateIgnore' in v || 'access' in v || 'context' in v || 'traceID' in v || 'session' in v );
+        && ( 'duplicateIgnore' in v || 'maxRetries' in v || 'verifyUniqueness' in v || 'access' in v || 'context' in v || 'traceID' in v || 'session' in v );
 }
 
 export function resolveCreateFromArgs<ID>(
@@ -168,7 +178,48 @@ export function resolveCreateFromArgs<ID>(
     };
 }
 
-export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, populate?: PopulateSpec, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+export function resolveCreateManyFromArgs<ID>(
+    fromMap: Record<string, unknown> | undefined,
+    fromKeyOrIdsOrOptions?: string | ID[] | ModelCreateOptions,
+    idsOrOptions?: ID[] | ModelCreateOptions,
+    options?: ModelCreateOptions
+): { fromKey?: string, explicitIds?: ID[], resolvedOptions?: ModelCreateOptions }
+{
+    void fromMap;
+
+    if( isCreateOptionsObject( fromKeyOrIdsOrOptions ) )
+    {
+        return { resolvedOptions: fromKeyOrIdsOrOptions };
+    }
+
+    if( Array.isArray( fromKeyOrIdsOrOptions ) )
+    {
+        return {
+            explicitIds     : fromKeyOrIdsOrOptions,
+            resolvedOptions : isCreateOptionsObject( idsOrOptions ) ? idsOrOptions : options
+        };
+    }
+
+    if( typeof fromKeyOrIdsOrOptions === 'string' )
+    {
+        if( isCreateOptionsObject( idsOrOptions ) )
+        {
+            return { fromKey: fromKeyOrIdsOrOptions, resolvedOptions: idsOrOptions };
+        }
+
+        return {
+            fromKey         : fromKeyOrIdsOrOptions,
+            explicitIds     : Array.isArray( idsOrOptions ) ? idsOrOptions : undefined,
+            resolvedOptions : options
+        };
+    }
+
+    return {
+        resolvedOptions : isCreateOptionsObject( idsOrOptions ) ? idsOrOptions : options
+    };
+}
+
+export function isFindOptionsObject( match: unknown ): match is { filter?: unknown, smartFilter?: unknown, populate?: PopulateSpec, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession, collation?: ModelCollationConfig, maxTimeMS?: number, hint?: string | Document, readPreference?: ReadPreferenceLike }
 {
     return Boolean(
         match
@@ -185,15 +236,19 @@ export function isFindOptionsObject( match: unknown ): match is { filter?: unkno
             || 'after' in match
             || 'before' in match
             || 'includeDeleted' in match
+            || 'collation' in match
+            || 'maxTimeMS' in match
+            || 'hint' in match
+            || 'readPreference' in match
             || (( 'access' in match || 'session' in match ) && Object.keys( match ).every( k => FIND_OPTION_KEYS.has( k ) ))
         )
     );
 }
 
 export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilterType = any>(
-    match: FilterType | { filter?: FilterType, smartFilter?: SmartFilterType, populate?: PopulateSpec, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession },
-    optionsOrAccess?: string | { populate?: PopulateSpec, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
-): { filter: FilterType, smartFilter?: SmartFilterType, populate?: PopulateSpec, cursor?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
+    match: FilterType | ( ModelQueryExecutionOptions & { filter?: FilterType, smartFilter?: SmartFilterType, populate?: PopulateSpec, cursor?: string, after?: string, before?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession } ),
+    optionsOrAccess?: string | ( ModelQueryExecutionOptions & { populate?: PopulateSpec, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession } )
+): ModelQueryExecutionOptions & { filter: FilterType, smartFilter?: SmartFilterType, populate?: PopulateSpec, cursor?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
 {
     const opts = typeof optionsOrAccess === 'string' ? { access: optionsOrAccess } : optionsOrAccess;
 
@@ -207,6 +262,10 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
         const includeDeleted = opts?.includeDeleted ?? match.includeDeleted;
         const populate = opts?.populate ?? match.populate;
         const cursor = normalizeCursorOption( match );
+        const collation = opts?.collation !== undefined ? opts.collation : match.collation;
+        const maxTimeMS = opts?.maxTimeMS ?? match.maxTimeMS;
+        const hint = opts?.hint ?? match.hint;
+        const readPreference = opts?.readPreference ?? match.readPreference;
 
         return {
             filter      : ( match.filter ?? {} ) as FilterType,
@@ -217,7 +276,11 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
             ...( includeDeleted !== undefined ? { includeDeleted } : {} ),
             ...( context !== undefined ? { context } : {} ),
             ...( traceID !== undefined ? { traceID } : {} ),
-            ...( session !== undefined ? { session } : {} )
+            ...( session !== undefined ? { session } : {} ),
+            ...( collation !== undefined ? { collation } : {} ),
+            ...( maxTimeMS !== undefined ? { maxTimeMS } : {} ),
+            ...( hint !== undefined ? { hint } : {} ),
+            ...( readPreference !== undefined ? { readPreference } : {} )
         };
     }
 
@@ -228,7 +291,11 @@ export function normalizeFindMatch<FilterType = Record<string, any>, SmartFilter
         ...( opts?.includeDeleted !== undefined ? { includeDeleted: opts.includeDeleted } : {} ),
         ...( opts?.context !== undefined ? { context: opts.context } : {} ),
         ...( opts?.traceID !== undefined ? { traceID: opts.traceID } : {} ),
-        ...( opts?.session !== undefined ? { session: opts.session } : {} )
+        ...( opts?.session !== undefined ? { session: opts.session } : {} ),
+        ...( opts?.collation !== undefined ? { collation: opts.collation } : {} ),
+        ...( opts?.maxTimeMS !== undefined ? { maxTimeMS: opts.maxTimeMS } : {} ),
+        ...( opts?.hint !== undefined ? { hint: opts.hint } : {} ),
+        ...( opts?.readPreference !== undefined ? { readPreference: opts.readPreference } : {} )
     };
 }
 
@@ -236,8 +303,8 @@ export function normalizeExistsOptions<FilterType = Record<string, any>, SmartFi
     idOrFilter: unknown,
     idKey: '_id' | 'id',
     dbeID: ( id: any ) => any,
-    optionsOrAccess?: string | { includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession }
-): { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession, isPrimitiveId?: boolean }
+    optionsOrAccess?: string | ( ModelQueryExecutionOptions & { includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession } )
+): ModelQueryExecutionOptions & { filter: FilterType, smartFilter?: SmartFilterType, cursor?: string, includeDeleted?: boolean, access?: string, context?: Record<string, unknown>, traceID?: string, session?: ClientSession, isPrimitiveId?: boolean }
 {
     if( idOrFilter === undefined || idOrFilter === null )
     {
@@ -1471,6 +1538,314 @@ export function isIdDuplicateKeyError( err: any, idField: '_id' | 'id' = '_id' )
     }
 
     return true;
+}
+
+export function resolveCollationOption(
+    collation?: ModelCollationConfig,
+    fallback?: ModelCollationConfig,
+    defaultLocale: string | false = 'en'
+): CollationOptions | undefined
+{
+    const chosen = collation !== undefined ? collation : fallback;
+
+    if( chosen === false )
+    {
+        return undefined;
+    }
+
+    if( typeof chosen === 'string' )
+    {
+        return { locale: chosen };
+    }
+
+    if( chosen && typeof chosen === 'object' )
+    {
+        return chosen;
+    }
+
+    if( defaultLocale === false )
+    {
+        return undefined;
+    }
+
+    return { locale: defaultLocale };
+}
+
+const TRANSIENT_MONGO_ERROR_CODES = new Set([
+    6,      // HostUnreachable
+    7,      // HostNotFound
+    89,     // NetworkTimeout
+    91,     // ShutdownInProgress
+    112,    // WriteConflict
+    189,    // PrimarySteppedDown
+    262,    // ExceededTimeLimit
+    9001,   // SocketException
+    10107,  // NotWritablePrimary
+    11600,  // InterruptedAtShutdown
+    11602,  // InterruptedDueToReplStateChange
+    13435,  // NotPrimaryNoSecondaryOk
+    13436   // NotPrimaryOrSecondary
+]);
+
+const TRANSIENT_MONGO_ERROR_LABELS = new Set([
+    'TransientTransactionError',
+    'UnknownTransactionCommitResult',
+    'RetryableWriteError'
+]);
+
+const TRANSIENT_MONGO_ERROR_NAMES = new Set([
+    'MongoNetworkError',
+    'MongoNetworkTimeoutError',
+    'MongoServerSelectionError',
+    'MongoWriteConcernError'
+]);
+
+export function isTransientMongoError( error: unknown ): boolean
+{
+    if( !error || typeof error !== 'object' )
+    {
+        return false;
+    }
+
+    const err = error as any;
+
+    if( typeof err.hasErrorLabel === 'function' )
+    {
+        for( const label of TRANSIENT_MONGO_ERROR_LABELS )
+        {
+            if( err.hasErrorLabel( label ) )
+            {
+                return true;
+            }
+        }
+    }
+
+    if( Array.isArray( err.errorLabels ) && err.errorLabels.some(( l: unknown ) => typeof l === 'string' && TRANSIENT_MONGO_ERROR_LABELS.has( l )) )
+    {
+        return true;
+    }
+
+    if( typeof err.code === 'number' && TRANSIENT_MONGO_ERROR_CODES.has( err.code ) )
+    {
+        return true;
+    }
+
+    if( typeof err.name === 'string' && TRANSIENT_MONGO_ERROR_NAMES.has( err.name ) )
+    {
+        return true;
+    }
+
+    if( typeof err.codeName === 'string' && /WriteConflict|TransientTransactionError|UnknownTransactionCommitResult|PrimarySteppedDown|NotWritablePrimary|InterruptedAtShutdown|InterruptedDueToReplStateChange|HostUnreachable|NetworkTimeout|SocketException|ExceededTimeLimit/i.test( err.codeName ) )
+    {
+        return true;
+    }
+
+    if( typeof err.message === 'string' && /WriteConflict|TransientTransactionError|UnknownTransactionCommitResult|PrimarySteppedDown|NotWritablePrimary|ECONNRESET|ETIMEDOUT|socket hang up/i.test( err.message ) )
+    {
+        return true;
+    }
+
+    return false;
+}
+
+export type ResolvedRetryConfig =
+{
+    maxAttempts : number
+    baseDelayMs : number
+    maxDelayMs  : number
+    jitter      : boolean
+    shouldRetry?: ( error: unknown, attempt: number ) => boolean | Promise<boolean>
+    onRetry?    : ( error: unknown, attempt: number, delayMs: number ) => void | Promise<void>
+};
+
+export function resolveRetryConfig( config?: ModelRetryConfig, fallback?: ResolvedRetryConfig ): ResolvedRetryConfig | undefined
+{
+    if( config === false )
+    {
+        return undefined;
+    }
+
+    if( config === undefined )
+    {
+        return fallback;
+    }
+
+    const opts: ModelRetryOptions = config === true
+        ? {}
+        : ( typeof config === 'number' ? { maxAttempts: config } : config );
+
+    return {
+        maxAttempts : Math.max( 1, Math.floor( opts.maxAttempts ?? fallback?.maxAttempts ?? 3 )),
+        baseDelayMs : Math.max( 0, opts.baseDelayMs ?? fallback?.baseDelayMs ?? 25 ),
+        maxDelayMs  : Math.max( 0, opts.maxDelayMs ?? fallback?.maxDelayMs ?? 1000 ),
+        jitter      : opts.jitter ?? fallback?.jitter ?? true,
+        shouldRetry : opts.shouldRetry ?? fallback?.shouldRetry,
+        onRetry     : opts.onRetry ?? fallback?.onRetry
+    };
+}
+
+export async function executeWithTransientRetry<T>(
+    fn: ( attempt: number ) => Promise<T>,
+    options?: ModelRetryConfig,
+    fallback?: ResolvedRetryConfig
+): Promise<T>
+{
+    const resolved = resolveRetryConfig( options ?? true, fallback );
+
+    if( !resolved || resolved.maxAttempts <= 1 )
+    {
+        return fn( 1 );
+    }
+
+    for( let attempt = 1; attempt <= resolved.maxAttempts; attempt++ )
+    {
+        try
+        {
+            return await fn( attempt );
+        }
+        catch( error )
+        {
+            if( attempt >= resolved.maxAttempts )
+            {
+                throw error;
+            }
+
+            const retryable = resolved.shouldRetry
+                ? await resolved.shouldRetry( error, attempt )
+                : isTransientMongoError( error );
+
+            if( !retryable )
+            {
+                throw error;
+            }
+
+            const expDelay = Math.min( resolved.maxDelayMs, resolved.baseDelayMs * Math.pow( 2, attempt - 1 ));
+            const delayMs = resolved.jitter
+                ? Math.floor( expDelay * ( 0.5 + ( Math.random() * 0.5 )))
+                : expDelay;
+
+            await resolved.onRetry?.( error, attempt, delayMs );
+
+            if( delayMs > 0 )
+            {
+                await new Promise( resolve => setTimeout( resolve, delayMs ));
+            }
+        }
+    }
+
+    /* c8 ignore next */
+    return fn( resolved.maxAttempts );
+}
+
+export type ResolvedAuditConfig<DBE extends Document = Document> =
+{
+    collection?         : string | Collection<Document>
+    onAudit?            : ModelAuditCallback<DBE>
+    actions             : Set<ModelAuditAction>
+    captureBefore       : boolean
+    captureAfter        : boolean
+    computeDiff         : boolean
+    redactFields?       : Set<string>
+    redactReplacement   : string
+};
+
+export function resolveAuditConfig<DBE extends Document = Document>(
+    config?: ModelAuditConfig<DBE>,
+    fallback?: ResolvedAuditConfig<DBE>
+): ResolvedAuditConfig<DBE> | undefined
+{
+    if( config === false )
+    {
+        return undefined;
+    }
+
+    if( config === undefined )
+    {
+        return fallback;
+    }
+
+    const opts = ( config === true
+        ? {}
+        : ( typeof config === 'string'
+            ? { collection: config }
+            : ( typeof config === 'function' ? { onAudit: config } : config ))) as {
+        enabled?            : boolean
+        collection?         : string | Collection<Document>
+        onAudit?            : ModelAuditCallback<DBE>
+        actions?            : ModelAuditAction[]
+        captureBefore?      : boolean
+        captureAfter?       : boolean
+        computeDiff?        : boolean
+        redactFields?       : string[] | boolean
+        redactReplacement?  : string
+    };
+
+    if( opts.enabled === false )
+    {
+        return undefined;
+    }
+
+    const onAudit = opts.onAudit ?? fallback?.onAudit;
+
+    return {
+        collection          : opts.collection ?? fallback?.collection ?? ( onAudit ? undefined : 'audit_logs' ),
+        onAudit,
+        actions             : opts.actions ? new Set<ModelAuditAction>( opts.actions ) : ( fallback?.actions ?? new Set<ModelAuditAction>([ 'create', 'update', 'delete' ]) ),
+        captureBefore       : opts.captureBefore ?? fallback?.captureBefore ?? true,
+        captureAfter        : opts.captureAfter ?? fallback?.captureAfter ?? true,
+        computeDiff         : opts.computeDiff ?? fallback?.computeDiff ?? true,
+        redactFields        : opts.redactFields !== undefined ? resolveRedactFieldsSet( opts.redactFields ) : fallback?.redactFields,
+        redactReplacement   : opts.redactReplacement ?? fallback?.redactReplacement ?? '[REDACTED]'
+    };
+}
+
+function areAuditValuesEqual( a: unknown, b: unknown ): boolean
+{
+    if( a === b )
+    {
+        return true;
+    }
+
+    if( ( isLibraryObjectId( a ) || isForeignObjectIdLike( a )) && ( isLibraryObjectId( b ) || isForeignObjectIdLike( b )) )
+    {
+        return String( a ) === String( b );
+    }
+
+    return isDeepStrictEqual( a, b );
+}
+
+export function computeAuditDiff(
+    before: Record<string, any> | undefined,
+    after: Record<string, any> | undefined,
+    redactFields?: Set<string>
+): Record<string, ModelAuditDiffChange> | undefined
+{
+    if( !before || !after || typeof before !== 'object' || typeof after !== 'object' )
+    {
+        return undefined;
+    }
+
+    const keys = new Set([ ...Object.keys( before ), ...Object.keys( after ) ]);
+    const changes: Record<string, ModelAuditDiffChange> = {};
+
+    for( const key of keys )
+    {
+        if( redactFields && redactFields.has( key.toLowerCase() ) )
+        {
+            continue;
+        }
+
+        if( !areAuditValuesEqual( before[key], after[key] ) )
+        {
+            changes[key] =
+            {
+                before  : before[key],
+                after   : after[key]
+            };
+        }
+    }
+
+    return Object.keys( changes ).length > 0 ? changes : undefined;
 }
 
 

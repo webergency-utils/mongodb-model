@@ -3,20 +3,28 @@ import { describe, expect, it, vi } from 'vitest';
 import
 {
     AbstractModels,
+    ModelConverterError,
     ModelError,
     ModelExternalCacheStore,
     ModelIdCollisionError,
     ModelVersionConflictError,
     ObjectId,
+    computeAuditDiff,
     createIdGenerator,
     defineModel,
     definePropertyModel,
     estimateIdCollisionRisk,
+    executeWithTransientRetry,
     extractExplainSummary,
     generateRandomId,
     isIdDuplicateKeyError,
+    isTransientMongoError,
     normalizePopulateSpecs,
+    redactSensitiveData,
+    resolveAuditConfig,
+    resolveCollationOption,
     resolveIdConfig,
+    resolveRetryConfig,
     resolveVersioningConfig
 }
 from '../index.js';
@@ -311,8 +319,12 @@ class TestModels extends AbstractModels
     {
         super( 'mongodb://localhost/test-advanced', config );
         ( this as any ).client = {
-            db      : () => ({ command: this.commandSpy }),
-            close   : vi.fn().mockResolvedValue( undefined )
+            db              : () => ({ command: this.commandSpy }),
+            startSession    : vi.fn(() => ({
+                withTransaction : vi.fn( async( fn: any ) => await fn( {} )),
+                endSession      : vi.fn().mockResolvedValue( undefined )
+            })),
+            close           : vi.fn().mockResolvedValue( undefined )
         };
     }
 }
@@ -1637,6 +1649,632 @@ describe( 'Advanced Next-Gen Features', () =>
                 .rejects.toThrow( ModelIdCollisionError );
             await expect( stuckComments.createMany( 'p1', [{ text: 'Collides 1' }], { maxRetries: 1 }) )
                 .rejects.toThrow( ModelIdCollisionError );
+        });
+    });
+
+    describe( '9. Batch createManyFrom on AbstractModel & AbstractPropertyModel', () =>
+    {
+        it( 'converts arrays of external inputs via converters.from and inserts them in a single batch', async() =>
+        {
+            const models = new TestModels();
+            const mock = createRichCollectionMock( 'posts', [
+                { _id: 'p1', title: 'Parent Post', comments: [] }
+            ]);
+
+            const posts = defineModel( models, mock.collection,
+            {
+                id          : 'base62',
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1 },
+                        converter   : ( dbe: PostDBE ) => ({ id: dbe._id, title: dbe.title })
+                    },
+                    from:
+                    {
+                        default : ( raw: string ) => ({ title: raw.trim() }),
+                        csv     : async( row: { headline: string } ) => ({ title: `CSV:${row.headline}` }),
+                        failing : () => { throw new Error( 'Bad input row' ); }
+                    }
+                }
+            });
+
+            // Empty array fast-path
+            expect( await posts.createManyFrom([]) ).toEqual([]);
+
+            // Default 'from' converter
+            const ids1 = await posts.createManyFrom([ '  First  ', '  Second  ' ]);
+            expect( ids1 ).toHaveLength( 2 );
+
+            // Named converter ('csv') with explicit IDs and options
+            const ids2 = await posts.createManyFrom(
+                'csv',
+                [{ headline: 'News A' }, { headline: 'News B' }],
+                [ 'custom_a', 'custom_b' ],
+                { ordered: true }
+            );
+            expect( ids2 ).toEqual([ 'custom_a', 'custom_b' ]);
+
+            // Default 'from' with options as second argument
+            const ids3 = await posts.createManyFrom([ 'Third' ], { ordered: false });
+            expect( ids3 ).toHaveLength( 1 );
+
+            // Named 'from' with options as third argument
+            const ids4 = await posts.createManyFrom( 'csv', [{ headline: 'News C' }], { ordered: true });
+            expect( ids4 ).toHaveLength( 1 );
+
+            // Converter error wraps into ModelConverterError and emits error event
+            await expect( posts.createManyFrom( 'failing', [ 'bad' ]) )
+                .rejects.toThrow( ModelConverterError );
+
+            // PropertyModel createManyFrom
+            const comments = definePropertyModel( models, mock.collection,
+            {
+                path        : 'comments[]',
+                id          : 'base62',
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { id: 1, text: 1 },
+                        converter   : ( dbe: CommentDBE ) => ({ id: dbe.id, text: dbe.text })
+                    },
+                    from:
+                    {
+                        default : ( text: string ) => ({ text }),
+                        tagged  : ( input: { body: string, tag: string } ) => ({ text: `[${input.tag}] ${input.body}` }),
+                        broken  : () => { throw new Error( 'Broken comment input' ); }
+                    }
+                }
+            });
+
+            expect( await comments.createManyFrom( 'p1', [] ) ).toEqual([]);
+
+            const cIds1 = await comments.createManyFrom( 'p1', [ 'Hello', 'World' ]);
+            expect( cIds1 ).toHaveLength( 2 );
+
+            const cIds2 = await comments.createManyFrom(
+                'p1',
+                'tagged',
+                [{ body: 'Nice', tag: 'vip' }],
+                [ 'c_vip_1' ],
+                { traceID: 'tr-c' }
+            );
+            expect( cIds2 ).toEqual([ 'c_vip_1' ]);
+
+            await expect( comments.createManyFrom( 'p1', 'broken', [ 'x' ]) )
+                .rejects.toThrow( ModelConverterError );
+        });
+    });
+
+    describe( '10. Configurable Collation, maxTimeMS, Index Hint, & ReadPreference', () =>
+    {
+        it( 'resolves container-level, model-level, and per-call query execution options including collation: false and locale shorthand', async() =>
+        {
+            expect( resolveCollationOption( undefined ) ).toEqual({ locale: 'en' });
+            expect( resolveCollationOption( undefined, undefined, false ) ).toBeUndefined();
+            expect( resolveCollationOption( false ) ).toBeUndefined();
+            expect( resolveCollationOption( 'cs' ) ).toEqual({ locale: 'cs' });
+            expect( resolveCollationOption({ locale: 'de', strength: 2 }) ).toEqual({ locale: 'de', strength: 2 });
+
+            const models = new TestModels({
+                queryDefaults:
+                {
+                    collation       : 'cs',
+                    maxTimeMS       : 2500,
+                    readPreference  : 'secondaryPreferred'
+                }
+            });
+
+            const mock = createRichCollectionMock( 'posts', [
+                { _id: 'p1', title: 'Alpha', authorId: 'a1' }
+            ]);
+
+            const posts = defineModel<PostDBE, PostDTO>( models, mock.collection,
+            {
+                maxTimeMS   : 1500,
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title })
+                    }
+                }
+            });
+
+            // 1. Default inherited collation ('cs'), model maxTimeMS (1500), container readPreference ('secondaryPreferred')
+            await posts.list();
+            expect( mock.spies.aggregate ).toHaveBeenLastCalledWith(
+                expect.any( Array ),
+                expect.objectContaining({
+                    collation       : { locale: 'cs' },
+                    maxTimeMS       : 1500,
+                    readPreference  : 'secondaryPreferred'
+                })
+            );
+
+            // 2. Per-call override: collation: false (disables collation for binary index scan), custom hint & maxTimeMS
+            await posts.list({
+                collation   : false,
+                maxTimeMS   : 500,
+                hint        : 'title_1'
+            });
+            const lastCallOpts = mock.spies.aggregate.mock.calls.at( -1 )?.[1];
+            expect( lastCallOpts.collation ).toBeUndefined();
+            expect( lastCallOpts.maxTimeMS ).toBe( 500 );
+            expect( lastCallOpts.hint ).toBe( 'title_1' );
+
+            // 3. find, exists, distinct, aggregate with per-call query execution options
+            await posts.find({ filter: { title: 'Alpha' }, collation: 'sk', maxTimeMS: 800, hint: { title: 1 } });
+            expect( mock.spies.aggregate ).toHaveBeenLastCalledWith(
+                expect.any( Array ),
+                expect.objectContaining({
+                    collation   : { locale: 'sk' },
+                    maxTimeMS   : 800,
+                    hint        : { title: 1 }
+                })
+            );
+
+            await posts.exists({ title: 'Alpha' }, { collation: false, maxTimeMS: 300 });
+            expect( mock.spies.aggregate.mock.calls.at( -1 )?.[1]?.collation ).toBeUndefined();
+            expect( mock.spies.aggregate.mock.calls.at( -1 )?.[1]?.maxTimeMS ).toBe( 300 );
+
+            await posts.distinct( 'authorId', { title: 'Alpha' }, { collation: 'de', maxTimeMS: 400 });
+            expect( mock.spies.aggregate ).toHaveBeenLastCalledWith(
+                expect.any( Array ),
+                expect.objectContaining({
+                    collation   : { locale: 'de' },
+                    maxTimeMS   : 400
+                })
+            );
+        });
+    });
+
+    describe( '11. Transient Error & WriteConflict Retry with Exponential Backoff', () =>
+    {
+        it( 'detects transient MongoDB errors and retries operations and transactions with exponential backoff', async() =>
+        {
+            expect( isTransientMongoError( null ) ).toBe( false );
+            expect( isTransientMongoError({ code: 112 }) ).toBe( true ); // WriteConflict
+            expect( isTransientMongoError({ codeName: 'PrimarySteppedDown' }) ).toBe( true );
+            expect( isTransientMongoError({ errorLabels: [ 'TransientTransactionError' ] }) ).toBe( true );
+            expect( isTransientMongoError({ hasErrorLabel: ( l: string ) => l === 'UnknownTransactionCommitResult' }) ).toBe( true );
+            expect( isTransientMongoError( new Error( 'ECONNRESET socket hang up' )) ).toBe( true );
+            expect( isTransientMongoError( new Error( 'Validation failed' )) ).toBe( false );
+
+            expect( resolveRetryConfig( undefined ) ).toBeUndefined();
+            expect( resolveRetryConfig( false ) ).toBeUndefined();
+            expect( resolveRetryConfig( true )?.maxAttempts ).toBe( 3 );
+            expect( resolveRetryConfig( 5 )?.maxAttempts ).toBe( 5 );
+
+            const retryHooks: number[] = [];
+            let attempts = 0;
+            const res = await executeWithTransientRetry(
+                async( attempt ) =>
+                {
+                    attempts = attempt;
+                    if( attempt < 3 )
+                    {
+                        throw Object.assign( new Error( 'WriteConflict' ), { code: 112 });
+                    }
+
+                    return 'committed';
+                },
+                {
+                    maxAttempts     : 4,
+                    baseDelayMs     : 1,
+                    maxDelayMs      : 5,
+                    jitter          : false,
+                    onRetry         : ( _err, attempt ) => { retryHooks.push( attempt ); }
+                }
+            );
+
+            expect( res ).toBe( 'committed' );
+            expect( attempts ).toBe( 3 );
+            expect( retryHooks ).toEqual([ 1, 2 ]);
+
+            // Non-transient error fails immediately without retry
+            let nonTransientCalls = 0;
+            await expect( executeWithTransientRetry(
+                async() =>
+                {
+                    nonTransientCalls++;
+                    throw new Error( 'Syntax error' );
+                },
+                { maxAttempts: 4, baseDelayMs: 1 }
+            )).rejects.toThrow( 'Syntax error' );
+            expect( nonTransientCalls ).toBe( 1 );
+
+            // Model & Models withRetry + models.transaction with retry
+            const models = new TestModels({ retry: { maxAttempts: 3, baseDelayMs: 1 } });
+            const mock = createRichCollectionMock( 'posts', [{ _id: 'p1', title: 'RetryDoc' }]);
+            const posts = defineModel<PostDBE, PostDTO>( models, mock.collection,
+            {
+                retry       : { maxAttempts: 3, baseDelayMs: 1 },
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title })
+                    }
+                }
+            });
+
+            let modelRetryCount = 0;
+            const modelVal = await posts.withRetry( async() =>
+            {
+                modelRetryCount++;
+                if( modelRetryCount < 2 )
+                {
+                    throw Object.assign( new Error( 'NotWritablePrimary' ), { code: 10107 });
+                }
+
+                return await posts.get( 'p1' );
+            });
+            expect( modelVal ).toEqual({ id: 'p1', title: 'RetryDoc' });
+            expect( modelRetryCount ).toBe( 2 );
+
+            let txAttempts = 0;
+            const txResult = await models.transaction( async() =>
+            {
+                txAttempts++;
+                if( txAttempts < 2 )
+                {
+                    throw Object.assign( new Error( 'TransientTransactionError' ), {
+                        errorLabels: [ 'TransientTransactionError' ]
+                    });
+                }
+
+                return 'tx-ok';
+            }, { retry: { maxAttempts: 3, baseDelayMs: 1 } });
+
+            expect( txResult ).toBe( 'tx-ok' );
+            expect( txAttempts ).toBe( 2 );
+
+            // models.withRetry & custom shouldRetry + maxAttempts: 1
+            expect( await models.withRetry( async() => 'direct', false ) ).toBe( 'direct' );
+            let customAttempts = 0;
+            const customRes = await models.withRetry( async() =>
+            {
+                customAttempts++;
+                if( customAttempts === 1 ){ throw new Error( 'CustomTransient' ) }
+
+                return 'custom-ok';
+            }, { maxAttempts: 2, baseDelayMs: 0, jitter: true, shouldRetry: err => ( err as Error ).message === 'CustomTransient' });
+            expect( customRes ).toBe( 'custom-ok' );
+        });
+    });
+
+    describe( '12. Observability PII / Secret Redaction', () =>
+    {
+        it( 'redacts sensitive fields recursively in observability query, mutation, slowQuery, and error events', async() =>
+        {
+            const redacted = redactSensitiveData(
+                {
+                    email       : 'user@example.com',
+                    password    : 'super-secret',
+                    nested      : { apiKey: 'k-123', safe: 'ok' },
+                    items       : [{ access_token: 'tok-abc', title: 'item1' }]
+                },
+                new Set([ 'password', 'apikey', 'access_token' ]),
+                '***'
+            );
+
+            expect( redacted ).toEqual({
+                email       : 'user@example.com',
+                password    : '***',
+                nested      : { apiKey: '***', safe: 'ok' },
+                items       : [{ access_token: '***', title: 'item1' }]
+            });
+
+            const capturedQueries: any[] = [];
+            const capturedMutations: any[] = [];
+            const capturedErrors: any[] = [];
+
+            const models = new TestModels({
+                observability:
+                {
+                    redactFields        : [ 'password', 'secretToken', 'ssn' ],
+                    redactReplacement   : '[MASKED]',
+                    onQuery             : ev => { capturedQueries.push( ev ); },
+                    onMutation          : ev => { capturedMutations.push( ev ); },
+                    onError             : ev => { capturedErrors.push( ev ); }
+                }
+            });
+
+            const mock = createRichCollectionMock( 'users', [
+                { _id: 'u1', title: 'Alice' }
+            ]);
+            const users = defineModel<PostDBE, PostDTO>( models, mock.collection,
+            {
+                converters:
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title })
+                    }
+                }
+            });
+
+            await users.list({
+                filter  : { title: 'Alice', password: 'plain-password' } as any,
+                context : { secretToken: 'jwt-xyz', tenant: 't1' }
+            });
+
+            expect( capturedQueries ).toHaveLength( 1 );
+            expect( JSON.stringify( capturedQueries[0].pipeline ) ).toContain( '[MASKED]' );
+            expect( JSON.stringify( capturedQueries[0].pipeline ) ).not.toContain( 'plain-password' );
+            expect( capturedQueries[0].query?.filter ).toEqual({ title: 'Alice', password: '[MASKED]' });
+            expect( capturedQueries[0].context ).toEqual({ secretToken: '[MASKED]', tenant: 't1' });
+
+            await users.update( 'u1', { title: 'Bob', ssn: '123-45-6789' } as any, {
+                documentBefore  : true,
+                documentAfter   : true
+            });
+
+            expect( capturedMutations ).toHaveLength( 1 );
+            expect( ( capturedMutations[0].update as any )?.$set?.ssn ).toBe( '[MASKED]' );
+            expect( ( capturedMutations[0].documentAfter as any )?.ssn ).toBe( '[MASKED]' );
+
+            // Error event redaction with default redactFields: true
+            const modelsDefaultRedact = new TestModels({
+                observability:
+                {
+                    redactFields    : true,
+                    onError         : ev => { capturedErrors.push( ev ); }
+                }
+            });
+            const errUsers = defineModel<PostDBE, PostDTO>( modelsDefaultRedact, mock.collection,
+            {
+                converters:
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title })
+                    }
+                }
+            });
+
+            mock.spies.aggregate.mockImplementationOnce(() => ({
+                toArray : vi.fn().mockRejectedValue( new Error( 'DB boom' ))
+            }));
+
+            await expect( errUsers.find({ filter: { password: 'leaked-pw' } as any }) ).rejects.toThrow( 'DB boom' );
+            expect( capturedErrors ).toHaveLength( 1 );
+            expect( capturedErrors[0].filter ).toEqual({ password: '[REDACTED]' });
+        });
+    });
+
+    describe( '13. Cursor-Paginated Batch Processor (forEachBatch) & Backfill Helper (backfill)', () =>
+    {
+        it( 'streams documents in batches and performs chunked bulkWrite backfills on AbstractModel and AbstractPropertyModel', async() =>
+        {
+            const models = new TestModels();
+            const mock = createRichCollectionMock( 'posts', [
+                { _id: 'p1', title: 'post one', comments: [{ id: 'c1', text: 'old 1' }, { id: 'c2', text: 'old 2' }] },
+                { _id: 'p2', title: 'post two', comments: [] },
+                { _id: 'p3', title: 'post three', comments: [] }
+            ]);
+
+            const posts = defineModel<PostDBE, PostDTO>( models, mock.collection,
+            {
+                converters:
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title })
+                    }
+                }
+            });
+
+            // 1. forEachBatch with batchSize: 2 and early termination
+            const seenBatches: string[][] = [];
+            const processed = await posts.forEachBatch({ batchSize: 2 }, async( batch, meta ) =>
+            {
+                seenBatches.push( batch.map( p => p.id ));
+                if( meta.batchIndex === 0 ){ return false }
+            });
+
+            expect( processed ).toEqual({ batches: 1, processed: 2 });
+            expect( seenBatches ).toEqual([[ 'p1', 'p2' ]]);
+
+            // 2. forEachBatch with callback as first arg and maxItems
+            const allIds: string[] = [];
+            await posts.forEachBatch( item => { allIds.push( ...item.map( d => d.id )); });
+            expect( allIds ).toEqual([ 'p1', 'p2', 'p3' ]);
+
+            // 3. backfill with dryRun: true (does not invoke collection.bulkWrite)
+            mock.spies.bulkWrite.mockClear();
+            const progressSnapshots: any[] = [];
+            const dryRes = await posts.backfill(
+                doc => doc._id === 'p2' ? null : { title: doc.title.toUpperCase() },
+                {
+                    batchSize   : 2,
+                    dryRun      : true,
+                    onProgress  : p => { progressSnapshots.push({ ...p }); }
+                }
+            );
+
+            expect( dryRes ).toEqual({
+                batches     : 2,
+                scanned     : 3,
+                matched     : 2,
+                modified    : 2,
+                skipped     : 1,
+                dryRun      : true
+            });
+            expect( mock.spies.bulkWrite ).not.toHaveBeenCalled();
+            expect( progressSnapshots ).toHaveLength( 2 );
+
+            // 4. backfill live execution (invokes bulkWrite in chunks)
+            mock.spies.bulkWrite.mockResolvedValue({
+                insertedCount   : 0,
+                matchedCount    : 2,
+                modifiedCount   : 2,
+                deletedCount    : 0,
+                upsertedCount   : 0,
+                upsertedIds     : {}
+            });
+
+            const liveRes = await posts.backfill(
+                doc => ({ $set: { title: `${doc.title}!` } }),
+                { batchSize: 2, maxItems: 2 }
+            );
+
+            expect( liveRes.scanned ).toBe( 2 );
+            expect( liveRes.modified ).toBe( 2 );
+            expect( mock.spies.bulkWrite ).toHaveBeenCalledTimes( 1 );
+
+            // 5. PropertyModel backfill on subdocuments
+            const comments = definePropertyModel<PostDBE, CommentDBE, CommentDTO>( models, mock.collection,
+            {
+                path        : 'comments[]',
+                converters  :
+                {
+                    dto:
+                    {
+                        projection  : { id: 1, text: 1 },
+                        converter   : dbe => ({ id: dbe.id, text: dbe.text })
+                    }
+                }
+            });
+
+            // Mock list on comments to return subdocs
+            vi.spyOn( comments, 'list' ).mockResolvedValue([
+                { id: 'c1', text: 'old 1' },
+                { id: 'c2', text: 'old 2' }
+            ] as any );
+
+            const propDry = await comments.backfill(
+                sub => sub.id === 'c1' ? { text: 'NEW 1' } : null,
+                { dryRun: true }
+            );
+            expect( propDry ).toEqual({
+                batches     : 1,
+                scanned     : 2,
+                matched     : 1,
+                modified    : 1,
+                skipped     : 1,
+                dryRun      : true
+            });
+
+            mock.spies.updateOne.mockClear();
+
+            const propLive = await comments.backfill(
+                sub => ({ $set: { text: `${sub.text} updated` } }),
+                { batchSize: 1, maxBatches: 1 }
+            );
+            expect( propLive.scanned ).toBe( 1 );
+            expect( propLive.modified ).toBe( 1 );
+            expect( mock.spies.updateOne ).toHaveBeenCalledTimes( 1 );
+        });
+    });
+
+    describe( '14. Declarative Audit Trail (audit callback & MongoDB collection)', () =>
+    {
+        it( 'captures create, update (with automatic before/after snapshots & field-level diff), and delete audit entries with redaction', async() =>
+        {
+            expect( resolveAuditConfig( undefined ) ).toBeUndefined();
+            expect( resolveAuditConfig( false ) ).toBeUndefined();
+            expect( resolveAuditConfig({ enabled: false }) ).toBeUndefined();
+            expect( resolveAuditConfig( true )?.collection ).toBe( 'audit_logs' );
+            expect( resolveAuditConfig( 'custom_audit' )?.collection ).toBe( 'custom_audit' );
+            const auditFn = vi.fn();
+            expect( resolveAuditConfig( auditFn )?.onAudit ).toBe( auditFn );
+
+            expect( computeAuditDiff( undefined, { a: 1 }) ).toBeUndefined();
+            const oidA = new ObjectId();
+            expect( computeAuditDiff({ _id: oidA }, { _id: new ObjectId( String( oidA )) }) ).toBeUndefined();
+
+            const directDiff = computeAuditDiff(
+                { _id: '1', title: 'Old', tags: [ 'a' ], secret: 's1' },
+                { _id: '1', title: 'New', tags: [ 'a', 'b' ], secret: 's2' },
+                new Set([ 'secret' ])
+            );
+            expect( directDiff ).toEqual({
+                title   : { before: 'Old', after: 'New' },
+                tags    : { before: [ 'a' ], after: [ 'a', 'b' ] }
+            });
+
+            const auditEntries: any[] = [];
+            const auditCollMock = createRichCollectionMock( 'audit_logs', []);
+
+            const models = new TestModels({
+                audit:
+                {
+                    collection      : auditCollMock.collection,
+                    onAudit         : entry => { auditEntries.push( entry ); },
+                    redactFields    : [ 'secretNote' ]
+                }
+            });
+
+            const mock = createRichCollectionMock( 'posts', [
+                { _id: 'p1', title: 'Original Title', authorId: 'a1' }
+            ]);
+
+            const posts = defineModel<PostDBE, PostDTO>( models, mock.collection,
+            {
+                converters:
+                {
+                    dto:
+                    {
+                        projection  : { _id: 1, title: 1, authorId: 1 },
+                        converter   : dbe => ({ id: dbe._id, title: dbe.title, authorId: dbe.authorId })
+                    }
+                }
+            });
+
+            // 1. Create records 'create' audit entry
+            await posts.create({ title: 'Created Post', authorId: 'a2' }, 'p2', {
+                context : { actor: 'admin' },
+                traceID : 'tr-audit-1'
+            });
+
+            expect( auditEntries ).toHaveLength( 1 );
+            expect( auditEntries[0] ).toMatchObject({
+                collection  : 'posts',
+                action      : 'create',
+                method      : 'create',
+                documentId  : 'p2',
+                context     : { actor: 'admin' },
+                traceID     : 'tr-audit-1'
+            });
+            expect( auditCollMock.spies.insertOne ).toHaveBeenCalledTimes( 1 );
+
+            // 2. Update automatically fetches documentBefore & documentAfter for audit diff even when caller did not request them!
+            const updateResult = await posts.update( 'p1', {
+                title       : 'Updated Title',
+                secretNote  : 'top-secret'
+            } as any );
+
+            // Caller did not pass documentBefore/documentAfter, so updateResult only has modifiedCount & matchedCount
+            expect( updateResult ).toEqual({ modifiedCount: 1, matchedCount: 1 });
+
+            expect( auditEntries ).toHaveLength( 2 );
+            const updateAudit = auditEntries[1];
+            expect( updateAudit.action ).toBe( 'update' );
+            expect( updateAudit.method ).toBe( 'update' );
+            expect( updateAudit.documentId ).toBe( 'p1' );
+            expect( updateAudit.before ).toMatchObject({ _id: 'p1', title: 'Original Title' });
+            expect( updateAudit.after ).toMatchObject({ _id: 'p1', title: 'Updated Title', secretNote: '[REDACTED]' });
+            expect( updateAudit.changes ).toEqual({
+                title: { before: 'Original Title', after: 'Updated Title' }
+            });
+
+            // 3. Delete records 'delete' audit entry
+            await posts.delete( 'p1' );
+            expect( auditEntries ).toHaveLength( 3 );
+            expect( auditEntries[2] ).toMatchObject({
+                action      : 'delete',
+                method      : 'delete',
+                documentId  : 'p1'
+            });
         });
     });
 });

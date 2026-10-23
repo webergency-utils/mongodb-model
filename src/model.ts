@@ -31,7 +31,8 @@ import
     isIdDuplicateKeyError,
     normalizeCursorOption,
     normalizeFindMatch,
-    resolveCreateFromArgs
+    resolveCreateFromArgs,
+    resolveCreateManyFromArgs
 }
 from './operations.js';
 import { INCLUDE_DELETED, RESOLVED_ACCESS } from './symbols.js';
@@ -40,9 +41,14 @@ import
     ExtractComputedProperties,
     ExtractSmartFilters,
     ModelAggregateOptions,
+    ModelAuditConfig,
+    ModelBackfillOptions,
+    ModelBackfillResult,
+    ModelBackfillTransformFn,
     ModelBulkWriteOperation,
     ModelBulkWriteOptions,
     ModelBulkWriteResult,
+    ModelCollationConfig,
     ModelCreateOptions,
     ModelDeleteOptions,
     ModelExtensions,
@@ -53,7 +59,9 @@ import
     ModelIdConfig,
     ModelIndexDefinition,
     ModelListOptions,
+    ModelQueryDefaultsConfig,
     ModelRelationsConfig,
+    ModelRetryConfig,
     ModelSoftDeleteConfig,
     ModelStreamOptions,
     ModelTimestampsConfig,
@@ -110,6 +118,11 @@ extends AbstractBaseModel<
             relations?      : ModelRelationsConfig<DBE>
             hooks?          : ModelHooksConfig<DBE>
             id?             : ModelIdConfig
+            queryDefaults?  : ModelQueryDefaultsConfig
+            collation?      : ModelCollationConfig
+            maxTimeMS?      : number
+            retry?          : ModelRetryConfig
+            audit?          : ModelAuditConfig<DBE>
         }
     )
     {
@@ -130,6 +143,11 @@ extends AbstractBaseModel<
             relations           : params.relations,
             hooks               : params.hooks,
             id                  : params.id,
+            queryDefaults       : params.queryDefaults,
+            collation           : params.collation,
+            maxTimeMS           : params.maxTimeMS,
+            retry               : params.retry,
+            audit               : params.audit,
             idField             : '_id'
         });
 
@@ -458,6 +476,58 @@ extends AbstractBaseModel<
         });
     }
 
+    public async createManyFrom(
+        itemsOrFromKey: unknown[] | string,
+        fromKeyOrItemsOrIdsOrOptions?: string | unknown[] | DTO['id'][] | ModelCreateOptions,
+        idsOrOptions?: DTO['id'][] | ModelCreateOptions,
+        options?: ModelCreateOptions
+    ): Promise<DTO['id'][]>
+    {
+        return this.runOperation( async() =>
+        {
+            const isFromKeyFirst = typeof itemsOrFromKey === 'string' && Array.isArray( fromKeyOrItemsOrIdsOrOptions );
+            const items = ( isFromKeyFirst ? fromKeyOrItemsOrIdsOrOptions : itemsOrFromKey ) as unknown[];
+            const { fromKey, explicitIds, resolvedOptions } = resolveCreateManyFromArgs<DTO['id']>(
+                this.converters.from as Record<string, unknown> | undefined,
+                isFromKeyFirst ? itemsOrFromKey : ( fromKeyOrItemsOrIdsOrOptions as string | DTO['id'][] | ModelCreateOptions | undefined ),
+                idsOrOptions,
+                options
+            );
+
+            const start = Date.now();
+            let dbeItems: Array<Omit<DBE, '_id'> & { _id?: DBE['_id'] }>;
+
+            try
+            {
+                dbeItems = await Promise.all(
+                    items.map( item => this._converters.convertFrom( item, fromKey ))
+                );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'createManyFrom', Date.now() - start,
+                {
+                    context : resolvedOptions?.context,
+                    traceID : resolvedOptions?.traceID
+                });
+
+                throw e;
+            }
+
+            const createdIds = await this.createMany( dbeItems, explicitIds ?? resolvedOptions, explicitIds ? resolvedOptions : undefined );
+
+            this._emitMutation( 'createManyFrom', Date.now() - start,
+            {
+                insertedCount   : createdIds.length,
+                ids             : createdIds,
+                context         : resolvedOptions?.context,
+                traceID         : resolvedOptions?.traceID
+            });
+
+            return createdIds;
+        });
+    }
+
     public async createMany(
         items: Array<Omit<DBE, '_id'> & { _id?: DBE['_id'] }>,
         idsOrOptions?: DTO['id'][] | ModelCreateOptions,
@@ -680,11 +750,13 @@ extends AbstractBaseModel<
                 match
             ));
 
+            const effectiveOptions = this._withAuditSnapshotOptions( options );
+
             try
             {
-                if( options?.documentBefore || options?.documentAfter )
+                if( effectiveOptions?.documentBefore || effectiveOptions?.documentAfter )
                 {
-                    const snapshot = await this.#findOneAndUpdateWithSnapshots( match, validatedUpdate, options, 'update' );
+                    const snapshot = await this.#findOneAndUpdateWithSnapshots( match, validatedUpdate, effectiveOptions, 'update' );
 
                     if( snapshot.matchedCount === 0 && options?.expectedVersion !== undefined )
                     {
@@ -703,8 +775,8 @@ extends AbstractBaseModel<
                         modifiedCount   : snapshot.modifiedCount,
                         documentBefore  : snapshot.documentBefore,
                         documentAfter   : snapshot.documentAfter,
-                        context         : options.context,
-                        traceID         : options.traceID,
+                        context         : effectiveOptions.context,
+                        traceID         : effectiveOptions.traceID,
                         session
                     }, pendingAfterCommit );
                     this._emitMutation( 'update', Date.now() - start,
@@ -713,15 +785,18 @@ extends AbstractBaseModel<
                         modifiedCount   : snapshot.modifiedCount,
                         ids             : [ id ],
                         filter          : match,
-                        context         : options.context,
-                        traceID         : options.traceID
+                        update          : toUpdateOperations( validatedUpdate ),
+                        ...( options?.documentBefore ? { documentBefore: snapshot.documentBefore } : {} ),
+                        ...( options?.documentAfter ? { documentAfter: snapshot.documentAfter } : {} ),
+                        context         : effectiveOptions.context,
+                        traceID         : effectiveOptions.traceID
                     });
 
                     return {
                         matchedCount    : snapshot.matchedCount,
                         modifiedCount   : snapshot.modifiedCount,
-                        documentBefore  : snapshot.documentBefore,
-                        documentAfter   : snapshot.documentAfter
+                        ...( options?.documentBefore ? { documentBefore: snapshot.documentBefore } : {} ),
+                        ...( options?.documentAfter ? { documentAfter: snapshot.documentAfter } : {} )
                     };
                 }
 
@@ -756,6 +831,7 @@ extends AbstractBaseModel<
                     modifiedCount   : res.modifiedCount,
                     ids             : [ id ],
                     filter          : match,
+                    update          : toUpdateOperations( validatedUpdate ),
                     context         : options?.context,
                     traceID         : options?.traceID
                 });
@@ -912,7 +988,7 @@ extends AbstractBaseModel<
             {
                 docs = await this.collection.aggregate(
                     pipeline,
-                    this._withSession({ collation: { locale: 'en' } }, session )
+                    this._buildAggregateOptions({ session })
                 ).toArray() as Array<{ _id: DBE['_id'] }>;
             }
             catch( e )
@@ -1272,14 +1348,16 @@ extends AbstractBaseModel<
                 smartFilter
             ));
 
+            const effectiveOptions = this._withAuditSnapshotOptions( options );
+
             try
             {
-                if( options?.documentBefore || options?.documentAfter )
+                if( effectiveOptions?.documentBefore || effectiveOptions?.documentAfter )
                 {
                     const snapshot = await this.#findOneAndUpdateWithSnapshots(
                         versionedMatch,
                         validatedUpdate,
-                        { ...options, context, traceID, session },
+                        { ...effectiveOptions, context, traceID, session },
                         'updateOne'
                     );
 
@@ -1331,8 +1409,8 @@ extends AbstractBaseModel<
                     return {
                         matchedCount    : snapshot.matchedCount,
                         modifiedCount   : snapshot.modifiedCount,
-                        documentBefore  : snapshot.documentBefore,
-                        documentAfter   : snapshot.documentAfter
+                        ...( options?.documentBefore ? { documentBefore: snapshot.documentBefore } : {} ),
+                        ...( options?.documentAfter ? { documentAfter: snapshot.documentAfter } : {} )
                     };
                 }
 
@@ -1460,14 +1538,16 @@ extends AbstractBaseModel<
             const updateOps = toUpdateOperations( validatedUpdate ) as Record<string, any>;
             const generatedDtoId = await this.#prepareUpsertSetOnInsert( updateOps, finalMatch, targetIds, options?.id );
 
+            const effectiveOptions = this._withAuditSnapshotOptions( options );
+
             try
             {
-                if( options?.documentBefore || options?.documentAfter )
+                if( effectiveOptions?.documentBefore || effectiveOptions?.documentAfter )
                 {
                     const snapshot = await this.#findOneAndUpdateWithSnapshots(
                         versionedMatch,
                         updateOps as UpdateFilter<DBE>,
-                        { ...options, context, traceID, session, upsert: true },
+                        { ...effectiveOptions, context, traceID, session, upsert: true },
                         'upsert'
                     );
                     const upsertedId = snapshot.upsertedId ?? ( snapshot.upsertedCount > 0 ? generatedDtoId : undefined );
@@ -1523,8 +1603,8 @@ extends AbstractBaseModel<
                         upsertedCount   : snapshot.upsertedCount,
                         matchedCount    : snapshot.matchedCount,
                         modifiedCount   : snapshot.modifiedCount,
-                        documentBefore  : snapshot.documentBefore,
-                        documentAfter   : snapshot.documentAfter
+                        ...( options?.documentBefore ? { documentBefore: snapshot.documentBefore } : {} ),
+                        ...( options?.documentAfter ? { documentAfter: snapshot.documentAfter } : {} )
                     };
                 }
 
@@ -2857,5 +2937,84 @@ extends AbstractBaseModel<
 
             return result;
         });
+    }
+
+    public async backfill(
+        transform: ModelBackfillTransformFn<DBE, DBE>,
+        options?: ModelBackfillOptions<DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
+    ): Promise<ModelBackfillResult>
+    {
+        const dryRun = Boolean( options?.dryRun );
+        const stats: ModelBackfillResult =
+        {
+            batches     : 0,
+            scanned     : 0,
+            matched     : 0,
+            modified    : 0,
+            skipped     : 0,
+            dryRun
+        };
+        const { dryRun: _d, ordered, onProgress, ...forEachOpts } = options ?? {};
+
+        await this.forEachBatch(
+            {
+                ...forEachOpts,
+                as : 'dbe' as any
+            },
+            async( batch, meta ) =>
+            {
+                stats.batches = meta.batchIndex + 1;
+                stats.scanned += batch.length;
+
+                const ops: Array<ModelBulkWriteOperation<DBE, DTO['id'], ExtractSmartFilters<Extensions>>> = [];
+
+                for( let i = 0; i < batch.length; i++ )
+                {
+                    const doc = batch[i] as unknown as DBE;
+                    const patch = await transform( doc, { ...meta, indexInBatch: i });
+
+                    if( !patch || typeof patch !== 'object' || Object.keys( patch ).length === 0 )
+                    {
+                        stats.skipped++;
+
+                        continue;
+                    }
+
+                    stats.matched++;
+                    ops.push({
+                        update :
+                        {
+                            id      : this.dtoID( doc._id ),
+                            update  : patch as Partial<DBE> | UpdateFilter<DBE>
+                        }
+                    });
+                }
+
+                if( ops.length > 0 )
+                {
+                    if( dryRun )
+                    {
+                        stats.modified += ops.length;
+                    }
+                    else
+                    {
+                        const res = await this.bulkWrite( ops,
+                        {
+                            ordered,
+                            access  : options?.access,
+                            context : options?.context,
+                            traceID : options?.traceID,
+                            session : options?.session
+                        });
+
+                        stats.modified += res.modifiedCount;
+                    }
+                }
+
+                await onProgress?.({ ...stats });
+            }
+        );
+
+        return stats;
     }
 }

@@ -6,12 +6,16 @@ import
     AbstractModelProperties,
     AbstractModelSmartFilters,
     ModelAccessConfig,
+    ModelAuditConfig,
     ModelCacheConfig,
+    ModelCollationConfig,
     ModelExtensions,
     ModelHooksConfig,
     ModelIdConfig,
     ModelIndexDefinition,
+    ModelQueryDefaultsConfig,
     ModelRelationsConfig,
+    ModelRetryConfig,
     ModelSoftDeleteConfig,
     ModelTimestampsConfig,
     ModelValidatorConfig,
@@ -117,6 +121,11 @@ export type RootModelDefinition
     relations?           : ModelRelationsConfig<DBE>
     hooks?               : ModelHooksConfig<DBE>
     id?                  : ModelIdConfig
+    queryDefaults?       : ModelQueryDefaultsConfig
+    collation?           : ModelCollationConfig
+    maxTimeMS?           : number
+    retry?               : ModelRetryConfig
+    audit?               : ModelAuditConfig<DBE>
     dtoID?               : ( id: unknown ) => string
     dbeID?               : ( id: any ) => any
 }
@@ -146,6 +155,11 @@ export type PropertyModelDefinition
     relations?           : ModelRelationsConfig<DBE>
     hooks?               : ModelHooksConfig<DBE>
     id?                  : ModelIdConfig
+    queryDefaults?       : ModelQueryDefaultsConfig
+    collation?           : ModelCollationConfig
+    maxTimeMS?           : number
+    retry?               : ModelRetryConfig
+    audit?               : ModelAuditConfig<DBE>
     dtoID?               : ( id: unknown ) => string
     dbeID?               : ( id: any ) => any
 }

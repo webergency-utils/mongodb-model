@@ -1,4 +1,4 @@
-import { ClientSession, CreateIndexesOptions, Document, Filter, FindOptions, IndexDirection, MongoClientOptions, ObjectId, OneOrMore, UpdateFilter } from 'mongodb';
+import { ClientSession, CollationOptions, Collection, CreateIndexesOptions, Document, Filter, FindOptions, IndexDirection, MongoClientOptions, ObjectId, OneOrMore, ReadPreferenceLike, TransactionOptions, UpdateFilter } from 'mongodb';
 import type { OptimizerOptions } from '@webergency-utils/mongodb-query-optimizer';
 import type { ModelCacheConfig } from '../cache.js';
 import type { ModelValidationIssue } from '../errors.js';
@@ -33,10 +33,44 @@ from '../events.js';
 export type CacheOptions = ModelCacheConfig;
 export type OptimizerConfig = boolean | OptimizerOptions;
 
+export type ModelCollationConfig = CollationOptions | string | false;
+
+export type ModelQueryExecutionOptions =
+{
+    collation?      : ModelCollationConfig
+    maxTimeMS?      : number
+    hint?           : string | Document
+    readPreference? : ReadPreferenceLike
+};
+
+export type ModelQueryDefaultsConfig = ModelQueryExecutionOptions;
+
+export type ModelRetryOptions =
+{
+    maxAttempts?    : number
+    baseDelayMs?    : number
+    maxDelayMs?     : number
+    jitter?         : boolean
+    shouldRetry?    : ( error: unknown, attempt: number ) => boolean | Promise<boolean>
+    onRetry?        : ( error: unknown, attempt: number, delayMs: number ) => void | Promise<void>
+};
+
+export type ModelRetryConfig = boolean | number | ModelRetryOptions;
+
+export type ModelTransactionOptions = TransactionOptions &
+{
+    retry? : ModelRetryConfig
+};
+
 export type ModelsOptions = MongoClientOptions &
 {
     optimizer?      : OptimizerConfig
     observability?  : ObservabilityConfig
+    queryDefaults?  : ModelQueryDefaultsConfig
+    collation?      : ModelCollationConfig
+    maxTimeMS?      : number
+    retry?          : ModelRetryConfig
+    audit?          : ModelAuditConfig
 };
 
 export type ModelCreateOptions =
@@ -110,7 +144,7 @@ export type ModelDeleteOptions =
     session?    : ClientSession
 };
 
-export type ModelExistsOptions =
+export type ModelExistsOptions = ModelQueryExecutionOptions &
 {
     includeDeleted? : boolean
     access?         : string
@@ -119,7 +153,7 @@ export type ModelExistsOptions =
     session?        : ClientSession
 };
 
-export type ModelDistinctOptions<DBE = Document, Filters = never> =
+export type ModelDistinctOptions<DBE = Document, Filters = never> = ModelQueryExecutionOptions &
 {
     filter?         : Filter<DBE>
     smartFilter?    : ModelSmartFilter<Filters>
@@ -136,7 +170,7 @@ export type PropertyModelDistinctOptions
     DBE extends Document,
     Filters extends AbstractModelSmartFilters<any> = never
 >
-=
+= ModelQueryExecutionOptions &
 {
     filter?         : PropertyModelFilter<RootDBE, DBE>
     smartFilter?    : ModelSmartFilter<SecondType<Filters>>
@@ -484,6 +518,85 @@ export type ModelHooksConfig<DBE extends Document = Document> =
     afterDelete?    : OneOrMore<ModelAfterHookFn<DBE>>
 };
 
+export type ModelAuditAction = 'create' | 'update' | 'delete';
+
+export type ModelAuditDiffChange =
+{
+    before  : unknown
+    after   : unknown
+};
+
+export type ModelAuditEntry<DBE extends Document = Document> =
+{
+    collection      : string
+    model?          : string
+    action          : ModelAuditAction
+    method          : ModelMutationOperation
+    documentId?     : unknown
+    documentIds?    : unknown[]
+    parentId?       : unknown
+    timestamp       : Date
+    context?        : Record<string, unknown>
+    traceID?        : string
+    before?         : Partial<DBE> | Document
+    after?          : Partial<DBE> | Document
+    changes?        : Record<string, ModelAuditDiffChange>
+    data?           : Document
+};
+
+export type ModelAuditCallback<DBE extends Document = Document> = (
+    entry: ModelAuditEntry<DBE>
+) => void | Promise<void>;
+
+export type ModelAuditOptions<DBE extends Document = Document> =
+{
+    enabled?            : boolean
+    collection?         : string | Collection<Document>
+    onAudit?            : ModelAuditCallback<DBE>
+    actions?            : ModelAuditAction[]
+    captureBefore?      : boolean
+    captureAfter?       : boolean
+    computeDiff?        : boolean
+    redactFields?       : string[] | boolean
+    redactReplacement?  : string
+};
+
+export type ModelAuditConfig<DBE extends Document = Document> =
+    | boolean
+    | string
+    | ModelAuditCallback<DBE>
+    | ModelAuditOptions<DBE>;
+
+export type ModelBatchCallbackMeta =
+{
+    batchIndex  : number
+    cursor?     : string
+    processed   : number
+};
+
+export type ModelBackfillTransformResult<DBE extends Document> =
+    | Partial<DBE>
+    | UpdateFilter<DBE>
+    | null
+    | undefined
+    | false
+    | void;
+
+export type ModelBackfillTransformFn<DBE extends Document, Item = DBE> = (
+    doc: Item,
+    meta: ModelBatchCallbackMeta & { indexInBatch: number }
+) => ModelBackfillTransformResult<DBE> | Promise<ModelBackfillTransformResult<DBE>>;
+
+export type ModelBackfillResult =
+{
+    batches     : number
+    scanned     : number
+    matched     : number
+    modified    : number
+    skipped     : number
+    dryRun      : boolean
+};
+
 export type MongoRootDocument = Document & { _id: any };
 export type MongoPropertyDocument = Document & { id: any };
 
@@ -500,7 +613,7 @@ export type WithTotal<T> = T extends Array<infer U>
     ? Array<U> & ListResult<U>
     : T & { total?: number, cursors?: { next?: string, prev?: string }, nextCursor?: string, prevCursor?: string };
 
-export type GetOptions<K extends string | number | symbol = 'dto'> =
+export type GetOptions<K extends string | number | symbol = 'dto'> = ModelQueryExecutionOptions &
 {
     as?             : K
     populate?       : PopulateSpec
@@ -511,7 +624,7 @@ export type GetOptions<K extends string | number | symbol = 'dto'> =
     session?        : ClientSession
 }
 
-export type GetManyOptions<K extends string | number | symbol = 'dto'> =
+export type GetManyOptions<K extends string | number | symbol = 'dto'> = ModelQueryExecutionOptions &
 {
     as?             : K
     filter?         : boolean
@@ -527,7 +640,9 @@ export type ModelSmartFilter<T> = { [K in PublicMethodNames<T>]?: FirstParameter
 
 export type PropertyModelFilter<RootDBE extends Document, DBE extends Document> = Filter<DBE> & { _root?: Filter<RootDBE> };
 
-export type ModelListOptions<DBE extends Document, Filters = never, Properties = never> = FindOptions &
+export type ModelListOptions<DBE extends Document, Filters = never, Properties = never> =
+    Omit<FindOptions, 'collation' | 'hint' | 'maxTimeMS' | 'readPreference'> &
+    ModelQueryExecutionOptions &
 {
     filter?             : Filter<DBE>
     smartFilter?        : ModelSmartFilter<Filters>
@@ -550,6 +665,26 @@ export type ModelListOptions<DBE extends Document, Filters = never, Properties =
 export type ModelStreamOptions<DBE extends Document, Filters = never, Properties = never> =
     Omit<ModelListOptions<DBE, Filters, Properties>, 'count' | 'countLimit'>;
 
+export type ModelForEachBatchOptions<DBE extends Document, Filters = never, Properties = never, K extends string | number | symbol = 'dto'> =
+    Omit<ModelListOptions<DBE, Filters, Properties>, 'limit' | 'skip' | 'count' | 'countLimit'> &
+    {
+        as?         : K
+        batchSize?  : number
+        maxBatches? : number
+        maxItems?   : number
+    };
+
+export type ModelBackfillOptions<DBE extends Document, Filters = never, Properties = never> =
+    Omit<ModelListOptions<DBE, Filters, Properties>, 'limit' | 'skip' | 'count' | 'countLimit'> &
+    {
+        batchSize?  : number
+        maxBatches? : number
+        maxItems?   : number
+        dryRun?     : boolean
+        ordered?    : boolean
+        onProgress? : ( stats: ModelBackfillResult ) => void | Promise<void>
+    };
+
 export type PropertyModelListOptions
 <
     RootDBE extends Document,
@@ -557,7 +692,8 @@ export type PropertyModelListOptions
     Filters extends AbstractModelSmartFilters<any> = never,
     Properties = never
 >
-= Omit<FindOptions, 'projection'> &
+= Omit<FindOptions, 'projection' | 'collation' | 'hint' | 'maxTimeMS' | 'readPreference'> &
+    ModelQueryExecutionOptions &
 {
     filter?             : PropertyModelFilter<RootDBE, DBE>
     smartFilter?        : ModelSmartFilter<FirstType<Filters>>
@@ -587,7 +723,40 @@ export type PropertyModelStreamOptions
 >
 = Omit<PropertyModelListOptions<RootDBE, DBE, Filters, Properties>, 'count' | 'countLimit'>;
 
-export type ModelFindOptions<DBE extends Document, Filters = never> =
+export type PropertyModelForEachBatchOptions
+<
+    RootDBE extends Document,
+    DBE extends Document,
+    Filters extends AbstractModelSmartFilters<any> = never,
+    Properties = never,
+    K extends string | number | symbol = 'dto'
+>
+= Omit<PropertyModelListOptions<RootDBE, DBE, Filters, Properties>, 'limit' | 'skip' | 'count' | 'countLimit'> &
+{
+    as?         : K
+    batchSize?  : number
+    maxBatches? : number
+    maxItems?   : number
+};
+
+export type PropertyModelBackfillOptions
+<
+    RootDBE extends Document,
+    DBE extends Document,
+    Filters extends AbstractModelSmartFilters<any> = never,
+    Properties = never
+>
+= Omit<PropertyModelListOptions<RootDBE, DBE, Filters, Properties>, 'limit' | 'skip' | 'count' | 'countLimit'> &
+{
+    batchSize?  : number
+    maxBatches? : number
+    maxItems?   : number
+    dryRun?     : boolean
+    ordered?    : boolean
+    onProgress? : ( stats: ModelBackfillResult ) => void | Promise<void>
+};
+
+export type ModelFindOptions<DBE extends Document, Filters = never> = ModelQueryExecutionOptions &
 {
     filter?         : Filter<DBE>
     smartFilter?    : ModelSmartFilter<Filters>
@@ -608,7 +777,7 @@ export type PropertyModelFindOptions
     DBE extends Document,
     Filters extends AbstractModelSmartFilters<any> = never
 >
-=
+= ModelQueryExecutionOptions &
 {
     filter?         : PropertyModelFilter<RootDBE, DBE>
     smartFilter?    : ModelSmartFilter<SecondType<Filters>>
@@ -629,7 +798,7 @@ export type ModelAggregateOptions
     Filters extends AbstractModelSmartFilters<any> = never,
     Properties extends AbstractModelProperties<any> = never
 >
-=
+= ModelQueryExecutionOptions &
 {
     filter?             : Filter<DBE>
     smartFilter?        : ModelSmartFilter<Filters>
@@ -657,7 +826,7 @@ export type PropertyModelAggregateOptions
     Filters extends AbstractPropertyModelSmartFilters<any, any> = never,
     Properties extends AbstractPropertyModelComputedProperties<any, any> = never
 >
-=
+= ModelQueryExecutionOptions &
 {
     filter?             : PropertyModelFilter<RootDBE, DBE>
     smartFilter?        : ModelSmartFilter<SecondType<Filters>>
@@ -744,6 +913,11 @@ export type ConstructorExtensions<E extends PropertyModelExtensions<any, any, an
         relations?          : E['relations']
         hooks?              : E['hooks']
         id?                 : ModelIdConfig
+        queryDefaults?      : ModelQueryDefaultsConfig
+        collation?          : ModelCollationConfig
+        maxTimeMS?          : number
+        retry?              : ModelRetryConfig
+        audit?              : E['audit']
     }
 
 export type ModelExtensions
@@ -769,6 +943,11 @@ export type ModelExtensions
     relations?          : ModelRelationsConfig<DBE>
     hooks?              : ModelHooksConfig<DBE>
     id?                 : ModelIdConfig
+    queryDefaults?      : ModelQueryDefaultsConfig
+    collation?          : ModelCollationConfig
+    maxTimeMS?          : number
+    retry?              : ModelRetryConfig
+    audit?              : ModelAuditConfig<DBE>
 }
 
 export type PropertyModelExtensions
@@ -794,6 +973,11 @@ export type PropertyModelExtensions
     relations?          : ModelRelationsConfig<DBE>
     hooks?              : ModelHooksConfig<DBE>
     id?                 : ModelIdConfig
+    queryDefaults?      : ModelQueryDefaultsConfig
+    collation?          : ModelCollationConfig
+    maxTimeMS?          : number
+    retry?              : ModelRetryConfig
+    audit?              : ModelAuditConfig<DBE>
 }
 
 export type MongoBSONTypes<T> = T extends ObjectId

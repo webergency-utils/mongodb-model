@@ -30,6 +30,8 @@ import
     dispatchObservabilityEvent,
     isOperationObserved,
     isSlowQueryObserved,
+    redactSensitiveData,
+    resolveObservabilityContext,
     resolveObservabilityOptions
 }
 from './events.js';
@@ -50,7 +52,9 @@ from './helpers/index.js';
 import { AbstractModels } from './models.js';
 import
 {
+    ResolvedAuditConfig,
     ResolvedIdConfig,
+    ResolvedRetryConfig,
     ResolvedSoftDeleteConfig,
     ResolvedTimestampsConfig,
     ResolvedVersioningConfig,
@@ -62,10 +66,12 @@ import
     attachListMetadata,
     buildSoftDeleteFilter,
     combineMongoFilters,
+    computeAuditDiff,
     convertDocuments,
     createChangeStreamController,
     estimateIdCollisionRisk,
     executeModelValidator,
+    executeWithTransientRetry,
     extractExplainSummary,
     normalizeCursorOption,
     normalizeExistsOptions,
@@ -74,7 +80,10 @@ import
     normalizeGetOptions,
     normalizeModelIndexes,
     normalizePopulateSpecs,
+    resolveAuditConfig,
+    resolveCollationOption,
     resolveIdConfig,
+    resolveRetryConfig,
     resolveSoftDeleteConfig,
     resolveTimestampsConfig,
     resolveVersioningConfig
@@ -104,9 +113,13 @@ import
     GetManyOptions,
     GetOptions,
     ModelAccessConfig,
+    ModelAuditConfig,
+    ModelAuditEntry,
+    ModelBatchCallbackMeta,
     ModelChangeEvent,
     ModelChangeOperationType,
     ModelChangeStream,
+    ModelCollationConfig,
     ModelDistinctOptions,
     ModelExistsOptions,
     ModelExplainResult,
@@ -118,11 +131,15 @@ import
     ModelIdConfig,
     ModelIdGeneratorContext,
     ModelIndexDefinition,
+    ModelQueryDefaultsConfig,
+    ModelQueryExecutionOptions,
     ModelRelationsConfig,
+    ModelRetryConfig,
     ModelSoftDeleteConfig,
     ModelSyncIndexesOptions,
     ModelSyncIndexesResult,
     ModelTimestampsConfig,
+    ModelUpdateOptions,
     ModelValidationContext,
     ModelValidationOperation,
     ModelValidatorConfig,
@@ -164,6 +181,11 @@ export type BaseModelParams<DBE extends Document> =
     relations?              : ModelRelationsConfig<DBE>
     hooks?                  : ModelHooksConfig<DBE>
     id?                     : ModelIdConfig
+    queryDefaults?          : ModelQueryDefaultsConfig
+    collation?              : ModelCollationConfig
+    maxTimeMS?              : number
+    retry?                  : ModelRetryConfig
+    audit?                  : ModelAuditConfig<DBE>
     idField                 : '_id' | 'id'
     prefix?                 : string
     smartFilterOptions?     : SmartFilterResolverOptions
@@ -210,6 +232,9 @@ export abstract class AbstractBaseModel
     protected _relations?: ModelRelationsConfig<DBE>;
     protected _hooks?: ModelHooksConfig<DBE>;
     protected _idConfig: ResolvedIdConfig<DTO['id']>;
+    protected _queryDefaults: ModelQueryDefaultsConfig;
+    protected _retry?: ResolvedRetryConfig;
+    protected _audit?: ResolvedAuditConfig<DBE>;
     protected _idField: '_id' | 'id';
     protected _prefix?: string;
 
@@ -240,6 +265,16 @@ export abstract class AbstractBaseModel
         this._relations = params.relations;
         this._hooks = params.hooks;
         this._idConfig = resolveIdConfig( params.id, this );
+        const containerQueryDefaults = ( models as any )._queryDefaults as ModelQueryDefaultsConfig | undefined;
+        this._queryDefaults =
+        {
+            ...containerQueryDefaults,
+            ...params.queryDefaults,
+            ...( params.collation !== undefined ? { collation: params.collation } : {} ),
+            ...( params.maxTimeMS !== undefined ? { maxTimeMS: params.maxTimeMS } : {} )
+        };
+        this._retry = resolveRetryConfig( params.retry, ( models as any )._retry );
+        this._audit = resolveAuditConfig( params.audit, ( models as any )._audit );
         this._pipelineBuilder = new PipelineBuilder<CollectionDoc>();
         this.converters = ( params.converters ?? { dto: { converter: ( dbe: DBE ) => dbe }, dbe: { converter: ( dbe: DBE ) => dbe } }) as unknown as Extensions['converters'];
         this._converters = new ConverterManager( this, this.converters, ( err, op ) => this._emitError( err, op ));
@@ -253,7 +288,7 @@ export abstract class AbstractBaseModel
         this._smartFilters = new SmartFilterResolver( this, params.smartFilters, params.smartFilterOptions );
         this._computedProperties = new ComputedPropertyResolver( this, params.computedProperties, params.computedPropertyOptions );
 
-        this.#findAggregator = new Aggregator( async( ids: Array<any>, conversion: keyof Extensions['converters'], accessCtx?: { access?: string, scopeKey?: string, [RESOLVED_ACCESS]?: { denied: boolean, filter?: Filter<DBE> }, [RESOLVED_SESSION]?: ClientSession, [INCLUDE_DELETED]?: boolean } ) =>
+        this.#findAggregator = new Aggregator( async( ids: Array<any>, conversion: keyof Extensions['converters'], accessCtx?: { access?: string, scopeKey?: string, queryOptions?: ModelQueryExecutionOptions, [RESOLVED_ACCESS]?: { denied: boolean, filter?: Filter<DBE> }, [RESOLVED_SESSION]?: ClientSession, [INCLUDE_DELETED]?: boolean } ) =>
         {
             const metaKey = this.#batchMetaKey( conversion, accessCtx?.access, accessCtx?.scopeKey );
             const queue = this.#pendingBatchMeta.get( metaKey );
@@ -351,7 +386,10 @@ export abstract class AbstractBaseModel
                 flowGet( 'log' ) && DUMP( pipeline );
 
                 start = Date.now();
-                const documents = await this.collection.aggregate( pipeline, this._withSession({ collation: { locale: 'en' } }, accessCtx?.[RESOLVED_SESSION] )).toArray() as DBE[];
+                const documents = await this.collection.aggregate(
+                    pipeline,
+                    this._buildAggregateOptions({ ...accessCtx?.queryOptions, session: accessCtx?.[RESOLVED_SESSION] })
+                ).toArray() as DBE[];
                 const duration = Date.now() - start;
 
                 LOG_FILE( `Collection: ${this._collectionLabel}` );
@@ -915,6 +953,61 @@ export abstract class AbstractBaseModel
         return session ? { ...baseOptions, session } : baseOptions;
     }
 
+    protected _buildAggregateOptions( options?: ModelQueryExecutionOptions & { session?: ClientSession } ): Record<string, any>
+    {
+        const out: Record<string, any> = {};
+        const collation = resolveCollationOption( options?.collation, this._queryDefaults.collation, 'en' );
+        const maxTimeMS = options?.maxTimeMS ?? this._queryDefaults.maxTimeMS;
+        const hint = options?.hint ?? this._queryDefaults.hint;
+        const readPreference = options?.readPreference ?? this._queryDefaults.readPreference;
+
+        if( collation !== undefined ){ out.collation = collation }
+        if( maxTimeMS !== undefined ){ out.maxTimeMS = maxTimeMS }
+        if( hint !== undefined ){ out.hint = hint }
+        if( readPreference !== undefined ){ out.readPreference = readPreference }
+
+        return this._withSession( out, options?.session );
+    }
+
+    #extractQueryExecutionOptions( options?: ModelQueryExecutionOptions ): ModelQueryExecutionOptions | undefined
+    {
+        if( !options || ( options.collation === undefined && options.maxTimeMS === undefined && options.hint === undefined && options.readPreference === undefined ) )
+        {
+            return undefined;
+        }
+
+        const out: ModelQueryExecutionOptions = {};
+
+        if( options.collation !== undefined ){ out.collation = options.collation }
+        if( options.maxTimeMS !== undefined ){ out.maxTimeMS = options.maxTimeMS }
+        if( options.hint !== undefined ){ out.hint = options.hint }
+        if( options.readPreference !== undefined ){ out.readPreference = options.readPreference }
+
+        return out;
+    }
+
+    protected _withAuditSnapshotOptions<T extends ModelUpdateOptions>( options?: T ): T | undefined
+    {
+        if( !this._audit || !this._audit.actions.has( 'update' ) )
+        {
+            return options;
+        }
+
+        const wantBefore = this._audit.captureBefore || this._audit.computeDiff;
+        const wantAfter = this._audit.captureAfter || this._audit.computeDiff;
+
+        if( !wantBefore && !wantAfter )
+        {
+            return options;
+        }
+
+        return {
+            ...options,
+            ...( wantBefore ? { documentBefore: true } : {} ),
+            ...( wantAfter ? { documentAfter: true } : {} )
+        } as T;
+    }
+
     protected _sessionArg( explicitSession?: ClientSession ): [ { session: ClientSession } ] | []
     {
         const session = this._resolveSession( explicitSession );
@@ -1243,9 +1336,88 @@ export abstract class AbstractBaseModel
             }
         }
 
+        await this.#recordAudit( ctxInput );
+
         for( const callback of localCallbacks )
         {
             await callback();
+        }
+    }
+
+    async #recordAudit(
+        ctxInput: Omit<ModelHookContext<DBE>, 'model' | 'collection' | 'afterCommit'>
+    ): Promise<void>
+    {
+        if( !this._audit || !this._audit.actions.has( ctxInput.operation ) )
+        {
+            return;
+        }
+
+        const isNoOpMutation =
+            ( ctxInput.operation === 'create' && ctxInput.insertedCount === 0 )
+            || ( ctxInput.operation === 'update' && ctxInput.matchedCount === 0 && ( ctxInput.upsertedCount ?? 0 ) === 0 )
+            || ( ctxInput.operation === 'delete' && ctxInput.deletedCount === 0 && ( ctxInput.matchedCount === undefined || ctxInput.matchedCount === 0 ));
+
+        if( isNoOpMutation )
+        {
+            return;
+        }
+
+        const resolvedContext = resolveObservabilityContext( this[GET_OBSERVABILITY_OPTIONS]()?.context, ctxInput.context );
+        const resolvedTraceID = ctxInput.traceID ?? ( flowGet( 'traceID' ) as string | undefined );
+        const rawBefore = this._audit.captureBefore
+            ? ctxInput.documentBefore
+            : undefined;
+        const rawAfter = this._audit.captureAfter
+            ? ( ctxInput.documentAfter ?? ( ctxInput.operation === 'create' ? ctxInput.data as Partial<DBE> | undefined : undefined ))
+            : undefined;
+        const rawChanges = this._audit.computeDiff && ctxInput.operation === 'update'
+            ? computeAuditDiff(
+                ctxInput.documentBefore as Record<string, any> | undefined,
+                ctxInput.documentAfter as Record<string, any> | undefined,
+                this._audit.redactFields
+            )
+            : undefined;
+        const rawData = ( ctxInput.update ?? ctxInput.data ?? ( ctxInput.items ? { items: ctxInput.items } : undefined )) as Document | undefined;
+
+        const redact = <T>( val: T ): T =>
+            this._audit?.redactFields
+                ? redactSensitiveData( val, this._audit.redactFields, this._audit.redactReplacement )
+                : val;
+
+        const entry: ModelAuditEntry<DBE> =
+        {
+            collection  : this._collectionLabel,
+            model       : this.constructor.name,
+            action      : ctxInput.operation,
+            method      : ctxInput.method,
+            ...( ctxInput.id !== undefined ? { documentId: ctxInput.id } : {} ),
+            ...( ctxInput.ids !== undefined ? { documentIds: ctxInput.ids } : ( ctxInput.id !== undefined ? { documentIds: [ ctxInput.id ] } : {} )),
+            ...( ctxInput.parentID !== undefined ? { parentId: ctxInput.parentID } : {} ),
+            timestamp   : new Date(),
+            ...( resolvedContext !== undefined ? { context: redact( resolvedContext ) } : {} ),
+            ...( resolvedTraceID !== undefined ? { traceID: resolvedTraceID } : {} ),
+            ...( rawBefore !== undefined ? { before: redact( rawBefore ) } : {} ),
+            ...( rawAfter !== undefined ? { after: redact( rawAfter ) } : {} ),
+            ...( rawChanges !== undefined ? { changes: redact( rawChanges ) } : {} ),
+            ...( rawData !== undefined ? { data: redact( rawData ) } : {} )
+        };
+
+        if( this._audit.onAudit )
+        {
+            await this._audit.onAudit( entry );
+        }
+
+        if( this._audit.collection )
+        {
+            const targetCol = typeof this._audit.collection === 'string'
+                ? ( this._models as any )?.client?.db?.()?.collection?.( this._audit.collection )
+                : this._audit.collection;
+
+            if( targetCol && typeof targetCol.insertOne === 'function' )
+            {
+                await targetCol.insertOne( entry as Document, ...this._sessionArg( ctxInput.session ));
+            }
         }
     }
 
@@ -1656,9 +1828,16 @@ export abstract class AbstractBaseModel
             if( access.denied ){ return null }
 
             const session = this._resolveSession( options.session );
+            const queryOptions = this.#extractQueryExecutionOptions( options );
             const baseScopeKey = access.filter ? objectHash( access.filter ) : undefined;
             const scopeKey = options.includeDeleted ? `${baseScopeKey ?? ''}|incDel` : baseScopeKey;
-            const batchScopeKey = session ? `${scopeKey ?? ''}|${this.#sessionScopeToken( session )}` : scopeKey;
+            let batchScopeKey = session ? `${scopeKey ?? ''}|${this.#sessionScopeToken( session )}` : scopeKey;
+
+            if( queryOptions )
+            {
+                batchScopeKey = `${batchScopeKey ?? ''}|q:${objectHash( queryOptions )}`;
+            }
+
             let dtoId: string | undefined;
             let cacheKey: string | undefined;
 
@@ -1702,7 +1881,7 @@ export abstract class AbstractBaseModel
                 documents = await this.#findAggregator.execute(
                     rawIds,
                     conversion,
-                    { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
+                    { access: options.access, scopeKey: batchScopeKey, queryOptions, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
                 ) as unknown as Array<DBE | null>;
             }
             finally
@@ -1773,9 +1952,16 @@ export abstract class AbstractBaseModel
             }
 
             const session = this._resolveSession( options.session );
+            const queryOptions = this.#extractQueryExecutionOptions( options );
             const baseScopeKey = access.filter ? objectHash( access.filter ) : undefined;
             const scopeKey = options.includeDeleted ? `${baseScopeKey ?? ''}|incDel` : baseScopeKey;
-            const batchScopeKey = session ? `${scopeKey ?? ''}|${this.#sessionScopeToken( session )}` : scopeKey;
+            let batchScopeKey = session ? `${scopeKey ?? ''}|${this.#sessionScopeToken( session )}` : scopeKey;
+
+            if( queryOptions )
+            {
+                batchScopeKey = `${batchScopeKey ?? ''}|q:${objectHash( queryOptions )}`;
+            }
+
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':getMany(' + String( conversion ) + ')' ) : undefined;
 
             if( this._cache && !session )
@@ -1831,7 +2017,7 @@ export abstract class AbstractBaseModel
                         documents = await this.#findAggregator.execute(
                             missingIds,
                             conversion,
-                            { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
+                            { access: options.access, scopeKey: batchScopeKey, queryOptions, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
                         ) as unknown as Array<DBE | null>;
                     }
                     finally
@@ -1896,7 +2082,7 @@ export abstract class AbstractBaseModel
                 documents = await this.#findAggregator.execute(
                     ids,
                     conversion,
-                    { access: options.access, scopeKey: batchScopeKey, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
+                    { access: options.access, scopeKey: batchScopeKey, queryOptions, [RESOLVED_ACCESS]: access, [RESOLVED_SESSION]: session, [INCLUDE_DELETED]: options.includeDeleted }
                 ) as unknown as Array<DBE | null>;
             }
             finally
@@ -1919,14 +2105,26 @@ export abstract class AbstractBaseModel
         });
     }
 
-    protected _stripObservabilityOptions<T extends { context?: Record<string, unknown>, traceID?: string, session?: ClientSession, populate?: PopulateSpec }>( options: T ): Omit<T, 'context' | 'traceID' | 'session' | 'populate'>
+    protected _stripObservabilityOptions<T extends ModelQueryExecutionOptions & { context?: Record<string, unknown>, traceID?: string, session?: ClientSession, populate?: PopulateSpec }>( options: T ): Omit<T, 'context' | 'traceID' | 'session' | 'populate' | 'collation' | 'maxTimeMS' | 'hint' | 'readPreference'>
     {
-        if( !options || ( options.context === undefined && options.traceID === undefined && options.session === undefined && options.populate === undefined ) )
+        if(
+            !options
+            || (
+                options.context === undefined
+                && options.traceID === undefined
+                && options.session === undefined
+                && options.populate === undefined
+                && options.collation === undefined
+                && options.maxTimeMS === undefined
+                && options.hint === undefined
+                && options.readPreference === undefined
+            )
+        )
         {
-            return ( options ?? {} ) as Omit<T, 'context' | 'traceID' | 'session' | 'populate'>;
+            return ( options ?? {} ) as Omit<T, 'context' | 'traceID' | 'session' | 'populate' | 'collation' | 'maxTimeMS' | 'hint' | 'readPreference'>;
         }
 
-        const { context: _c, traceID: _t, session: _s, populate: _p, ...rest } = options;
+        const { context: _c, traceID: _t, session: _s, populate: _p, collation: _col, maxTimeMS: _mt, hint: _h, readPreference: _rp, ...rest } = options;
 
         return rest;
     }
@@ -1944,7 +2142,7 @@ export abstract class AbstractBaseModel
         const { context, traceID } = options;
         const effectiveCursor = normalizeCursorOption( options );
         const prev = effectiveCursor?.startsWith( 'prev:' );
-        const aggOpts = this._withSession({ collation: { locale: 'en' } }, options.session );
+        const aggOpts = this._buildAggregateOptions( options );
         const start = Date.now();
         let queryDuration = 0;
         let entries: Document[];
@@ -2051,7 +2249,7 @@ export abstract class AbstractBaseModel
         const { context, traceID } = options;
         const effectiveCursor = normalizeCursorOption( options );
         const prev = effectiveCursor?.startsWith( 'prev:' );
-        const aggOpts = this._withSession({ collation: { locale: 'en' } }, options.session );
+        const aggOpts = this._buildAggregateOptions( options );
         const start = Date.now();
         const emitStreamQuery = ( duration: number ) =>
         {
@@ -2340,7 +2538,7 @@ export abstract class AbstractBaseModel
 
             try
             {
-                dbe = ( await this.collection.aggregate( pipeline, this._withSession({ collation: { locale: 'en' } }, opts.session )).toArray() )[0] as DBE | undefined;
+                dbe = ( await this.collection.aggregate( pipeline, this._buildAggregateOptions( opts )).toArray() )[0] as DBE | undefined;
             }
             catch( e )
             {
@@ -2397,7 +2595,7 @@ export abstract class AbstractBaseModel
     {
         return this.runOperation( async() =>
         {
-            const { context, traceID, session, ...pipelineOptions } = ( options ?? {} ) as Record<string, any>;
+            const { context, traceID, session, collation, maxTimeMS, hint, readPreference, ...pipelineOptions } = ( options ?? {} ) as Record<string, any>;
             const access = await this._access.resolveOrDeny({ operation: 'read', method: operation, access: pipelineOptions.access });
 
             if( access.denied ){ return [] }
@@ -2434,7 +2632,10 @@ export abstract class AbstractBaseModel
 
             try
             {
-                res = await this.collection.aggregate( aggregationPipeline, this._withSession({ collation: { locale: 'en' } }, session )).toArray() as T[];
+                res = await this.collection.aggregate(
+                    aggregationPipeline,
+                    this._buildAggregateOptions({ session, collation, maxTimeMS, hint, readPreference })
+                ).toArray() as T[];
             }
             catch( e )
             {
@@ -2539,7 +2740,7 @@ export abstract class AbstractBaseModel
 
             try
             {
-                res = await this.collection.aggregate( pipeline, this._withSession({ collation: { locale: 'en' } }, findOptions.session )).toArray();
+                res = await this.collection.aggregate( pipeline, this._buildAggregateOptions( findOptions )).toArray();
             }
             catch( e )
             {
@@ -2601,7 +2802,7 @@ export abstract class AbstractBaseModel
 
             try
             {
-                res = await this.collection.aggregate( pipeline, this._withSession({ collation: { locale: 'en' } }, distinctOptions.session )).toArray();
+                res = await this.collection.aggregate( pipeline, this._buildAggregateOptions( distinctOptions )).toArray();
             }
             catch( e )
             {
@@ -2683,7 +2884,7 @@ export abstract class AbstractBaseModel
                 pipeline = this._optimizePipeline( pipeline );
             }
 
-            const aggOpts = this._withSession({ collation: { locale: 'en' } }, session );
+            const aggOpts = this._buildAggregateOptions( Array.isArray( optionsOrPipeline ) ? { session } : ( optionsOrPipeline as any ));
             const cursor = this.collection.aggregate( pipeline, aggOpts ) as any;
             const db = ( this._models as any )?.client?.db?.();
             const raw: Document = ( await cursor?.explain?.( verbosity ))
@@ -2821,6 +3022,128 @@ export abstract class AbstractBaseModel
         }
 
         return stream;
+    }
+
+    public async withRetry<T>(
+        fn: ( attempt: number ) => Promise<T>,
+        options?: ModelRetryConfig
+    ): Promise<T>
+    {
+        return this.runOperation( async() =>
+            executeWithTransientRetry( fn, options, this._retry )
+        );
+    }
+
+    public async forEachBatch<K extends keyof Extensions['converters'] = 'dto'>(
+        callback: (
+            batch: Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>,
+            meta: ModelBatchCallbackMeta
+        ) => void | false | Promise<void | false>
+    ): Promise<{ batches: number, processed: number }>;
+    public async forEachBatch<K extends keyof Extensions['converters'] = 'dto'>(
+        options: ( Omit<ListOpts, 'limit' | 'skip' | 'count' | 'countLimit'> & { as?: K, batchSize?: number, maxBatches?: number, maxItems?: number } ) | undefined,
+        callback: (
+            batch: Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>,
+            meta: ModelBatchCallbackMeta
+        ) => void | false | Promise<void | false>
+    ): Promise<{ batches: number, processed: number }>;
+    public async forEachBatch<K extends keyof Extensions['converters'] = 'dto'>(
+        optionsOrCallback?: ( Omit<ListOpts, 'limit' | 'skip' | 'count' | 'countLimit'> & { as?: K, batchSize?: number, maxBatches?: number, maxItems?: number } )
+            | ((
+                batch: Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>,
+                meta: ModelBatchCallbackMeta
+            ) => void | false | Promise<void | false> ),
+        maybeCallback?: (
+            batch: Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>,
+            meta: ModelBatchCallbackMeta
+        ) => void | false | Promise<void | false>
+    ): Promise<{ batches: number, processed: number }>
+    {
+        const isCallbackFirst = typeof optionsOrCallback === 'function';
+        const rawOptions = ( isCallbackFirst ? {} : ( optionsOrCallback ?? {} )) as Record<string, any>;
+        const callback = ( isCallbackFirst ? optionsOrCallback : maybeCallback )!;
+        const { as: conversionOption, batchSize: rawBatchSize, maxBatches: rawMaxBatches, maxItems: rawMaxItems, ...listBase } = rawOptions;
+        const conversion = ( conversionOption ?? 'dto' ) as K;
+        const batchSize = Math.max( 1, Math.floor( rawBatchSize ?? 100 ));
+        const maxBatches = rawMaxBatches !== undefined ? Math.max( 0, Math.floor( rawMaxBatches )) : Infinity;
+        const maxItems = rawMaxItems !== undefined ? Math.max( 0, Math.floor( rawMaxItems )) : Infinity;
+
+        let batches = 0;
+        let processed = 0;
+        let currentCursor = normalizeCursorOption( listBase );
+
+        while( batches < maxBatches && processed < maxItems )
+        {
+            const remainingItems = maxItems === Infinity ? batchSize : Math.min( batchSize, maxItems - processed );
+
+            if( remainingItems <= 0 ){ break }
+
+            const page = await this.list(
+                {
+                    ...listBase,
+                    after   : undefined,
+                    before  : undefined,
+                    cursor  : currentCursor,
+                    limit   : remainingItems,
+                    count   : false
+                } as unknown as ListOpts,
+                conversion
+            );
+
+            if( page.length === 0 ){ break }
+
+            if( page.length > remainingItems )
+            {
+                let offset = 0;
+
+                while( offset < page.length && batches < maxBatches && processed < maxItems )
+                {
+                    const sliceSize = maxItems === Infinity ? batchSize : Math.min( batchSize, maxItems - processed );
+                    const batch = page.slice( offset, offset + sliceSize );
+
+                    if( batch.length === 0 ){ break }
+
+                    offset += batch.length;
+                    processed += batch.length;
+                    batches++;
+                    currentCursor = batch[batch.length - 1]?.$cursor
+                        ? `next:${batch[batch.length - 1].$cursor}`
+                        : page.nextCursor;
+
+                    const shouldContinue = await callback( batch,
+                    {
+                        batchIndex  : batches - 1,
+                        cursor      : currentCursor,
+                        processed
+                    });
+
+                    if( shouldContinue === false )
+                    {
+                        break;
+                    }
+                }
+
+                break;
+            }
+
+            processed += page.length;
+            batches++;
+            currentCursor = page.nextCursor;
+
+            const shouldContinue = await callback( page,
+            {
+                batchIndex  : batches - 1,
+                cursor      : currentCursor,
+                processed
+            });
+
+            if( shouldContinue === false || !currentCursor || page.length < remainingItems )
+            {
+                break;
+            }
+        }
+
+        return { batches, processed };
     }
 
     protected async accessFilter( _name: string ): Promise<AccessFilterResult<AccessFilterDoc>> {}

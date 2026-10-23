@@ -26,7 +26,12 @@ function buildExtensions<DBE extends MongoRootDocument>(
         versioning          : config.versioning,
         relations           : config.relations,
         hooks               : config.hooks,
-        id                  : config.id
+        id                  : config.id,
+        queryDefaults       : config.queryDefaults,
+        collation           : config.collation,
+        maxTimeMS           : config.maxTimeMS,
+        retry               : config.retry,
+        audit               : config.audit
     };
 }
 

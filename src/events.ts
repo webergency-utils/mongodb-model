@@ -9,6 +9,7 @@ export type ModelMutationOperation =
     | 'create'
     | 'createFrom'
     | 'createMany'
+    | 'createManyFrom'
     | 'update'
     | 'updateOne'
     | 'updateMany'
@@ -77,6 +78,8 @@ export type ModelMutationEvent =
     filter?             : Document
     smartFilter?        : Record<string, unknown>
     update?             : Document
+    documentBefore?     : Document
+    documentAfter?      : Document
     context?            : Record<string, unknown>
     traceID?            : string
 };
@@ -151,6 +154,8 @@ export type ObservabilityOptions =
     slowQueryMs?                    : number
     operations?                     : ObservabilityOperationFilter[] | Partial<Record<ObservabilityOperationFilter, boolean>>
     context?                        : ObservabilityContextResolver
+    redactFields?                   : string[] | boolean
+    redactReplacement?              : string
     logger?                         : ObservabilityLogger
     onQuery?                        : ( event: ModelQueryEvent ) => void
     onMutation?                     : ( event: ModelMutationEvent ) => void
@@ -162,12 +167,117 @@ export type ObservabilityOptions =
 
 export type ObservabilityConfig = boolean | ObservabilityOptions;
 
+export const DEFAULT_REDACT_FIELDS: readonly string[] =
+[
+    'password',
+    'passwordHash',
+    'secret',
+    'token',
+    'accessToken',
+    'refreshToken',
+    'apiKey',
+    'authorization',
+    'ssn',
+    'creditCard'
+];
+
+export function resolveRedactFieldsSet( redactFields?: string[] | boolean ): Set<string> | undefined
+{
+    if( !redactFields )
+    {
+        return undefined;
+    }
+
+    const list = redactFields === true ? DEFAULT_REDACT_FIELDS : redactFields;
+
+    if( list.length === 0 )
+    {
+        return undefined;
+    }
+
+    const set = new Set<string>();
+
+    for( const field of list )
+    {
+        set.add( field );
+        set.add( field.toLowerCase());
+    }
+
+    return set;
+}
+
+export function redactSensitiveData<T>(
+    value: T,
+    fields: ReadonlySet<string> | undefined,
+    replacement: string = '[REDACTED]'
+): T
+{
+    if( !fields || fields.size === 0 || value === null || value === undefined || typeof value !== 'object' )
+    {
+        return value;
+    }
+
+    if( value instanceof Date || value instanceof RegExp || Buffer.isBuffer( value ) || ( value as any )._bsontype )
+    {
+        return value;
+    }
+
+    if( Array.isArray( value ) )
+    {
+        let mutated = false;
+        const copy = new Array( value.length );
+
+        for( let i = 0; i < value.length; i++ )
+        {
+            const item = value[i];
+            const next = redactSensitiveData( item, fields, replacement );
+
+            if( next !== item )
+            {
+                mutated = true;
+            }
+
+            copy[i] = next;
+        }
+
+        return ( mutated ? copy : value ) as unknown as T;
+    }
+
+    let mutated = false;
+    const out: Record<string, unknown> = {};
+
+    for( const [ key, propVal ] of Object.entries( value as Record<string, unknown> ) )
+    {
+        const leafKey = key.includes( '.' ) ? key.slice( key.lastIndexOf( '.' ) + 1 ) : key;
+
+        if( fields.has( key ) || fields.has( key.toLowerCase()) || fields.has( leafKey ) || fields.has( leafKey.toLowerCase()) )
+        {
+            out[key] = replacement;
+            mutated = true;
+        }
+        else
+        {
+            const next = redactSensitiveData( propVal, fields, replacement );
+
+            if( next !== propVal )
+            {
+                mutated = true;
+            }
+
+            out[key] = next;
+        }
+    }
+
+    return ( mutated ? out : value ) as unknown as T;
+}
+
 const ALL_QUERY_OPS: ModelQueryOperation[] = [ 'get', 'getMany', 'list', 'stream', 'aggregate', 'count', 'find', 'exists', 'distinct' ];
 const ALL_MUTATION_OPS: ModelMutationOperation[] =
 [
     'create',
     'createFrom',
     'createMany',
+    'createManyFrom',
     'update',
     'updateOne',
     'updateMany',
@@ -182,7 +292,7 @@ const ALL_MUTATION_OPS: ModelMutationOperation[] =
     'hardDeleteMany',
     'bulkWrite'
 ];
-const CREATE_OPS: ModelMutationOperation[] = [ 'create', 'createFrom', 'createMany', 'upsert', 'bulkWrite' ];
+const CREATE_OPS: ModelMutationOperation[] = [ 'create', 'createFrom', 'createMany', 'createManyFrom', 'upsert', 'bulkWrite' ];
 const UPDATE_OPS: ModelMutationOperation[] = [ 'update', 'updateOne', 'updateMany', 'upsert', 'findOneAndUpdate', 'restore', 'restoreMany', 'bulkWrite' ];
 const DELETE_OPS: ModelMutationOperation[] = [ 'delete', 'deleteMany', 'findOneAndDelete', 'hardDelete', 'hardDeleteMany', 'bulkWrite' ];
 const QUERY_OP_SET = new Set<string>( ALL_QUERY_OPS );
@@ -593,6 +703,8 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
 
     const traceID = payload.traceID ?? ( flowGet( 'traceID' ) as string | undefined );
     const context = resolveObservabilityContext( filterOptions?.context, payload.context );
+    const redactSet = resolveRedactFieldsSet( filterOptions?.redactFields );
+    const redactReplacement = filterOptions?.redactReplacement ?? '[REDACTED]';
 
     let enriched = payload;
 
@@ -604,6 +716,22 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
             ...( traceID !== undefined ? { traceID } : {} ),
             ...( context !== undefined ? { context } : {} )
         };
+    }
+
+    if( redactSet )
+    {
+        const cloned: Record<string, any> = { ...enriched };
+
+        if( cloned.pipeline !== undefined ){ cloned.pipeline = redactSensitiveData( cloned.pipeline, redactSet, redactReplacement ) }
+        if( cloned.filter !== undefined ){ cloned.filter = redactSensitiveData( cloned.filter, redactSet, redactReplacement ) }
+        if( cloned.smartFilter !== undefined ){ cloned.smartFilter = redactSensitiveData( cloned.smartFilter, redactSet, redactReplacement ) }
+        if( cloned.update !== undefined ){ cloned.update = redactSensitiveData( cloned.update, redactSet, redactReplacement ) }
+        if( cloned.query !== undefined ){ cloned.query = redactSensitiveData( cloned.query, redactSet, redactReplacement ) }
+        if( cloned.context !== undefined ){ cloned.context = redactSensitiveData( cloned.context, redactSet, redactReplacement ) }
+        if( cloned.documentBefore !== undefined ){ cloned.documentBefore = redactSensitiveData( cloned.documentBefore, redactSet, redactReplacement ) }
+        if( cloned.documentAfter !== undefined ){ cloned.documentAfter = redactSensitiveData( cloned.documentAfter, redactSet, redactReplacement ) }
+
+        enriched = cloned as ModelEventsMap[E];
     }
 
     const fnLogger = activeOptions && typeof activeOptions.logger === 'function' ? activeOptions.logger : undefined;

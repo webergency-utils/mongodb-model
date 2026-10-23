@@ -46,7 +46,8 @@ import
     isIdDuplicateKeyError,
     normalizeCursorOption,
     normalizeFindMatch,
-    resolveCreateFromArgs
+    resolveCreateFromArgs,
+    resolveCreateManyFromArgs
 }
 from './operations.js';
 import { GET_PARENT, INCLUDE_DELETED, RESOLVED_ACCESS } from './symbols.js';
@@ -58,6 +59,8 @@ import
     ExtractComputedProperties,
     ExtractSmartFilters,
     FirstType,
+    ModelBackfillResult,
+    ModelBackfillTransformFn,
     ModelBulkWriteOptions,
     ModelBulkWriteResult,
     ModelCreateOptions,
@@ -69,6 +72,7 @@ import
     MongoPropertyDocument,
     MongoRootDocument,
     PropertyModelAggregateOptions,
+    PropertyModelBackfillOptions,
     PropertyModelBulkWriteOperation,
     PropertyModelExtensions,
     PropertyModelFilter,
@@ -138,6 +142,11 @@ extends AbstractBaseModel<
             relations                   : params.relations,
             hooks                       : params.hooks,
             id                          : params.id,
+            queryDefaults               : params.queryDefaults,
+            collation                   : params.collation,
+            maxTimeMS                   : params.maxTimeMS,
+            retry                       : params.retry,
+            audit                       : params.audit,
             idField                     : 'id',
             prefix,
             smartFilterOptions          :
@@ -533,6 +542,61 @@ extends AbstractBaseModel<
         });
     }
 
+    public async createManyFrom(
+        parentID: any,
+        itemsOrFromKey: unknown[] | string,
+        fromKeyOrItemsOrIdsOrOptions?: string | unknown[] | DTO['id'][] | ModelCreateOptions,
+        idsOrOptions?: DTO['id'][] | ModelCreateOptions,
+        options?: ModelCreateOptions
+    ): Promise<DTO['id'][]>
+    {
+        return this.runOperation( async() =>
+        {
+            const isFromKeyFirst = typeof itemsOrFromKey === 'string' && Array.isArray( fromKeyOrItemsOrIdsOrOptions );
+            const items = ( isFromKeyFirst ? fromKeyOrItemsOrIdsOrOptions : itemsOrFromKey ) as unknown[];
+            const { fromKey, explicitIds, resolvedOptions } = resolveCreateManyFromArgs<DTO['id']>(
+                this.converters.from as Record<string, unknown> | undefined,
+                isFromKeyFirst ? itemsOrFromKey : ( fromKeyOrItemsOrIdsOrOptions as string | DTO['id'][] | ModelCreateOptions | undefined ),
+                idsOrOptions,
+                options
+            );
+
+            const start = Date.now();
+            let dbeItems: Array<Omit<DBE, 'id'> & { id?: DBE['id'] }>;
+
+            try
+            {
+                dbeItems = await Promise.all(
+                    items.map( item => this._converters.convertFrom( item, fromKey ) as unknown as Promise<Omit<DBE, 'id'> & { id?: DBE['id'] }> )
+                );
+            }
+            catch( e )
+            {
+                this._emitError( e, 'createManyFrom', Date.now() - start,
+                {
+                    parentID,
+                    context : resolvedOptions?.context,
+                    traceID : resolvedOptions?.traceID
+                });
+
+                throw e;
+            }
+
+            const createdIds = await this.createMany( parentID, dbeItems, explicitIds ?? resolvedOptions, explicitIds ? resolvedOptions : undefined );
+
+            this._emitMutation( 'createManyFrom', Date.now() - start,
+            {
+                insertedCount   : createdIds.length,
+                ids             : createdIds,
+                parentID,
+                context         : resolvedOptions?.context,
+                traceID         : resolvedOptions?.traceID
+            });
+
+            return createdIds;
+        });
+    }
+
     public async createMany(
         parentID: any,
         items: Array<Omit<DBE, 'id'> & { id?: DBE['id'] }>,
@@ -879,7 +943,8 @@ extends AbstractBaseModel<
 
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
-        const documentBefore = options?.documentBefore ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options, includeDeleted ) : undefined;
+        const effectiveOptions = this._withAuditSnapshotOptions( options );
+        const documentBefore = effectiveOptions?.documentBefore ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, effectiveOptions, includeDeleted ) : undefined;
         let res: { matchedCount: number, modifiedCount: number };
 
         try
@@ -907,7 +972,7 @@ extends AbstractBaseModel<
 
         this._invalidateCache([ id ], res.matchedCount > 0 );
 
-        const documentAfter = options?.documentAfter ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options, includeDeleted ) : undefined;
+        const documentAfter = effectiveOptions?.documentAfter ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, effectiveOptions, includeDeleted ) : undefined;
 
         await this._runAfterHook( 'afterUpdate',
         {
@@ -938,7 +1003,12 @@ extends AbstractBaseModel<
 
         flowGet( 'log' ) && LOG({ res });
 
-        return { matchedRootCount: res.matchedCount, modifiedRootCount: res.modifiedCount, documentBefore, documentAfter };
+        return {
+            matchedRootCount    : res.matchedCount,
+            modifiedRootCount   : res.modifiedCount,
+            ...( options?.documentBefore ? { documentBefore } : {} ),
+            ...( options?.documentAfter ? { documentAfter } : {} )
+        };
     }
 
     async #fetchSubdocSnapshot(
@@ -970,7 +1040,7 @@ extends AbstractBaseModel<
         {
             docs = await this.collection.aggregate(
                 pipeline,
-                this._withSession({ collation: { locale: 'en' } }, options?.session )
+                this._buildAggregateOptions({ session: options?.session })
             ).toArray() as DBE[];
         }
         catch( e )
@@ -1042,7 +1112,7 @@ extends AbstractBaseModel<
         {
             docs = await this.collection.aggregate(
                 pipeline,
-                this._withSession({ collation: { locale: 'en' } }, findOptions.session )
+                this._buildAggregateOptions( findOptions )
             ).toArray() as Array<{ id: DBE['id'] }>;
         }
         catch( e )
@@ -2304,6 +2374,85 @@ extends AbstractBaseModel<
                 upsertedIds
             };
         });
+    }
+
+    public async backfill(
+        transform: ModelBackfillTransformFn<DBE, DBE>,
+        options?: PropertyModelBackfillOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>
+    ): Promise<ModelBackfillResult>
+    {
+        const dryRun = Boolean( options?.dryRun );
+        const stats: ModelBackfillResult =
+        {
+            batches     : 0,
+            scanned     : 0,
+            matched     : 0,
+            modified    : 0,
+            skipped     : 0,
+            dryRun
+        };
+        const { dryRun: _d, ordered, onProgress, ...forEachOpts } = options ?? {};
+
+        await this.forEachBatch(
+            {
+                ...forEachOpts,
+                as : 'dbe' as any
+            },
+            async( batch, meta ) =>
+            {
+                stats.batches = meta.batchIndex + 1;
+                stats.scanned += batch.length;
+
+                const ops: Array<PropertyModelBulkWriteOperation<RootDBE, DBE, DTO['id'], ExtractSmartFilters<Extensions>>> = [];
+
+                for( let i = 0; i < batch.length; i++ )
+                {
+                    const doc = batch[i] as unknown as DBE;
+                    const patch = await transform( doc, { ...meta, indexInBatch: i });
+
+                    if( !patch || typeof patch !== 'object' || Object.keys( patch ).length === 0 )
+                    {
+                        stats.skipped++;
+
+                        continue;
+                    }
+
+                    stats.matched++;
+                    ops.push({
+                        update :
+                        {
+                            id      : this.dtoID( doc.id ),
+                            update  : patch as Partial<DBE> | UpdateFilter<DBE>
+                        }
+                    });
+                }
+
+                if( ops.length > 0 )
+                {
+                    if( dryRun )
+                    {
+                        stats.modified += ops.length;
+                    }
+                    else
+                    {
+                        const res = await this.bulkWrite( ops,
+                        {
+                            ordered,
+                            access  : options?.access,
+                            context : options?.context,
+                            traceID : options?.traceID,
+                            session : options?.session
+                        });
+
+                        stats.modified += res.modifiedCount;
+                    }
+                }
+
+                await onProgress?.({ ...stats });
+            }
+        );
+
+        return stats;
     }
 
     async #filterStages(

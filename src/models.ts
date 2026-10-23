@@ -1,6 +1,6 @@
 import { ClientSession, MongoClient, WithTransactionCallback } from 'mongodb';
 import { ModelError } from './errors.js';
-import { createChangeStreamController } from './operations.js';
+import { ResolvedAuditConfig, ResolvedRetryConfig, createChangeStreamController, executeWithTransientRetry, resolveAuditConfig, resolveRetryConfig } from './operations.js';
 import
 {
     ModelEventEmitter,
@@ -38,8 +38,11 @@ import type
 {
     ModelChangeEvent,
     ModelChangeStream,
+    ModelQueryDefaultsConfig,
+    ModelRetryConfig,
     ModelSyncIndexesOptions,
     ModelSyncIndexesResult,
+    ModelTransactionOptions,
     ModelWatchOptions,
     ModelsHealthCheckResult,
     ModelsOptions,
@@ -82,6 +85,9 @@ type ModelInstance = AbstractBaseModel<any, any, any, any>;
 export class AbstractModels
 {
     protected client: MongoClient;
+    protected _queryDefaults?: ModelQueryDefaultsConfig;
+    protected _retry?: ResolvedRetryConfig;
+    protected _audit?: ResolvedAuditConfig<any>;
     #connectionString: string;
     #closed = false;
     #shutdownPromise?: Promise<void>;
@@ -102,11 +108,19 @@ export class AbstractModels
 
     protected constructor( connectionString: string, options: ModelsOptions = {})
     {
-        const { optimizer = true, observability, ...mongoOptions } = options;
+        const { optimizer = true, observability, queryDefaults, collation, maxTimeMS, retry, audit, ...mongoOptions } = options;
 
         this.#connectionString = connectionString;
         this.#optimizer = optimizer;
         this.#resolvedObservability = resolveObservabilityOptions( observability );
+        this._queryDefaults =
+        {
+            ...queryDefaults,
+            ...( collation !== undefined ? { collation } : {} ),
+            ...( maxTimeMS !== undefined ? { maxTimeMS } : {} )
+        };
+        this._retry = resolveRetryConfig( retry );
+        this._audit = resolveAuditConfig( audit );
 
         if( Clients.has( connectionString ) )
         {
@@ -431,44 +445,73 @@ export class AbstractModels
         this.#events.emit( event, payload );
     }
 
-    public async transaction<T = void>( fn: WithTransactionCallback<T> ): Promise<T>
+    public async withRetry<T>(
+        fn: ( attempt: number ) => Promise<T>,
+        options?: ModelRetryConfig
+    ): Promise<T>
     {
         const release = this.trackOperation();
 
         try
         {
-            const session = this.client.startSession();
-            const postCommitCallbacks = new Set<() => void | Promise<void>>();
+            return await executeWithTransientRetry( fn, options, this._retry );
+        }
+        finally
+        {
+            release();
+        }
+    }
 
-            try
+    public async transaction<T = void>(
+        fn: WithTransactionCallback<T>,
+        options?: ModelTransactionOptions
+    ): Promise<T>
+    {
+        const release = this.trackOperation();
+        const { retry, ...txOptions } = options ?? {};
+        const hasTxOptions = Object.keys( txOptions ).length > 0;
+        const effectiveRetry = retry !== undefined ? retry : ( this._retry ?? false );
+
+        try
+        {
+            return await executeWithTransientRetry( async() =>
             {
-                const result = await session.withTransaction( async( txSession ) =>
+                const session = this.client.startSession();
+                const postCommitCallbacks = new Set<() => void | Promise<void>>();
+
+                try
                 {
-                    const activeSession = txSession ?? session;
-
-                    postCommitCallbacks.clear();
-
-                    return await flowExecute(
-                        () => fn( activeSession ),
+                    const result = await session.withTransaction(
+                        async( txSession ) =>
                         {
-                            [TRANSACTION_SESSION_KEY]       : activeSession,
-                            [TRANSACTION_POST_COMMIT_KEY]   : postCommitCallbacks
+                            const activeSession = txSession ?? session;
+
+                            postCommitCallbacks.clear();
+
+                            return await flowExecute(
+                                () => fn( activeSession ),
+                                {
+                                    [TRANSACTION_SESSION_KEY]       : activeSession,
+                                    [TRANSACTION_POST_COMMIT_KEY]   : postCommitCallbacks
+                                },
+                                false
+                            );
                         },
-                        false
+                        ...( hasTxOptions ? [ txOptions ] : [] )
                     );
-                });
 
-                for( const callback of postCommitCallbacks )
-                {
-                    await callback();
+                    for( const callback of postCommitCallbacks )
+                    {
+                        await callback();
+                    }
+
+                    return result as T;
                 }
-
-                return result as T;
-            }
-            finally
-            {
-                await session.endSession();
-            }
+                finally
+                {
+                    await session.endSession();
+                }
+            }, effectiveRetry, this._retry );
         }
         finally
         {

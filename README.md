@@ -218,6 +218,22 @@ Configure `observability` on `AbstractModels`, `AbstractModel`, or `AbstractProp
   - Configure `id` in `defineModel` / `definePropertyModel` (or constructor extensions) using built-in strategies (`'objectId' | 'cryptoHex' | 'uuid' | 'ulid' | 'nanoid' | 'base62'`), custom `{ strategy, length, alphabet, prefix, maxRetries, verifyUniqueness, expectedCount, minEntropyBits, maxCollisionRisk }`, or a custom generator function `(ctx) => ...`.
   - Automatic collision retry: `create`, `createMany`, and `bulkWrite` guarantee intra-batch uniqueness, check existing parent subdocuments on `PropertyModel`, and automatically regenerate and retry auto-generated IDs on `E11000` `_id` / `id` collisions up to `maxRetries` (default `5`), throwing `ModelIdCollisionError` (`MODEL_ID_COLLISION`) if exhausted.
   - Birthday-paradox collision risk calculator: `estimateIdCollisionRisk(options)` and `model.idCollisionRisk(expectedCountOrOptions?)` return `{ entropyBits, alphabetSize, length, expectedCount, collisionProbability, maxCountForOneInBillion, maxCountForOneInMillion, maxCountForOneInThousand, riskLevel }`.
+- **Batch `createManyFrom` (`model.createManyFrom` & `propModel.createManyFrom`):**
+  - Converts an array of external payloads through `converters.from` (`default` or any named converter key) in parallel and inserts them in a single batched `createMany` call: `await model.createManyFrom(items, fromKey?, ids?, options?)` or `await model.createManyFrom(fromKey, items, ids?, options?)`.
+- **Configurable `collation`, `maxTimeMS`, `hint`, & `readPreference` (`queryDefaults`):**
+  - Configure `queryDefaults: { collation, maxTimeMS, hint, readPreference }` (or top-level `collation` / `maxTimeMS`) on `AbstractModels`, `defineModel`, or `definePropertyModel`, and override per call on `get`, `getMany`, `list`, `find`, `aggregate`, `exists`, `distinct`, and `explain`.
+  - Pass `collation: false` to disable the default `{ locale: 'en' }` collation (for binary index comparisons), a locale string shorthand like `collation: 'cs'`, or a full `CollationOptions` object.
+- **Transient Error & `WriteConflict` Retry with Exponential Backoff (`retry`, `withRetry`, `models.transaction`):**
+  - Configure `retry: true | maxAttempts | { maxAttempts?, baseDelayMs?, maxDelayMs?, jitter?, shouldRetry?, onRetry? }` on `AbstractModels` or individual models.
+  - Use `await model.withRetry(fn, options?)`, `await models.withRetry(fn, options?)`, or `await models.transaction(fn, { retry: true })` to automatically retry `WriteConflict` (`112`), `TransientTransactionError`, `UnknownTransactionCommitResult`, `PrimarySteppedDown`, and network reset errors with exponential backoff and jitter.
+- **Observability PII / Secret Redaction (`redactFields` & `redactReplacement`):**
+  - Configure `observability: { redactFields: true | ['password', 'ssn', 'apiKey'], redactReplacement: '[REDACTED]' }` to recursively mask sensitive keys across `pipeline`, `filter`, `smartFilter`, `update`, `query`, `context`, `documentBefore`, and `documentAfter` in `query`, `mutation`, `slowQuery`, and `error` events.
+- **Cursor-Paginated Batch Processor & Backfill Helper (`forEachBatch` & `backfill`):**
+  - `await model.forEachBatch(options?, async (batch, meta) => { ... })` iterates through large collections or subdocument arrays in cursor-paginated batches (`batchSize`, `maxBatches`, `maxItems`; return `false` to stop early) without holding a long-lived server cursor open.
+  - `await model.backfill(async (doc, meta) => patchOrNull, { batchSize?, dryRun?, onProgress? })` scans documents in batches and applies chunked `bulkWrite` updates, returning `{ batches, scanned, matched, modified, skipped, dryRun }`.
+- **Declarative Audit Trail (`audit`):**
+  - Configure `audit: true | 'audit_logs' | onAuditFn | { collection?, onAudit?, actions?, captureBefore?, captureAfter?, computeDiff?, redactFields?, redactReplacement? }` on `AbstractModels` or individual models.
+  - Automatically captures `before` and `after` snapshots on updates, computes field-level `changes` (`{ [field]: { before, after } }`) via `computeAuditDiff`, redacts sensitive fields, and dispatches `ModelAuditEntry` records to `onAudit` and/or a MongoDB audit collection.
 
 ### Helpers (selected)
 
