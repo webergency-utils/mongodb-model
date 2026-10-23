@@ -114,12 +114,18 @@ describe( 'operations', () =>
         expect( isFindOptionsObject({ filter: { name: 'a' } })).toBe( true );
         expect( isFindOptionsObject({ smartFilter: { search: 'a' } })).toBe( true );
         expect( isFindOptionsObject({ access: 'admin' })).toBe( true );
-        expect( isFindOptionsObject({ context: { user: 'u1' } })).toBe( true );
         expect( isFindOptionsObject({ traceID: 't-1', access: 'admin' })).toBe( true );
+        expect( isFindOptionsObject({ context: { user: 'u1' } })).toBe( false );
+        expect( isFindOptionsObject({ traceID: 't-1' })).toBe( false );
         expect( isFindOptionsObject({ access: 'admin', name: 'a' })).toBe( false );
         expect( isFindOptionsObject({ context: { user: 'u1' }, name: 'a' })).toBe( false );
         expect( isFindOptionsObject( new ObjectId() )).toBe( false );
 
+        expect( normalizeFindMatch({ traceID: 't-1', context: 'c-1' } as any )).toEqual(
+        {
+            filter : { traceID: 't-1', context: 'c-1' },
+            access : undefined
+        });
         expect( normalizeFindMatch({ filter: { x: 1 }, access: 'user' }, 'admin' )).toEqual(
         {
             filter      : { x: 1 },
@@ -150,15 +156,16 @@ describe( 'operations', () =>
         });
 
         expect( normalizeExistsOptions( undefined, '_id', id => id, 'admin' )).toEqual({ filter: {}, access: 'admin' });
-        expect( normalizeExistsOptions( '123', '_id', id => `dbe:${id}` )).toEqual({ filter: { _id: 'dbe:123' }, access: undefined });
+        expect( normalizeExistsOptions( '123', '_id', id => `dbe:${id}` )).toEqual({ filter: { _id: 'dbe:123' }, access: undefined, isPrimitiveId: true });
         expect( normalizeExistsOptions( '123', '_id', id => `dbe:${id}`, { access: 'admin', context: { op: 'check' }, traceID: 't-ex' } )).toEqual(
         {
-            filter  : { _id: 'dbe:123' },
-            access  : 'admin',
-            context : { op: 'check' },
-            traceID : 't-ex'
+            filter          : { _id: 'dbe:123' },
+            access          : 'admin',
+            context         : { op: 'check' },
+            traceID         : 't-ex',
+            isPrimitiveId   : true
         });
-        expect( normalizeExistsOptions( 42, 'id', id => id )).toEqual({ filter: { id: 42 }, access: undefined });
+        expect( normalizeExistsOptions( 42, 'id', id => id )).toEqual({ filter: { id: 42 }, access: undefined, isPrimitiveId: true });
         expect( normalizeExistsOptions({ filter: { active: true } }, '_id', id => id )).toEqual(
         {
             filter      : { active: true },

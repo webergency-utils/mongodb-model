@@ -763,6 +763,152 @@ describe( 'Observability query context, selective operations & internal pre-quer
             traceID     : 'tr-agg'
         });
 
+        // 6. PropertyModel.update with documentBefore & documentAfter emits internal: true pre-queries with parentOperation: 'update'
+        queries.length = 0;
+        mutations.length = 0;
+        await items.update( 'i1', { label: 'SnapChild' }, { documentBefore: true, documentAfter: true, context: { op: 'prop-snap' } });
+        expect( queries.filter( q => q.internal ) ).toHaveLength( 2 );
+        expect( queries[0] ).toMatchObject(
+        {
+            operation       : 'get',
+            internal        : true,
+            parentOperation : 'update',
+            context         : { op: 'prop-snap' },
+            query           : { ids: [ 'i1' ] }
+        });
+        expect( queries[1] ).toMatchObject(
+        {
+            operation       : 'get',
+            internal        : true,
+            parentOperation : 'update',
+            context         : { op: 'prop-snap' },
+            query           : { ids: [ 'i1' ] }
+        });
+
+        await models.shutdown();
+    });
+
+    test( 'supports exclusion-only operations maps, model-level observability: false suppression, raw traceID/context document filters, error metadata, and stream converter deduplication', async() =>
+    {
+        // 1. Exclusion-only object map: { internal: false, delete: false } keeps normal queries and non-delete mutations active
+        const queries: ModelQueryEvent[] = [];
+        const mutations: ModelMutationEvent[] = [];
+        const errors: ModelErrorEvent[] = [];
+
+        const models = new TestModels(
+        {
+            observability:
+            {
+                operations  : { internal: false, delete: false },
+                onQuery     : ( e ) => queries.push( e ),
+                onMutation  : ( e ) => mutations.push( e ),
+                onError     : ( e ) => errors.push( e )
+            }
+        });
+
+        const aggregate = vi.fn(() =>
+        ({
+            toArray: async() => [{ _id: 'u1', name: 'Ada', items: [{ id: 'i1', label: 'A' }] }]
+        }));
+        const updateOne = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const deleteMany = vi.fn( async() => ({ deletedCount: 1 }));
+        const deleteOne = vi.fn( async() => ({ deletedCount: 1 }));
+
+        const collection =
+        {
+            collectionName: 'users',
+            aggregate,
+            updateOne,
+            deleteMany,
+            deleteOne
+        };
+
+        const users = new UserModel( models, collection );
+        const items = new ItemModel( models, collection );
+
+        await users.find({ filter: { name: 'Ada' } });
+        expect( queries ).toHaveLength( 1 );
+
+        // Internal pre-queries during items.update with documentBefore are suppressed by { internal: false }
+        queries.length = 0;
+        await items.update( 'i1', { label: 'B' }, { documentBefore: true });
+        expect( queries ).toHaveLength( 0 );
+        expect( mutations ).toHaveLength( 1 );
+        expect( mutations[0].operation ).toBe( 'update' );
+
+        // Delete mutations are suppressed by { delete: false }
+        mutations.length = 0;
+        await users.delete( 'u1' );
+        expect( mutations ).toHaveLength( 0 );
+
+        // 2. Model with observability: false does not forward events to container models.on() listeners
+        const disabledCollection = { ...collection, collectionName: 'disabled_users' };
+        const disabledUsers = new UserModel( models, disabledCollection, { observability: false });
+        const containerQueries: ModelQueryEvent[] = [];
+        models.on( 'query', e => containerQueries.push( e ) );
+        await disabledUsers.find({ filter: { name: 'Ada' } });
+        expect( containerQueries ).toHaveLength( 0 );
+
+        // 3. Raw document filter on { traceID: 'doc-trace' } in deleteMany is preserved as a filter, not wiped to {}
+        await users.deleteMany({ traceID: 'doc-trace' } as any );
+        expect( deleteMany ).toHaveBeenCalledWith({ traceID: 'doc-trace' });
+
+        // 4. Error-path ModelErrorEvent carries query, filter, context, and traceID
+        aggregate.mockImplementationOnce(() =>
+        ({
+            toArray: async() => { throw new Error( 'find-boom' ) }
+        }));
+        await expect( users.find({ filter: { name: 'Ada' }, context: { step: 'err-find' }, traceID: 'tr-err' }) ).rejects.toThrow( 'find-boom' );
+        expect( errors ).toHaveLength( 1 );
+        expect( errors[0] ).toMatchObject(
+        {
+            operation   : 'find',
+            filter      : { name: 'Ada' },
+            query       : { filter: { name: 'Ada' } },
+            context     : { step: 'err-find' },
+            traceID     : 'tr-err'
+        });
+
+        // 5. Converter failure inside stream() emits exactly one error event (not duplicated by stream catch block)
+        errors.length = 0;
+
+        class FailingStreamModel extends AbstractModel<UserDBE, UserDTO, { converters: { dto: { converter: ( dbe: UserDBE ) => UserDTO }, broken: { converter: ( dbe: UserDBE ) => UserDTO } } }>
+        {
+            constructor()
+            {
+                super( models, collection as any,
+                {
+                    idField     : '_id',
+                    converters  :
+                    {
+                        dto     : { converter: ( dbe: UserDBE ) => ({ id: dbe._id, name: dbe.name }) },
+                        broken  : { converter: () => { throw new Error( 'conv-stream-fail' ) } }
+                    }
+                });
+            }
+        }
+
+        const failingStreamModel = new FailingStreamModel();
+        const streamColl = collection as any;
+        streamColl.aggregate = vi.fn(() =>
+        ({
+            async *[Symbol.asyncIterator]()
+            {
+                yield { _id: 'u1', name: 'Ada' };
+            }
+        }));
+
+        await expect( ( async() =>
+        {
+            for await( const _ of failingStreamModel.stream({ filter: { name: 'Ada' } }, 'broken' ) )
+            {
+                // consume
+            }
+        })() ).rejects.toThrow( 'MODEL_CONVERTER_ERROR' );
+
+        expect( errors ).toHaveLength( 1 );
+        expect( errors[0].operation ).toBe( 'convert:broken' );
+
         await models.shutdown();
     });
 });

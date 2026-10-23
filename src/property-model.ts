@@ -10,7 +10,7 @@ import
 from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { extractTargetIdsFromFilter } from './cache.js';
-import { ModelAccessDeniedError, ModelError } from './errors.js';
+import { ModelAccessDeniedError, ModelConverterError, ModelError } from './errors.js';
 import { ModelMutationOperation } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
@@ -572,7 +572,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         flowGet( 'log' ) && LOG({ match, operations, options: updateOptions });
 
-        const documentBefore = options?.documentBefore ? ( await this.get( id, { as: 'dbe' as any, context: options.context, traceID: options.traceID }) as DBE ) || undefined : undefined;
+        const documentBefore = options?.documentBefore ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options ) : undefined;
         const start = Date.now();
         let res: { matchedCount: number, modifiedCount: number };
 
@@ -601,7 +601,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         this._invalidateCache([ id ], res.matchedCount > 0 );
 
-        const documentAfter = options?.documentAfter ? ( await this.get( id, { as: 'dbe' as any, context: options.context, traceID: options.traceID }) as DBE ) || undefined : undefined;
+        const documentAfter = options?.documentAfter ? await this.#fetchSubdocSnapshot( id, dbeId, access, method, options ) : undefined;
 
         this._emitMutation( method, duration,
         {
@@ -617,6 +617,73 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         flowGet( 'log' ) && LOG({ res });
 
         return { matchedRootCount: res.matchedCount, modifiedRootCount: res.modifiedCount, documentBefore, documentAfter };
+    }
+
+    async #fetchSubdocSnapshot(
+        id: DBE['id'] | DTO['id'],
+        dbeId: DBE['id'],
+        access: { denied: boolean, filter?: Filter<any> },
+        method: 'update' | 'updateOne',
+        options?: ModelUpdateOptions
+    ): Promise<DBE | undefined>
+    {
+        const { projection } = this.converters.dbe;
+        let pipeline = await this.pipeline(
+        {
+            filter              : { id: dbeId } as any,
+            projection,
+            access              : options?.access,
+            [RESOLVED_ACCESS]   : access
+        } as any, 'dbe' as any, 'get' );
+
+        pipeline = this._optimizePipeline( pipeline );
+
+        const start = Date.now();
+        let docs: DBE[];
+
+        try
+        {
+            docs = await this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray() as DBE[];
+        }
+        catch( e )
+        {
+            this._emitError( e, method, Date.now() - start, () => (
+            {
+                filter  : { id: dbeId },
+                query   :
+                {
+                    ids : [ id ],
+                    ...( options?.access !== undefined ? { access: options.access } : {} )
+                },
+                ...( options?.context !== undefined ? { context: options.context } : {} ),
+                ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+            }));
+
+            throw e;
+        }
+
+        const duration = Date.now() - start;
+        const convStart = Date.now();
+        const converted = docs[0] ? await this._converters.convert( docs[0], 'dbe' ) as DBE : undefined;
+        const converterDuration = Date.now() - convStart;
+
+        this._emitQuery( 'get', pipeline, duration, () => (
+        {
+            converterDuration,
+            resultCount     : docs.length,
+            conversion      : 'dbe',
+            internal        : true,
+            parentOperation : method,
+            query           :
+            {
+                ids : [ id ],
+                ...( options?.access !== undefined ? { access: options.access } : {} )
+            },
+            ...( options?.context !== undefined ? { context: options.context } : {} ),
+            ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+        }), { internal: true, parentOperation: method });
+
+        return converted || undefined;
     }
 
     async #findMatchingSubdocIds(
@@ -1105,14 +1172,14 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             }
             catch( e )
             {
-                this._emitError( e, 'list', Date.now() - start,
+                this._emitError( e, 'list', Date.now() - start, () => (
                 {
                     ...( options.filter !== undefined ? { filter: options.filter } : {} ),
                     ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
                     query : this._buildListQueryContext( options, sort ),
                     ...( context !== undefined ? { context } : {} ),
                     ...( traceID !== undefined ? { traceID } : {} )
-                });
+                }));
 
                 throw e;
             }
@@ -1262,14 +1329,17 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             }
             catch( e )
             {
-                this._emitError( e, 'stream', Date.now() - start,
+                if( !( e instanceof ModelConverterError ) )
                 {
-                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this._buildListQueryContext( options, sort ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
-                });
+                    this._emitError( e, 'stream', Date.now() - start, () => (
+                    {
+                        ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                        ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
+                        query : this._buildListQueryContext( options, sort ),
+                        ...( context !== undefined ? { context } : {} ),
+                        ...( traceID !== undefined ? { traceID } : {} )
+                    }));
+                }
 
                 throw e;
             }

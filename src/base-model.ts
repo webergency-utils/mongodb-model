@@ -40,8 +40,6 @@ import
     Arr,
     DUMP,
     LOG_FILE,
-    isForeignObjectIdLike,
-    isLibraryObjectId,
     isSet,
     map,
     objectHash,
@@ -88,6 +86,7 @@ import { ComputedPropertiesParam } from './types/internal.js';
 
 type ObservabilityBatchEntry =
 {
+    ids         : Set<string>
     operation   : 'get' | 'getMany'
     access?     : string
     context?    : Record<string, unknown>
@@ -137,6 +136,7 @@ export abstract class AbstractBaseModel
     #findAggregator: Aggregator<any, DBE | null>;
     #pendingBatchMeta = new Map<string, ObservabilityBatchEntry[]>();
     #resolvedObservability: ObservabilityOptions | undefined | null = null;
+    #observabilityDisabled = false;
 
     public converters: Extensions['converters'];
 
@@ -168,13 +168,47 @@ export abstract class AbstractBaseModel
         this.#findAggregator = new Aggregator( async( ids: Array<any>, conversion: keyof Extensions['converters'], accessCtx?: { access?: string, scopeKey?: string, [RESOLVED_ACCESS]?: { denied: boolean, filter?: Filter<DBE> } } ) =>
         {
             const metaKey = this.#batchMetaKey( conversion, accessCtx?.access, accessCtx?.scopeKey );
-            const batchEntries = this.#pendingBatchMeta.get( metaKey ) ?? [];
+            const queue = this.#pendingBatchMeta.get( metaKey );
+            const batchEntries: ObservabilityBatchEntry[] = [];
 
-            this.#pendingBatchMeta.delete( metaKey );
+            if( queue && queue.length > 0 )
+            {
+                const requestedIdSet = new Set( ids.map( id => String( this.dtoID( id ))));
+
+                for( let i = 0; i < queue.length; i++ )
+                {
+                    const entry = queue[i];
+                    let matched = false;
+
+                    for( const reqId of requestedIdSet )
+                    {
+                        if( entry.ids.delete( reqId ) )
+                        {
+                            matched = true;
+                        }
+                    }
+
+                    if( matched )
+                    {
+                        batchEntries.push( entry );
+                    }
+
+                    if( entry.ids.size === 0 )
+                    {
+                        queue.splice( i, 1 );
+                        i--;
+                    }
+                }
+
+                if( queue.length === 0 )
+                {
+                    this.#pendingBatchMeta.delete( metaKey );
+                }
+            }
 
             const hasGet = batchEntries.some( e => e.operation === 'get' );
             const hasGetMany = batchEntries.some( e => e.operation === 'getMany' );
-            const obsOptions = this[GET_OBSERVABILITY_OPTIONS]();
+            const obsOptions = this[GET_OBSERVABILITY_OPTIONS]() ?? this._models[GET_OBSERVABILITY_OPTIONS]?.();
             let batchOperation: 'get' | 'getMany' = hasGetMany && !hasGet ? 'getMany' : 'get';
 
             if( hasGet && hasGetMany && !isOperationObserved( obsOptions, 'query', 'get' ) && isOperationObserved( obsOptions, 'query', 'getMany' ) )
@@ -254,7 +288,7 @@ export abstract class AbstractBaseModel
             }
             catch( e: any )
             {
-                this._emitError( e, batchOperation, Date.now() - start,
+                this._emitError( e, batchOperation, Date.now() - start, () => (
                 {
                     query :
                     {
@@ -262,7 +296,7 @@ export abstract class AbstractBaseModel
                         ...( accessCtx?.access !== undefined ? { access: accessCtx.access } : {} )
                     },
                     ...resolveBatchMeta()
-                });
+                }));
 
                 if( e instanceof ModelError )
                 {
@@ -281,13 +315,28 @@ export abstract class AbstractBaseModel
         return `${String( conversion )}:${scopeKey ?? ''}:${access ?? ''}`;
     }
 
+    #hasAnyObservabilityActive(): boolean
+    {
+        return Boolean(
+            this[GET_OBSERVABILITY_OPTIONS]()
+            || this._events.hasListeners()
+            || this._models[HAS_OBSERVABILITY_LISTENERS]?.()
+        );
+    }
+
     #enqueueBatchMeta(
         conversion: string | number | symbol,
         access: string | undefined,
         scopeKey: string | undefined,
-        entry: ObservabilityBatchEntry
-    ): void
+        rawIds: Array<any>,
+        entry: Omit<ObservabilityBatchEntry, 'ids'>
+    ): ObservabilityBatchEntry | undefined
     {
+        if( rawIds.length === 0 || !this.#hasAnyObservabilityActive() )
+        {
+            return undefined;
+        }
+
         const key = this.#batchMetaKey( conversion, access, scopeKey );
         let list = this.#pendingBatchMeta.get( key );
 
@@ -295,10 +344,44 @@ export abstract class AbstractBaseModel
         {
             list = [];
             this.#pendingBatchMeta.set( key, list );
-            process.nextTick(() => this.#pendingBatchMeta.delete( key ));
         }
 
-        list.push( entry );
+        const fullEntry: ObservabilityBatchEntry =
+        {
+            ...entry,
+            ids : new Set( rawIds.map( id => String( this.dtoID( id ))))
+        };
+
+        list.push( fullEntry );
+
+        return fullEntry;
+    }
+
+    #cleanupBatchMetaEntry(
+        conversion: string | number | symbol,
+        access: string | undefined,
+        scopeKey: string | undefined,
+        entry: ObservabilityBatchEntry | undefined
+    ): void
+    {
+        if( !entry ){ return }
+
+        const key = this.#batchMetaKey( conversion, access, scopeKey );
+        const list = this.#pendingBatchMeta.get( key );
+
+        if( !list ){ return }
+
+        const idx = list.indexOf( entry );
+
+        if( idx !== -1 )
+        {
+            list.splice( idx, 1 );
+        }
+
+        if( list.length === 0 )
+        {
+            this.#pendingBatchMeta.delete( key );
+        }
     }
 
     protected get _collectionLabel(): string
@@ -336,21 +419,34 @@ export abstract class AbstractBaseModel
             return this.#resolvedObservability;
         }
 
+        const selfDisabled = this._observability === false
+            || ( typeof this._observability === 'object' && this._observability.enabled === false );
+
         if( this._prefix )
         {
-            const parent = this._models[GET_PARENT]( this.collection.collectionName, this._prefix );
+            const parent = this._models[GET_PARENT]( this.collection.collectionName, this._prefix ) as AbstractBaseModel<any, any, any, any, any> | undefined;
             const parentOptions = typeof parent?.[GET_OBSERVABILITY_OPTIONS] === 'function'
                 ? parent[GET_OBSERVABILITY_OPTIONS]()
                 : this._models[GET_OBSERVABILITY_OPTIONS]();
 
             this.#resolvedObservability = resolveObservabilityOptions( this._observability, parentOptions );
+            this.#observabilityDisabled = selfDisabled
+                || ( this._observability === undefined && Boolean( parent && #observabilityDisabled in parent && parent.#observabilityDisabled ));
         }
         else
         {
             this.#resolvedObservability = resolveObservabilityOptions( this._observability, this._models[GET_OBSERVABILITY_OPTIONS]() );
+            this.#observabilityDisabled = selfDisabled;
         }
 
         return this.#resolvedObservability;
+    }
+
+    #dispatchOptions(): ObservabilityOptions | undefined
+    {
+        const options = this[GET_OBSERVABILITY_OPTIONS]();
+
+        return options ?? ( this.#observabilityDisabled ? { enabled: false } : undefined );
     }
 
     #hasOptionsConsumer( options: ObservabilityOptions | undefined, event: ModelEventName ): boolean
@@ -384,19 +480,28 @@ export abstract class AbstractBaseModel
     ): boolean
     {
         const options = this[GET_OBSERVABILITY_OPTIONS]();
-        const hasPrimaryListener = this._events.hasListeners( event )
-            || Boolean( this._models[HAS_OBSERVABILITY_LISTENERS]?.( event ))
-            || this.#hasOptionsConsumer( options, event );
+        const isDisabled = this.#observabilityDisabled;
+        const modelsOptions = this._models[GET_OBSERVABILITY_OPTIONS]?.();
+        const filterOptions = options ?? modelsOptions;
+        const hasLocalListener = this._events.hasListeners( event );
+        const hasContainerListener = !isDisabled
+            && Boolean( this._models[HAS_OBSERVABILITY_LISTENERS]?.( event ))
+            && modelsOptions?.enabled !== false;
+        const hasPrimaryListener = hasLocalListener || hasContainerListener || this.#hasOptionsConsumer( options, event );
 
-        if( hasPrimaryListener && isOperationObserved( options, event, operation, extra ) )
+        if( hasPrimaryListener && isOperationObserved( filterOptions, event, operation, extra ) )
         {
             return true;
         }
 
-        if( ( event === 'query' || event === 'mutation' ) && isSlowQueryObserved( options, duration ) )
+        const slowOptions = ( options && options.enabled !== false && options.slowQueryMs !== undefined )
+            ? options
+            : ( !isDisabled ? modelsOptions : undefined );
+
+        if( ( event === 'query' || event === 'mutation' ) && isSlowQueryObserved( slowOptions, duration ) )
         {
             return this._events.hasListeners( 'slowQuery' )
-                || Boolean( this._models[HAS_OBSERVABILITY_LISTENERS]?.( 'slowQuery' ))
+                || ( !isDisabled && Boolean( this._models[HAS_OBSERVABILITY_LISTENERS]?.( 'slowQuery' )))
                 || this.#hasOptionsConsumer( options, 'slowQuery' );
         }
 
@@ -450,7 +555,7 @@ export abstract class AbstractBaseModel
             },
             this._events,
             this._models,
-            this[GET_OBSERVABILITY_OPTIONS]()
+            this.#dispatchOptions()
         );
     }
 
@@ -479,7 +584,7 @@ export abstract class AbstractBaseModel
             },
             this._events,
             this._models,
-            this[GET_OBSERVABILITY_OPTIONS]()
+            this.#dispatchOptions()
         );
     }
 
@@ -506,7 +611,7 @@ export abstract class AbstractBaseModel
             },
             this._events,
             this._models,
-            this[GET_OBSERVABILITY_OPTIONS]()
+            this.#dispatchOptions()
         );
     }
 
@@ -515,12 +620,15 @@ export abstract class AbstractBaseModel
         operation?: string,
         duration?: number,
         extra?: Partial<Omit<ModelErrorEvent, 'collection' | 'model' | 'error' | 'operation' | 'duration'>>
+            | ( () => Partial<Omit<ModelErrorEvent, 'collection' | 'model' | 'error' | 'operation' | 'duration'>> )
     ): void
     {
         if( !this._shouldObserve( 'error', operation, duration ) )
         {
             return;
         }
+
+        const resolvedExtra = typeof extra === 'function' ? extra() : extra;
 
         dispatchObservabilityEvent(
             'error',
@@ -530,11 +638,11 @@ export abstract class AbstractBaseModel
                 error       : error instanceof Error ? error : new Error( String( error )),
                 operation,
                 duration,
-                ...extra
+                ...resolvedExtra
             },
             this._events,
             this._models,
-            this[GET_OBSERVABILITY_OPTIONS]()
+            this.#dispatchOptions()
         );
     }
 
@@ -702,13 +810,8 @@ export abstract class AbstractBaseModel
             }
 
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
-            const batchPromise = this.#findAggregator.execute(
-                Arr( idOrIds ),
-                conversion,
-                { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-            ) as unknown as Promise<Array<DBE | null>>;
-
-            this.#enqueueBatchMeta( conversion, options.access, scopeKey,
+            const rawIds = Arr( idOrIds );
+            const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, scopeKey, rawIds,
             {
                 operation   : 'get',
                 access      : options.access,
@@ -716,7 +819,20 @@ export abstract class AbstractBaseModel
                 traceID     : options.traceID
             });
 
-            const documents = await batchPromise;
+            let documents: Array<DBE | null>;
+
+            try
+            {
+                documents = await this.#findAggregator.execute(
+                    rawIds,
+                    conversion,
+                    { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
+                ) as unknown as Array<DBE | null>;
+            }
+            finally
+            {
+                this.#cleanupBatchMetaEntry( conversion, options.access, scopeKey, batchMetaEntry );
+            }
 
             benchmark?.step( 'QUERY' );
 
@@ -787,6 +903,7 @@ export abstract class AbstractBaseModel
             {
                 const results: Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null> = new Array( ids.length ).fill( null );
                 const missing: Array<{ index: number, id: any, dtoId: string, cacheKey: string }> = [];
+                const observeCache = this._shouldObserve( 'cache' );
 
                 for( let i = 0; i < ids.length; i++ )
                 {
@@ -798,38 +915,41 @@ export abstract class AbstractBaseModel
                     if( cached !== undefined )
                     {
                         results[i] = cached;
-                        this._emitCache( 'hit', () => (
+
+                        if( observeCache )
                         {
-                            key         : cacheKey,
-                            ids         : [ dtoId ],
-                            conversion  : String( conversion ),
-                            ...( options.context !== undefined ? { context: options.context } : {} ),
-                            ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                        }));
+                            this._emitCache( 'hit',
+                            {
+                                key         : cacheKey,
+                                ids         : [ dtoId ],
+                                conversion  : String( conversion ),
+                                ...( options.context !== undefined ? { context: options.context } : {} ),
+                                ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+                            });
+                        }
                     }
                     else
                     {
-                        this._emitCache( 'miss', () => (
+                        if( observeCache )
                         {
-                            key         : cacheKey,
-                            ids         : [ dtoId ],
-                            conversion  : String( conversion ),
-                            ...( options.context !== undefined ? { context: options.context } : {} ),
-                            ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                        }));
+                            this._emitCache( 'miss',
+                            {
+                                key         : cacheKey,
+                                ids         : [ dtoId ],
+                                conversion  : String( conversion ),
+                                ...( options.context !== undefined ? { context: options.context } : {} ),
+                                ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+                            });
+                        }
+
                         missing.push({ index: i, id, dtoId, cacheKey });
                     }
                 }
 
                 if( missing.length > 0 )
                 {
-                    const batchPromise = this.#findAggregator.execute(
-                        missing.map( m => m.id ),
-                        conversion,
-                        { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-                    ) as unknown as Promise<Array<DBE | null>>;
-
-                    this.#enqueueBatchMeta( conversion, options.access, scopeKey,
+                    const missingIds = missing.map( m => m.id );
+                    const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, scopeKey, missingIds,
                     {
                         operation   : 'getMany',
                         access      : options.access,
@@ -837,7 +957,20 @@ export abstract class AbstractBaseModel
                         traceID     : options.traceID
                     });
 
-                    const documents = await batchPromise;
+                    let documents: Array<DBE | null>;
+
+                    try
+                    {
+                        documents = await this.#findAggregator.execute(
+                            missingIds,
+                            conversion,
+                            { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
+                        ) as unknown as Array<DBE | null>;
+                    }
+                    finally
+                    {
+                        this.#cleanupBatchMetaEntry( conversion, options.access, scopeKey, batchMetaEntry );
+                    }
 
                     benchmark?.step( 'QUERY' );
 
@@ -855,14 +988,18 @@ export abstract class AbstractBaseModel
                         if( entry !== null )
                         {
                             this._cache.set( target.cacheKey, entry, [ target.dtoId ]);
-                            this._emitCache( 'set', () => (
+
+                            if( observeCache )
                             {
-                                key         : target.cacheKey,
-                                ids         : [ target.dtoId ],
-                                conversion  : String( conversion ),
-                                ...( options.context !== undefined ? { context: options.context } : {} ),
-                                ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                            }));
+                                this._emitCache( 'set',
+                                {
+                                    key         : target.cacheKey,
+                                    ids         : [ target.dtoId ],
+                                    conversion  : String( conversion ),
+                                    ...( options.context !== undefined ? { context: options.context } : {} ),
+                                    ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+                                });
+                            }
                         }
                     }
                 }
@@ -870,24 +1007,28 @@ export abstract class AbstractBaseModel
                 return options.filter ? results.filter( Boolean ) : results;
             }
 
-            const batchPromise = this.#findAggregator.execute(
-                ids,
-                conversion,
-                { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-            ) as unknown as Promise<Array<DBE | null>>;
-
-            if( ids.length > 0 )
+            const batchMetaEntry = this.#enqueueBatchMeta( conversion, options.access, scopeKey, ids,
             {
-                this.#enqueueBatchMeta( conversion, options.access, scopeKey,
-                {
-                    operation   : 'getMany',
-                    access      : options.access,
-                    context     : options.context,
-                    traceID     : options.traceID
-                });
-            }
+                operation   : 'getMany',
+                access      : options.access,
+                context     : options.context,
+                traceID     : options.traceID
+            });
 
-            const documents = await batchPromise;
+            let documents: Array<DBE | null>;
+
+            try
+            {
+                documents = await this.#findAggregator.execute(
+                    ids,
+                    conversion,
+                    { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
+                ) as unknown as Array<DBE | null>;
+            }
+            finally
+            {
+                this.#cleanupBatchMetaEntry( conversion, options.access, scopeKey, batchMetaEntry );
+            }
 
             benchmark?.step( 'QUERY' );
 
@@ -901,16 +1042,6 @@ export abstract class AbstractBaseModel
         {
             release();
         }
-    }
-
-    #hasQueryKeys( query: ModelQueryContext ): boolean
-    {
-        for( const _ in query )
-        {
-            return true;
-        }
-
-        return false;
     }
 
     protected _buildListQueryContext( options: any, sort?: Document ): ModelQueryContext
@@ -941,7 +1072,7 @@ export abstract class AbstractBaseModel
         if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
         if( options?.access !== undefined ){ query.access = options.access }
 
-        return this.#hasQueryKeys( query ) ? query : undefined;
+        return isSet( query ) ? query : undefined;
     }
 
     #buildAggregateQueryContext( options: any ): ModelQueryContext | undefined
@@ -950,7 +1081,7 @@ export abstract class AbstractBaseModel
 
         const query = this._buildListQueryContext( options, options.sort );
 
-        return this.#hasQueryKeys( query ) ? query : undefined;
+        return isSet( query ) ? query : undefined;
     }
 
     #buildExistsQueryContext( idOrFilter: unknown, isPrimitiveId: boolean, findOptions: any ): ModelQueryContext
@@ -1002,15 +1133,17 @@ export abstract class AbstractBaseModel
             }
             catch( e )
             {
-                const query = this.#buildFindQueryContext( options, sort );
-
-                this._emitError( e, 'find', Date.now() - start,
+                this._emitError( e, 'find', Date.now() - start, () =>
                 {
-                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter } : {} ),
-                    ...( query !== undefined ? { query } : {} ),
-                    ...( options.context !== undefined ? { context: options.context } : {} ),
-                    ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    const query = this.#buildFindQueryContext( options, sort );
+
+                    return {
+                        ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                        ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter } : {} ),
+                        ...( query !== undefined ? { query } : {} ),
+                        ...( options.context !== undefined ? { context: options.context } : {} ),
+                        ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    };
                 });
 
                 throw e;
@@ -1091,15 +1224,17 @@ export abstract class AbstractBaseModel
             }
             catch( e )
             {
-                const query = this.#buildAggregateQueryContext( pipelineOptions );
-
-                this._emitError( e, operation, Date.now() - start,
+                this._emitError( e, operation, Date.now() - start, () =>
                 {
-                    ...( pipelineOptions.filter !== undefined ? { filter: pipelineOptions.filter } : {} ),
-                    ...( pipelineOptions.smartFilter !== undefined ? { smartFilter: pipelineOptions.smartFilter } : {} ),
-                    ...( query !== undefined ? { query } : {} ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
+                    const query = this.#buildAggregateQueryContext( pipelineOptions );
+
+                    return {
+                        ...( pipelineOptions.filter !== undefined ? { filter: pipelineOptions.filter } : {} ),
+                        ...( pipelineOptions.smartFilter !== undefined ? { smartFilter: pipelineOptions.smartFilter } : {} ),
+                        ...( query !== undefined ? { query } : {} ),
+                        ...( context !== undefined ? { context } : {} ),
+                        ...( traceID !== undefined ? { traceID } : {} )
+                    };
                 });
 
                 throw e;
@@ -1168,10 +1303,6 @@ export abstract class AbstractBaseModel
     {
         return this.runOperation( async() =>
         {
-            const isPrimitiveId = idOrFilter !== undefined
-                && idOrFilter !== null
-                && ( typeof idOrFilter === 'string' || typeof idOrFilter === 'number' || isLibraryObjectId( idOrFilter ) || isForeignObjectIdLike( idOrFilter ) );
-
             const findOptions = normalizeExistsOptions<any, any>(
                 idOrFilter,
                 this._idField,
@@ -1204,14 +1335,14 @@ export abstract class AbstractBaseModel
             }
             catch( e )
             {
-                this._emitError( e, 'exists', Date.now() - start,
+                this._emitError( e, 'exists', Date.now() - start, () => (
                 {
                     filter : findOptions.filter,
                     ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter } : {} ),
-                    query  : this.#buildExistsQueryContext( idOrFilter, isPrimitiveId, findOptions ),
+                    query  : this.#buildExistsQueryContext( idOrFilter, Boolean( findOptions.isPrimitiveId ), findOptions ),
                     ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
                     ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
-                });
+                }));
 
                 throw e;
             }
@@ -1221,7 +1352,7 @@ export abstract class AbstractBaseModel
             this._emitQuery( 'exists', pipeline, duration, () => (
             {
                 resultCount : res.length,
-                query       : this.#buildExistsQueryContext( idOrFilter, isPrimitiveId, findOptions ),
+                query       : this.#buildExistsQueryContext( idOrFilter, Boolean( findOptions.isPrimitiveId ), findOptions ),
                 ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
                 ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
             }));

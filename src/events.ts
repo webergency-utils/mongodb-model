@@ -243,6 +243,22 @@ export function compileOperationFilter(
     }
 
     const entries = Object.entries( operations );
+    let hasPositiveQueryOrMutation = false;
+
+    for( const [ token, enabled ] of entries )
+    {
+        if( enabled === true && ( token === 'query' || token === 'mutation' || token === 'create' || token === 'update' || token === 'delete' || QUERY_OP_SET.has( token ) || MUTATION_OP_SET.has( token ) ) )
+        {
+            hasPositiveQueryOrMutation = true;
+            break;
+        }
+    }
+
+    if( !hasPositiveQueryOrMutation )
+    {
+        for( const op of ALL_QUERY_OPS ){ state.queryOps.add( op ) }
+        for( const op of ALL_MUTATION_OPS ){ state.mutationOps.add( op ) }
+    }
 
     for( const [ token, enabled ] of entries )
     {
@@ -541,8 +557,13 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
         ? { internal: ( payload as ModelQueryEvent ).internal, parentOperation: ( payload as ModelQueryEvent ).parentOperation }
         : undefined;
     const duration = ( payload as { duration?: number } ).duration;
-    const primaryObserved = isOperationObserved( options, event, operation, extra );
-    const slowObserved = ( event === 'query' || event === 'mutation' ) && isSlowQueryObserved( options, duration );
+    const isEnabled = options?.enabled !== false;
+    const activeOptions = isEnabled ? options : undefined;
+    const modelsOptions = models[GET_OBSERVABILITY_OPTIONS]?.();
+    const filterOptions = activeOptions ?? modelsOptions;
+    const primaryObserved = isOperationObserved( filterOptions, event, operation, extra );
+    const slowOptions = ( activeOptions && activeOptions.slowQueryMs !== undefined ) ? activeOptions : modelsOptions;
+    const slowObserved = ( event === 'query' || event === 'mutation' ) && isSlowQueryObserved( slowOptions, duration );
 
     if( !primaryObserved && !slowObserved )
     {
@@ -550,7 +571,7 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
     }
 
     const traceID = payload.traceID ?? ( flowGet( 'traceID' ) as string | undefined );
-    const context = resolveObservabilityContext( options?.context, payload.context );
+    const context = resolveObservabilityContext( filterOptions?.context, payload.context );
 
     let enriched = payload;
 
@@ -564,15 +585,19 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
         };
     }
 
-    const fnLogger = options && options.enabled !== false && typeof options.logger === 'function' ? options.logger : undefined;
-    const objLogger = options && options.enabled !== false && typeof options.logger === 'object' && options.logger !== null ? options.logger : undefined;
+    const fnLogger = activeOptions && typeof activeOptions.logger === 'function' ? activeOptions.logger : undefined;
+    const objLogger = activeOptions && typeof activeOptions.logger === 'object' && activeOptions.logger !== null ? activeOptions.logger : undefined;
 
     if( primaryObserved )
     {
         localEmitter.emit( event, enriched );
-        models[EMIT_OBSERVABILITY_EVENT]?.( event, enriched );
 
-        if( options && options.enabled !== false )
+        if( isEnabled && modelsOptions?.enabled !== false )
+        {
+            models[EMIT_OBSERVABILITY_EVENT]?.( event, enriched );
+        }
+
+        if( activeOptions )
         {
             if( fnLogger )
             {
@@ -583,52 +608,60 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
             {
                 const queryEvent = enriched as ModelQueryEvent;
 
-                safeCall( options.onQuery, queryEvent );
+                safeCall( activeOptions.onQuery, queryEvent );
                 objLogger?.info?.( `MongoDB query ${queryEvent.collection}.${queryEvent.operation} (${queryEvent.duration}ms)`, queryEvent as unknown as Record<string, unknown> );
             }
             else if( event === 'mutation' )
             {
                 const mutationEvent = enriched as ModelMutationEvent;
 
-                safeCall( options.onMutation, mutationEvent );
+                safeCall( activeOptions.onMutation, mutationEvent );
                 objLogger?.info?.( `MongoDB mutation ${mutationEvent.collection}.${mutationEvent.operation} (${mutationEvent.duration}ms)`, mutationEvent as unknown as Record<string, unknown> );
             }
             else if( event === 'cache' )
             {
                 const cacheEvent = enriched as ModelCacheEvent;
 
-                safeCall( options.onCache, cacheEvent );
+                safeCall( activeOptions.onCache, cacheEvent );
                 objLogger?.debug?.( `MongoDB cache ${cacheEvent.collection}.${cacheEvent.operation}`, cacheEvent as unknown as Record<string, unknown> );
             }
             else if( event === 'error' )
             {
                 const errorEvent = enriched as ModelErrorEvent;
 
-                safeCall( options.onError, errorEvent );
+                safeCall( activeOptions.onError, errorEvent );
                 objLogger?.error?.( `MongoDB error in ${errorEvent.collection}${errorEvent.operation ? '.' + errorEvent.operation : ''}: ${errorEvent.error.message}`, errorEvent as unknown as Record<string, unknown> );
             }
         }
     }
 
-    if( slowObserved && options && options.enabled !== false && options.slowQueryMs !== undefined )
+    if( slowObserved && slowOptions && slowOptions.enabled !== false && slowOptions.slowQueryMs !== undefined )
     {
         const timed = enriched as ModelQueryEvent | ModelMutationEvent;
         const slowPayload: ModelSlowQueryEvent =
         {
             ...timed,
-            thresholdMs : options.slowQueryMs
+            thresholdMs : slowOptions.slowQueryMs
         };
 
         localEmitter.emit( 'slowQuery', slowPayload );
-        models[EMIT_OBSERVABILITY_EVENT]?.( 'slowQuery', slowPayload );
-        safeCall( options.onSlowQuery, slowPayload );
 
-        if( fnLogger )
+        if( isEnabled && modelsOptions?.enabled !== false )
         {
-            safeCall( fnLogger, { ...slowPayload, type: 'slowQuery' } as ModelEventsMap[ModelEventName] & { type: ModelEventName } );
+            models[EMIT_OBSERVABILITY_EVENT]?.( 'slowQuery', slowPayload );
         }
 
-        objLogger?.warn?.( `Slow MongoDB ${event} ${timed.collection}.${timed.operation} (${timed.duration}ms >= ${options.slowQueryMs}ms)`, slowPayload as unknown as Record<string, unknown> );
+        if( activeOptions )
+        {
+            safeCall( activeOptions.onSlowQuery, slowPayload );
+
+            if( fnLogger )
+            {
+                safeCall( fnLogger, { ...slowPayload, type: 'slowQuery' } as ModelEventsMap[ModelEventName] & { type: ModelEventName } );
+            }
+
+            objLogger?.warn?.( `Slow MongoDB ${event} ${timed.collection}.${timed.operation} (${timed.duration}ms >= ${slowOptions.slowQueryMs}ms)`, slowPayload as unknown as Record<string, unknown> );
+        }
     }
 }
 

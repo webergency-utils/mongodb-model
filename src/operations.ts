@@ -98,7 +98,7 @@ export function isFindOptionsObject( match: unknown ): match is { filter?: unkno
         && (
             'filter' in match
             || 'smartFilter' in match
-            || (( 'access' in match || 'context' in match || 'traceID' in match ) && Object.keys( match ).every( k => FIND_OPTION_KEYS.has( k ) ))
+            || ( 'access' in match && Object.keys( match ).every( k => FIND_OPTION_KEYS.has( k ) ))
         )
     );
 }
@@ -139,7 +139,7 @@ export function normalizeExistsOptions<FilterType = Record<string, any>, SmartFi
     idKey: '_id' | 'id',
     dbeID: ( id: any ) => any,
     optionsOrAccess?: string | { access?: string, context?: Record<string, unknown>, traceID?: string }
-): { filter: FilterType, smartFilter?: SmartFilterType, access?: string, context?: Record<string, unknown>, traceID?: string }
+): { filter: FilterType, smartFilter?: SmartFilterType, access?: string, context?: Record<string, unknown>, traceID?: string, isPrimitiveId?: boolean }
 {
     if( idOrFilter === undefined || idOrFilter === null )
     {
@@ -153,10 +153,13 @@ export function normalizeExistsOptions<FilterType = Record<string, any>, SmartFi
         || isForeignObjectIdLike( idOrFilter )
     )
     {
-        return normalizeFindMatch<FilterType, SmartFilterType>(
-            { [idKey]: dbeID( idOrFilter ) } as unknown as FilterType,
-            optionsOrAccess
-        );
+        return {
+            ...normalizeFindMatch<FilterType, SmartFilterType>(
+                { [idKey]: dbeID( idOrFilter ) } as unknown as FilterType,
+                optionsOrAccess
+            ),
+            isPrimitiveId : true
+        };
     }
 
     return normalizeFindMatch<FilterType, SmartFilterType>( idOrFilter as any, optionsOrAccess );

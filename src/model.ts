@@ -10,7 +10,7 @@ import
 from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { ModelCacheConfig, extractTargetIdsFromFilter } from './cache.js';
-import { ModelAccessDeniedError } from './errors.js';
+import { ModelAccessDeniedError, ModelConverterError } from './errors.js';
 import { ModelMutationOperation, ObservabilityConfig } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
@@ -1066,14 +1066,14 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             }
             catch( e )
             {
-                this._emitError( e, 'list', Date.now() - start,
+                this._emitError( e, 'list', Date.now() - start, () => (
                 {
                     ...( options.filter !== undefined ? { filter: options.filter } : {} ),
                     ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
                     query : this._buildListQueryContext( options, sort ),
                     ...( context !== undefined ? { context } : {} ),
                     ...( traceID !== undefined ? { traceID } : {} )
-                });
+                }));
 
                 throw e;
             }
@@ -1244,14 +1244,17 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             }
             catch( e )
             {
-                this._emitError( e, 'stream', Date.now() - start,
+                if( !( e instanceof ModelConverterError ) )
                 {
-                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this._buildListQueryContext( options, sort ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
-                });
+                    this._emitError( e, 'stream', Date.now() - start, () => (
+                    {
+                        ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                        ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
+                        query : this._buildListQueryContext( options, sort ),
+                        ...( context !== undefined ? { context } : {} ),
+                        ...( traceID !== undefined ? { traceID } : {} )
+                    }));
+                }
 
                 throw e;
             }
