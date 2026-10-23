@@ -203,4 +203,20 @@ describe( 'mongo helper coverage gaps', () =>
 
         expect( Object.keys( res )).toEqual([ 'id' ]);
     });
+
+    test( 'getUsedFields extracts fields from $match when top-level condition contains unknown $ operators', () =>
+    {
+        const res = getUsedFields(
+        [
+            {
+                $match:
+                {
+                    status      : 'active',
+                    $unknownOp  : []
+                }
+            }
+        ]);
+
+        expect( res.used ).toEqual([ 'status' ]);
+    });
 });
