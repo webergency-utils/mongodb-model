@@ -229,4 +229,53 @@ describe( 'AbstractPropertyModel remaining ops', () =>
         expect( result.cursors.prev ).toBeDefined();
         expect( result.cursors.next ).toBeDefined();
     });
+
+    test( 'updateMany and deleteMany with non-ID filter invalidate resolved targetIds in cache and emit them in mutation events (R8)', async() =>
+    {
+        const aggregate = vi.fn(() => ({ toArray: async() => [{ id: 'sub1', orgId: 'o', label: 'old' }] }));
+        const updateMany = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+
+        class CachedItemModel extends AbstractPropertyModel<RootDBE, ItemDBE, ItemDTO, any>
+        {
+            constructor( models: AbstractModels, c: any )
+            {
+                super( models, c, 'items[]',
+                {
+                    cache       : true,
+                    converters  :
+                    {
+                        dto : { converter: ( dbe: ItemDBE ) => ({ id: dbe.id, orgId: dbe.orgId, label: dbe.label }) },
+                        dbe : { converter: ( dbe: ItemDBE ) => dbe }
+                    }
+                });
+            }
+        }
+
+        const model = new CachedItemModel( new TestModels(), { collectionName: 'roots', aggregate, updateMany });
+        const mutationSpy = vi.fn();
+        const cacheSpy = vi.fn();
+
+        model.on( 'mutation', mutationSpy );
+        model.on( 'cache', cacheSpy );
+
+        // Populate cache for sub1
+        await model.get( 'sub1' );
+        expect( cacheSpy ).toHaveBeenCalledWith( expect.objectContaining({ operation: 'set', ids: [ 'sub1' ] }));
+
+        cacheSpy.mockClear();
+
+        // Mutate using non-ID filter
+        await model.updateMany({ label: 'old' }, { label: 'new' });
+
+        expect( mutationSpy ).toHaveBeenCalledWith( expect.objectContaining(
+        {
+            operation   : 'updateMany',
+            ids         : [ 'sub1' ]
+        }));
+        expect( cacheSpy ).toHaveBeenCalledWith( expect.objectContaining(
+        {
+            operation   : 'invalidate',
+            ids         : [ 'sub1' ]
+        }));
+    });
 });

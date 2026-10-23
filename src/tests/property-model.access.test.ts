@@ -121,4 +121,46 @@ describe( 'AbstractPropertyModel named access', () =>
         expect( serialized ).toContain( '"items.id":{"$exists":false}' );
         expect( serialized ).toContain( '"_id":{"$exists":false}' );
     });
+
+    test( 'update, updateMany, and delete verify subdocument ID against accessFilter so inaccessible sibling subdocuments are not mutated (AE2, R7)', async() =>
+    {
+        const aggregate = vi.fn(() => ({ toArray: async() => [] }));
+        const updateOne = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+        const updateMany = vi.fn( async() => ({ matchedCount: 1, modifiedCount: 1 }));
+
+        class ItemModel extends AbstractPropertyModel<RootDBE, ItemDBE, ItemDTO, any>
+        {
+            constructor( models: AbstractModels, collection: any )
+            {
+                super( models, collection, 'items[]',
+                {
+                    converters:
+                    {
+                        dto : { converter: ( dbe: ItemDBE ) => ({ id: dbe.id, orgId: dbe.orgId, label: dbe.label }) },
+                        dbe : { converter: ( dbe: ItemDBE ) => dbe }
+                    },
+                    access:
+                    {
+                        filters  : { aliceOnly: async() => ({ orgId: 'alice' }) },
+                        defaults : { update: 'aliceOnly', delete: 'aliceOnly' }
+                    }
+                });
+            }
+        }
+
+        const models = new TestModels();
+        const model = new ItemModel( models, { collectionName: 'roots', aggregate, updateOne, updateMany });
+
+        const updateRes = await model.update( 'subBob', { label: 'hacked' });
+        expect( updateRes ).toEqual({ matchedRootCount: 0, modifiedRootCount: 0 });
+        expect( updateOne ).not.toHaveBeenCalled();
+
+        const updateManyRes = await model.updateMany([ 'subBob' ], { label: 'hacked' });
+        expect( updateManyRes ).toEqual({ matchedRootCount: 0, modifiedRootCount: 0 });
+        expect( updateMany ).not.toHaveBeenCalled();
+
+        const deleteRes = await model.delete( 'subBob' );
+        expect( deleteRes ).toBe( false );
+        expect( updateOne ).not.toHaveBeenCalled();
+    });
 });

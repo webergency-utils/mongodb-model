@@ -432,6 +432,17 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
         });
     }
 
+    #hasEffectiveSubdocAccessFilter( accessFilter?: Filter<any> ): boolean
+    {
+        if( !accessFilter ){ return false }
+
+        const keys = Object.keys( accessFilter );
+
+        if( keys.length === 0 ){ return false }
+
+        return !keys.every( k => k === '_root' || k.startsWith( '_root.' ) );
+    }
+
     public async update( id: DTO['id'] | DBE['id'], update: Partial<DBE> | UpdateFilter<DBE>, options?: ModelUpdateOptions ): Promise<PropertyModelUpdateResponse<DBE>>
     {
         const release = this.trackOperation();
@@ -444,6 +455,19 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
             if( access.denied )
             {
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
+            }
+
+            if( this.#hasEffectiveSubdocAccessFilter( access.filter ) )
+            {
+                const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: this.dbeID( id ) } as any, access: options?.access }, access.filter, 1 );
+
+                if( matchedIds.length === 0 )
+                {
+                    this._invalidateCache([ id ]);
+                    this._emitMutation( 'update', 0, { matchedCount: 0, modifiedCount: 0, ids: [ id ] });
+
+                    return { matchedRootCount: 0, modifiedRootCount: 0 };
+                }
             }
 
             const { updatePrefix, arrayFilters } = propertyModelTargetUpdateParams( this.#paths, this.dbeID( id ));
@@ -521,20 +545,38 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
         accessFilter?: Filter<any>
     ): Promise<{ targetIds: Array<DBE['id'] | DTO['id']>, cacheIdsToInvalidate: Array<DBE['id'] | DTO['id']> | null }>
     {
+        const hasSubdocAccess = this.#hasEffectiveSubdocAccessFilter( accessFilter );
+
         if( Array.isArray( idsOrFilter ) )
         {
+            if( hasSubdocAccess && idsOrFilter.length > 0 )
+            {
+                const dbeIds = idsOrFilter.map( id => this.dbeID( id ));
+                const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: { $in: dbeIds } } as any }, accessFilter );
+
+                return { targetIds: matchedIds, cacheIdsToInvalidate: idsOrFilter };
+            }
+
             return { targetIds: idsOrFilter, cacheIdsToInvalidate: idsOrFilter };
         }
 
         const extracted = extractTargetIdsFromFilter( idsOrFilter, 'id', id => String( this.dtoID( id )));
         const filterKeys = Object.keys( findOptions!.filter ?? {});
-        const isOnlyIdFilter = Boolean( extracted && !findOptions!.smartFilter && filterKeys.every( k => k === 'id' ));
+        const isOnlyIdFilter = Boolean( extracted.length > 0 && !findOptions!.smartFilter && filterKeys.every( k => k === 'id' ));
+
+        if( isOnlyIdFilter && !hasSubdocAccess )
+        {
+            return {
+                cacheIdsToInvalidate    : extracted,
+                targetIds               : extracted
+            };
+        }
+
+        const matchedIds = await this.#findMatchingSubdocIds( findOptions!, accessFilter );
 
         return {
-            cacheIdsToInvalidate    : extracted,
-            targetIds               : isOnlyIdFilter
-                ? extracted!
-                : await this.#findMatchingSubdocIds( findOptions!, accessFilter )
+            cacheIdsToInvalidate    : extracted.length > 0 ? extracted : matchedIds,
+            targetIds               : matchedIds
         };
     }
 
@@ -1001,6 +1043,25 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE>
             if( access.denied )
             {
                 return false;
+            }
+
+            if( this.#hasEffectiveSubdocAccessFilter( access.filter ) )
+            {
+                const matchedIds = await this.#findMatchingSubdocIds({ filter: { id: this.dbeID( id ) } as any, access: options?.access }, access.filter, 1 );
+
+                if( matchedIds.length === 0 )
+                {
+                    this._invalidateCache([ id ]);
+                    this._emitMutation( 'delete', 0,
+                    {
+                        matchedCount    : 0,
+                        modifiedCount   : 0,
+                        deletedCount    : 0,
+                        ids             : [ id ]
+                    });
+
+                    return false;
+                }
             }
 
             const path = this.#paths.map( p => p.path ).join( '.' ) + '.id';

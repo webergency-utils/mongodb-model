@@ -134,7 +134,7 @@ describe( 'AbstractPropertyModel coverage branches', () =>
         }
 
         const models = new TestModels();
-        const model = new AppModel( models, { collectionName: 'roots', updateMany, aggregate: vi.fn() });
+        const model = new AppModel( models, { collectionName: 'roots', updateMany, aggregate: vi.fn(() => ({ toArray: async() => [{ id: 'a1' }] })) });
 
         await model.updateMany([ 'a1' ], { status: 'ok' });
 
