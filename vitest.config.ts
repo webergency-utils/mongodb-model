@@ -25,6 +25,7 @@ export default defineConfig(
                 'src/tests/**',
                 'src/types/**',
                 'src/index.ts',
+                'src/helpers/index.ts',
                 'src/symbols.ts'
             ],
             reporter    : [ 'text', 'text-summary', 'html', 'lcov' ],

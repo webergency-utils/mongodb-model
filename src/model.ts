@@ -154,8 +154,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     insertedCount   : 1,
                     ids             : [ _id ],
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    context         : options?.context,
+                    traceID         : options?.traceID
                 });
             }
             catch( e: any )
@@ -173,9 +173,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     {
                         this._emitError( findErr, 'create', Date.now() - start,
                         {
-                            filter : e.keyValue,
-                            ...( options?.context !== undefined ? { context: options.context } : {} ),
-                            ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                            filter  : e.keyValue,
+                            context : options.context,
+                            traceID : options.traceID
                         });
 
                         throw findErr;
@@ -189,8 +189,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         internal        : true,
                         parentOperation : 'create',
                         query           : { filter: e.keyValue },
-                        ...( options?.context !== undefined ? { context: options.context } : {} ),
-                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        context         : options.context,
+                        traceID         : options.traceID
                     }), { internal: true, parentOperation: 'create' });
 
                     const existingId = this.dtoID( existingDoc?._id );
@@ -199,8 +199,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     {
                         insertedCount   : 0,
                         ids             : [ existingId ],
-                        ...( options?.context !== undefined ? { context: options.context } : {} ),
-                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        context         : options.context,
+                        traceID         : options.traceID
                     });
 
                     return existingId;
@@ -208,8 +208,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
                 this._emitError( e, 'create', Date.now() - start,
                 {
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    context : options?.context,
+                    traceID : options?.traceID
                 });
 
                 throw e;
@@ -246,8 +246,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._emitError( e, 'createFrom', Date.now() - start,
                 {
-                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                    context : resolvedOptions?.context,
+                    traceID : resolvedOptions?.traceID
                 });
 
                 throw e;
@@ -260,8 +260,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 insertedCount   : 1,
                 ids             : [ createdId ],
-                ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                context         : resolvedOptions?.context,
+                traceID         : resolvedOptions?.traceID
             });
 
             return createdId;
@@ -292,8 +292,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     insertedCount   : 0,
                     ids             : [],
-                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                    context         : resolvedOptions?.context,
+                    traceID         : resolvedOptions?.traceID
                 });
 
                 return [];
@@ -322,8 +322,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     insertedCount   : docs.length,
                     ids,
-                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                    context         : resolvedOptions?.context,
+                    traceID         : resolvedOptions?.traceID
                 });
 
                 return ids;
@@ -332,8 +332,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._emitError( e, 'createMany', Date.now() - start,
                 {
-                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                    context : resolvedOptions?.context,
+                    traceID : resolvedOptions?.traceID
                 });
 
                 throw e;
@@ -370,8 +370,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         modifiedCount   : snapshot.modifiedCount,
                         ids             : [ id ],
                         filter          : match,
-                        ...( options?.context !== undefined ? { context: options.context } : {} ),
-                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        context         : options.context,
+                        traceID         : options.traceID
                     });
 
                     return {
@@ -391,8 +391,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     modifiedCount   : res.modifiedCount,
                     ids             : [ id ],
                     filter          : match,
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    context         : options?.context,
+                    traceID         : options?.traceID
                 });
 
                 return {
@@ -404,9 +404,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._emitError( e, 'update', Date.now() - start,
                 {
-                    filter : match,
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    filter  : match,
+                    context : options?.context,
+                    traceID : options?.traceID
                 });
 
                 throw e;
@@ -438,8 +438,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 internal        : true,
                 parentOperation,
                 query           : { filter: match },
-                ...( options.context !== undefined ? { context: options.context } : {} ),
-                ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+                context         : options.context,
+                traceID         : options.traceID
             }), { internal: true, parentOperation });
 
             if( !beforeDoc )
@@ -535,17 +535,11 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._emitError( e, method, Date.now() - preStart,
                 {
-                    filter : rawFilter,
-                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                    query  :
-                    {
-                        filter : rawFilter,
-                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                        ...( limit !== undefined ? { limit } : {} ),
-                        ...( access !== undefined ? { access } : {} )
-                    },
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
+                    filter      : rawFilter,
+                    smartFilter,
+                    query       : { filter: rawFilter, smartFilter, limit, access },
+                    context,
+                    traceID
                 });
 
                 throw e;
@@ -558,15 +552,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 resultCount     : docs.length,
                 internal        : true,
                 parentOperation : method,
-                query           :
-                {
-                    filter : rawFilter,
-                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                    ...( limit !== undefined ? { limit } : {} ),
-                    ...( access !== undefined ? { access } : {} )
-                },
-                ...( context !== undefined ? { context } : {} ),
-                ...( traceID !== undefined ? { traceID } : {} )
+                query           : { filter: rawFilter, smartFilter, limit, access },
+                context,
+                traceID
             }), { internal: true, parentOperation: method });
 
             const matchedDbeIds = docs.map( d => d._id ).filter( id => id !== undefined );
@@ -622,8 +610,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         matchedCount    : 0,
                         modifiedCount   : 0,
                         ids             : [],
-                        ...( options?.context !== undefined ? { context: options.context } : {} ),
-                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        context         : options?.context,
+                        traceID         : options?.traceID
                     });
 
                     return { matchedCount: 0, modifiedCount: 0 };
@@ -640,9 +628,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     this._emitError( e, 'updateMany', Date.now() - start,
                     {
-                        filter : match,
-                        ...( options?.context !== undefined ? { context: options.context } : {} ),
-                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        filter  : match,
+                        context : options?.context,
+                        traceID : options?.traceID
                     });
 
                     throw e;
@@ -655,8 +643,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     modifiedCount   : res.modifiedCount,
                     ids             : idsOrFilter,
                     filter          : match,
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    context         : options?.context,
+                    traceID         : options?.traceID
                 });
 
                 return {
@@ -687,9 +675,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         modifiedCount   : 0,
                         ids             : targetIds.length > 0 ? targetIds : undefined,
                         filter          : rawFilter,
-                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                        ...( context !== undefined ? { context } : {} ),
-                        ...( traceID !== undefined ? { traceID } : {} )
+                        smartFilter,
+                        context,
+                        traceID
                     });
                 }
 
@@ -707,10 +695,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._emitError( e, 'updateMany', Date.now() - start,
                 {
-                    filter : finalMatch,
-                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
+                    filter      : finalMatch,
+                    smartFilter,
+                    context,
+                    traceID
                 });
 
                 throw e;
@@ -731,9 +719,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 modifiedCount   : res.modifiedCount,
                 ids             : targetIds.length > 0 ? targetIds : undefined,
                 filter          : finalMatch,
-                ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                ...( context !== undefined ? { context } : {} ),
-                ...( traceID !== undefined ? { traceID } : {} )
+                smartFilter,
+                context,
+                traceID
             });
 
             return {
@@ -774,9 +762,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         modifiedCount   : 0,
                         ids             : targetIds.length > 0 ? targetIds : undefined,
                         filter          : rawFilter,
-                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                        ...( context !== undefined ? { context } : {} ),
-                        ...( traceID !== undefined ? { traceID } : {} )
+                        smartFilter,
+                        context,
+                        traceID
                     });
                 }
 
@@ -814,9 +802,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         modifiedCount   : snapshot.modifiedCount,
                         ids             : idsToEvict ?? undefined,
                         filter          : finalMatch,
-                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                        ...( context !== undefined ? { context } : {} ),
-                        ...( traceID !== undefined ? { traceID } : {} )
+                        smartFilter,
+                        context,
+                        traceID
                     });
 
                     return {
@@ -844,9 +832,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     modifiedCount   : res.modifiedCount,
                     ids             : targetIds.length > 0 ? targetIds : undefined,
                     filter          : finalMatch,
-                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
+                    smartFilter,
+                    context,
+                    traceID
                 });
 
                 return {
@@ -858,10 +846,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._emitError( e, 'updateOne', Date.now() - start,
                 {
-                    filter : finalMatch,
-                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
+                    filter      : finalMatch,
+                    smartFilter,
+                    context,
+                    traceID
                 });
 
                 throw e;
@@ -1117,9 +1105,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._emitError( e, 'delete', Date.now() - start,
                 {
-                    filter : match,
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    filter  : match,
+                    context : options?.context,
+                    traceID : options?.traceID
                 });
 
                 throw e;
@@ -1131,8 +1119,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 deletedCount    : res.deletedCount,
                 ids             : [ id ],
                 filter          : match,
-                ...( options?.context !== undefined ? { context: options.context } : {} ),
-                ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                context         : options?.context,
+                traceID         : options?.traceID
             });
 
             return res.deletedCount === 1;
@@ -1161,8 +1149,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     {
                         deletedCount    : 0,
                         ids             : [],
-                        ...( options?.context !== undefined ? { context: options.context } : {} ),
-                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        context         : options?.context,
+                        traceID         : options?.traceID
                     });
 
                     return 0;
@@ -1179,9 +1167,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     this._emitError( e, 'deleteMany', Date.now() - start,
                     {
-                        filter : match,
-                        ...( options?.context !== undefined ? { context: options.context } : {} ),
-                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        filter  : match,
+                        context : options?.context,
+                        traceID : options?.traceID
                     });
 
                     throw e;
@@ -1193,8 +1181,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     deletedCount    : res.deletedCount,
                     ids             : idsOrFilter,
                     filter          : match,
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    context         : options?.context,
+                    traceID         : options?.traceID
                 });
 
                 return res.deletedCount;
@@ -1221,9 +1209,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         deletedCount    : 0,
                         ids             : targetIds.length > 0 ? targetIds : undefined,
                         filter          : rawFilter,
-                        ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                        ...( context !== undefined ? { context } : {} ),
-                        ...( traceID !== undefined ? { traceID } : {} )
+                        smartFilter,
+                        context,
+                        traceID
                     });
                 }
 
@@ -1241,10 +1229,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 this._emitError( e, 'deleteMany', Date.now() - start,
                 {
-                    filter : finalMatch,
-                    ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
+                    filter      : finalMatch,
+                    smartFilter,
+                    context,
+                    traceID
                 });
 
                 throw e;
@@ -1264,9 +1252,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 deletedCount    : res.deletedCount,
                 ids             : targetIds.length > 0 ? targetIds : undefined,
                 filter          : finalMatch,
-                ...( smartFilter !== undefined ? { smartFilter } : {} ),
-                ...( context !== undefined ? { context } : {} ),
-                ...( traceID !== undefined ? { traceID } : {} )
+                smartFilter,
+                context,
+                traceID
             });
 
             return res.deletedCount;

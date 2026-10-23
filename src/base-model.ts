@@ -241,8 +241,8 @@ export abstract class AbstractBaseModel
                 }
 
                 return {
-                    ...( batchContext !== undefined ? { context: batchContext } : {} ),
-                    ...( batchTraceID !== undefined ? { traceID: batchTraceID } : {} )
+                    context : batchContext,
+                    traceID : batchTraceID
                 };
             };
 
@@ -277,11 +277,7 @@ export abstract class AbstractBaseModel
                 {
                     resultCount : documents.length,
                     conversion  : String( conversion ),
-                    query       :
-                    {
-                        ids : dtoIds!,
-                        ...( accessCtx?.access !== undefined ? { access: accessCtx.access } : {} )
-                    },
+                    query       : { ids: dtoIds!, access: accessCtx?.access },
                     ...resolveBatchMeta()
                 }));
 
@@ -295,11 +291,7 @@ export abstract class AbstractBaseModel
             {
                 this._emitError( e, batchOperation, Date.now() - start, () => (
                 {
-                    query :
-                    {
-                        ids : dtoIds ?? ids.map( id => this.dtoID( id )),
-                        ...( accessCtx?.access !== undefined ? { access: accessCtx.access } : {} )
-                    },
+                    query : { ids: dtoIds ?? ids.map( id => this.dtoID( id )), access: accessCtx?.access },
                     ...resolveBatchMeta()
                 }));
 
@@ -530,6 +522,42 @@ export abstract class AbstractBaseModel
         this._events.off( event, handler );
     }
 
+    #resolveEmitExtra<T extends Record<string, any>>( extra?: T | ( () => T ) ): T | undefined
+    {
+        if( !extra ){ return undefined }
+
+        const raw = typeof extra === 'function' ? extra() : extra;
+        const cleaned = {} as T;
+
+        for( const key in raw )
+        {
+            const value = raw[key];
+
+            if( value === undefined ){ continue }
+
+            if( key === 'query' && value && typeof value === 'object' )
+            {
+                const cleanedQuery: Record<string, unknown> = {};
+
+                for( const qKey in value )
+                {
+                    if( value[qKey] !== undefined )
+                    {
+                        cleanedQuery[qKey] = value[qKey];
+                    }
+                }
+
+                cleaned[key] = cleanedQuery as T[Extract<keyof T, string>];
+            }
+            else
+            {
+                cleaned[key] = value;
+            }
+        }
+
+        return cleaned;
+    }
+
     protected _emitQuery(
         operation: ModelQueryOperation,
         pipeline: Document[],
@@ -546,7 +574,7 @@ export abstract class AbstractBaseModel
             return;
         }
 
-        const resolvedExtra = typeof extra === 'function' ? extra() : extra;
+        const resolvedExtra = this.#resolveEmitExtra( extra );
 
         dispatchObservabilityEvent(
             'query',
@@ -576,7 +604,7 @@ export abstract class AbstractBaseModel
             return;
         }
 
-        const resolvedExtra = typeof extra === 'function' ? extra() : extra;
+        const resolvedExtra = this.#resolveEmitExtra( extra );
 
         dispatchObservabilityEvent(
             'mutation',
@@ -604,7 +632,7 @@ export abstract class AbstractBaseModel
             return;
         }
 
-        const resolvedExtra = typeof extra === 'function' ? extra() : extra;
+        const resolvedExtra = this.#resolveEmitExtra( extra );
 
         dispatchObservabilityEvent(
             'cache',
@@ -633,7 +661,7 @@ export abstract class AbstractBaseModel
             return;
         }
 
-        const resolvedExtra = typeof extra === 'function' ? extra() : extra;
+        const resolvedExtra = this.#resolveEmitExtra( extra );
 
         dispatchObservabilityEvent(
             'error',
@@ -752,8 +780,8 @@ export abstract class AbstractBaseModel
             key,
             ids         : [ dtoId ],
             conversion  : String( conversion ),
-            ...( options.context !== undefined ? { context: options.context } : {} ),
-            ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+            context     : options.context,
+            traceID     : options.traceID
         }));
     }
 
@@ -1070,8 +1098,8 @@ export abstract class AbstractBaseModel
                         {
                             resultCount : r[0]?.count ?? 0,
                             query       : this._buildListQueryContext( options, sort ),
-                            ...( context !== undefined ? { context } : {} ),
-                            ...( traceID !== undefined ? { traceID } : {} )
+                            context,
+                            traceID
                         }));
 
                         return r[0]?.count ?? 0;
@@ -1083,11 +1111,11 @@ export abstract class AbstractBaseModel
         {
             this._emitError( e, 'list', Date.now() - start, () => (
             {
-                ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                query : this._buildListQueryContext( options, sort ),
-                ...( context !== undefined ? { context } : {} ),
-                ...( traceID !== undefined ? { traceID } : {} )
+                filter      : options.filter,
+                smartFilter : options.smartFilter as Record<string, unknown>,
+                query       : this._buildListQueryContext( options, sort ),
+                context,
+                traceID
             }));
 
             throw e;
@@ -1111,8 +1139,8 @@ export abstract class AbstractBaseModel
             resultCount : items.length,
             conversion  : String( conversion ),
             query       : this._buildListQueryContext( options, sort ),
-            ...( context !== undefined ? { context } : {} ),
-            ...( traceID !== undefined ? { traceID } : {} )
+            context,
+            traceID
         }));
 
         benchmark?.step( 'CONVERTER' );
@@ -1146,8 +1174,8 @@ export abstract class AbstractBaseModel
             {
                 conversion  : String( conversion ),
                 query       : this._buildListQueryContext( options, sort ),
-                ...( context !== undefined ? { context } : {} ),
-                ...( traceID !== undefined ? { traceID } : {} )
+                context,
+                traceID
             }));
         };
 
@@ -1202,11 +1230,11 @@ export abstract class AbstractBaseModel
             {
                 this._emitError( e, 'stream', Date.now() - start, () => (
                 {
-                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this._buildListQueryContext( options, sort ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
+                    filter      : options.filter,
+                    smartFilter : options.smartFilter as Record<string, unknown>,
+                    query       : this._buildListQueryContext( options, sort ),
+                    context,
+                    traceID
                 }));
             }
 
@@ -1233,14 +1261,7 @@ export abstract class AbstractBaseModel
 
     #buildFindQueryContext( options: any, sort?: FindOptions['sort'] ): ModelQueryContext | undefined
     {
-        if( !options && !sort ){ return undefined }
-
-        const query: ModelQueryContext = {};
-
-        if( options?.filter !== undefined ){ query.filter = options.filter }
-        if( options?.smartFilter !== undefined ){ query.smartFilter = options.smartFilter }
-        if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
-        if( options?.access !== undefined ){ query.access = options.access }
+        const query = this._buildListQueryContext( options, sort as Document | undefined );
 
         return isSet( query ) ? query : undefined;
     }
@@ -1257,10 +1278,10 @@ export abstract class AbstractBaseModel
     #buildExistsQueryContext( idOrFilter: unknown, isPrimitiveId: boolean, findOptions: any ): ModelQueryContext
     {
         return {
-            ...( isPrimitiveId ? { ids: [ this.dtoID( idOrFilter ) ] } : {} ),
-            filter : findOptions.filter,
-            ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter } : {} ),
-            ...( findOptions.access !== undefined ? { access: findOptions.access } : {} )
+            ids         : isPrimitiveId ? [ this.dtoID( idOrFilter ) ] : undefined,
+            filter      : findOptions.filter,
+            smartFilter : findOptions.smartFilter,
+            access      : findOptions.access
         };
     }
 
@@ -1303,18 +1324,14 @@ export abstract class AbstractBaseModel
             }
             catch( e )
             {
-                this._emitError( e, 'find', Date.now() - start, () =>
+                this._emitError( e, 'find', Date.now() - start, () => (
                 {
-                    const query = this.#buildFindQueryContext( options, sort );
-
-                    return {
-                        ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                        ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter } : {} ),
-                        ...( query !== undefined ? { query } : {} ),
-                        ...( options.context !== undefined ? { context: options.context } : {} ),
-                        ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                    };
-                });
+                    filter      : options.filter,
+                    smartFilter : options.smartFilter,
+                    query       : this.#buildFindQueryContext( options, sort ),
+                    context     : options.context,
+                    traceID     : options.traceID
+                }));
 
                 throw e;
             }
@@ -1331,19 +1348,15 @@ export abstract class AbstractBaseModel
             const data = dbe ? await this._converters.convert( dbe, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> : null;
             const converterDuration = Date.now() - convStart;
 
-            this._emitQuery( 'find', pipeline, duration, () =>
+            this._emitQuery( 'find', pipeline, duration, () => (
             {
-                const query = this.#buildFindQueryContext( options, sort );
-
-                return {
-                    converterDuration,
-                    resultCount : data ? 1 : 0,
-                    conversion  : String( conversion ),
-                    ...( query !== undefined ? { query } : {} ),
-                    ...( options.context !== undefined ? { context: options.context } : {} ),
-                    ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                };
-            });
+                converterDuration,
+                resultCount : data ? 1 : 0,
+                conversion  : String( conversion ),
+                query       : this.#buildFindQueryContext( options, sort ),
+                context     : options.context,
+                traceID     : options.traceID
+            }));
 
             benchmark?.step( 'CONVERTER' );
 
@@ -1394,18 +1407,14 @@ export abstract class AbstractBaseModel
             }
             catch( e )
             {
-                this._emitError( e, operation, Date.now() - start, () =>
+                this._emitError( e, operation, Date.now() - start, () => (
                 {
-                    const query = this.#buildAggregateQueryContext( pipelineOptions );
-
-                    return {
-                        ...( pipelineOptions.filter !== undefined ? { filter: pipelineOptions.filter } : {} ),
-                        ...( pipelineOptions.smartFilter !== undefined ? { smartFilter: pipelineOptions.smartFilter } : {} ),
-                        ...( query !== undefined ? { query } : {} ),
-                        ...( context !== undefined ? { context } : {} ),
-                        ...( traceID !== undefined ? { traceID } : {} )
-                    };
-                });
+                    filter      : pipelineOptions.filter,
+                    smartFilter : pipelineOptions.smartFilter,
+                    query       : this.#buildAggregateQueryContext( pipelineOptions ),
+                    context,
+                    traceID
+                }));
 
                 throw e;
             }
@@ -1420,17 +1429,13 @@ export abstract class AbstractBaseModel
                 ? (( res[0] as { count?: number } | undefined )?.count ?? 0 )
                 : res.length;
 
-            this._emitQuery( operation, aggregationPipeline, duration, () =>
+            this._emitQuery( operation, aggregationPipeline, duration, () => (
             {
-                const query = this.#buildAggregateQueryContext( pipelineOptions );
-
-                return {
-                    resultCount,
-                    ...( query !== undefined ? { query } : {} ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
-                };
-            });
+                resultCount,
+                query : this.#buildAggregateQueryContext( pipelineOptions ),
+                context,
+                traceID
+            }));
 
             return res;
         });
@@ -1507,11 +1512,11 @@ export abstract class AbstractBaseModel
             {
                 this._emitError( e, 'exists', Date.now() - start, () => (
                 {
-                    filter : findOptions.filter,
-                    ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter } : {} ),
-                    query  : this.#buildExistsQueryContext( idOrFilter, Boolean( findOptions.isPrimitiveId ), findOptions ),
-                    ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
-                    ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
+                    filter      : findOptions.filter,
+                    smartFilter : findOptions.smartFilter,
+                    query       : this.#buildExistsQueryContext( idOrFilter, Boolean( findOptions.isPrimitiveId ), findOptions ),
+                    context     : findOptions.context,
+                    traceID     : findOptions.traceID
                 }));
 
                 throw e;
@@ -1523,8 +1528,8 @@ export abstract class AbstractBaseModel
             {
                 resultCount : res.length,
                 query       : this.#buildExistsQueryContext( idOrFilter, Boolean( findOptions.isPrimitiveId ), findOptions ),
-                ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
-                ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
+                context     : findOptions.context,
+                traceID     : findOptions.traceID
             }));
 
             return res.length > 0;

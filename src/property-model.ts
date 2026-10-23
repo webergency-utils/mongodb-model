@@ -318,8 +318,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     insertedCount   : 1,
                     ids             : [ _id ],
                     parentID,
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    context         : options?.context,
+                    traceID         : options?.traceID
                 });
 
                 return _id;
@@ -329,8 +329,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 this._emitError( e, 'create', Date.now() - start,
                 {
                     parentID,
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    context : options?.context,
+                    traceID : options?.traceID
                 });
 
                 throw e;
@@ -367,8 +367,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 this._emitError( e, 'createFrom', Date.now() - start,
                 {
                     parentID,
-                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                    context : resolvedOptions?.context,
+                    traceID : resolvedOptions?.traceID
                 });
 
                 throw e;
@@ -382,8 +382,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 insertedCount   : 1,
                 ids             : [ createdId ],
                 parentID,
-                ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                context         : resolvedOptions?.context,
+                traceID         : resolvedOptions?.traceID
             });
 
             return createdId;
@@ -424,8 +424,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     insertedCount   : 0,
                     ids             : [],
                     parentID,
-                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                    context         : resolvedOptions?.context,
+                    traceID         : resolvedOptions?.traceID
                 });
 
                 return [];
@@ -465,8 +465,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     insertedCount   : docs.length,
                     ids,
                     parentID,
-                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                    context         : resolvedOptions?.context,
+                    traceID         : resolvedOptions?.traceID
                 });
 
                 return ids;
@@ -476,8 +476,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 this._emitError( e, 'createMany', Date.now() - start,
                 {
                     parentID,
-                    ...( resolvedOptions?.context !== undefined ? { context: resolvedOptions.context } : {} ),
-                    ...( resolvedOptions?.traceID !== undefined ? { traceID: resolvedOptions.traceID } : {} )
+                    context : resolvedOptions?.context,
+                    traceID : resolvedOptions?.traceID
                 });
 
                 throw e;
@@ -546,10 +546,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     matchedCount    : 0,
                     modifiedCount   : 0,
                     ids             : [ id ],
-                    ...( callerFilter?.filter !== undefined ? { filter: callerFilter.filter } : {} ),
-                    ...( callerFilter?.smartFilter !== undefined ? { smartFilter: callerFilter.smartFilter } : {} ),
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    filter          : callerFilter?.filter,
+                    smartFilter     : callerFilter?.smartFilter,
+                    context         : options?.context,
+                    traceID         : options?.traceID
                 });
 
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
@@ -582,10 +582,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         {
             this._emitError( e, method, Date.now() - start,
             {
-                filter : callerFilter?.filter ?? match,
-                ...( callerFilter?.smartFilter !== undefined ? { smartFilter: callerFilter.smartFilter } : {} ),
-                ...( options?.context !== undefined ? { context: options.context } : {} ),
-                ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                filter      : callerFilter?.filter ?? match,
+                smartFilter : callerFilter?.smartFilter,
+                context     : options?.context,
+                traceID     : options?.traceID
             });
 
             throw e;
@@ -602,10 +602,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             matchedCount    : res.matchedCount,
             modifiedCount   : res.modifiedCount,
             ids             : [ id ],
-            ...( callerFilter?.filter !== undefined ? { filter: callerFilter.filter } : {} ),
-            ...( callerFilter?.smartFilter !== undefined ? { smartFilter: callerFilter.smartFilter } : {} ),
-            ...( options?.context !== undefined ? { context: options.context } : {} ),
-            ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+            filter          : callerFilter?.filter,
+            smartFilter     : callerFilter?.smartFilter,
+            context         : options?.context,
+            traceID         : options?.traceID
         });
 
         flowGet( 'log' ) && LOG({ res });
@@ -644,13 +644,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             this._emitError( e, method, Date.now() - start, () => (
             {
                 filter  : { id: dbeId },
-                query   :
-                {
-                    ids : [ id ],
-                    ...( options?.access !== undefined ? { access: options.access } : {} )
-                },
-                ...( options?.context !== undefined ? { context: options.context } : {} ),
-                ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                query   : { ids: [ id ], access: options?.access },
+                context : options?.context,
+                traceID : options?.traceID
             }));
 
             throw e;
@@ -668,13 +664,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             conversion      : 'dbe',
             internal        : true,
             parentOperation : method,
-            query           :
-            {
-                ids : [ id ],
-                ...( options?.access !== undefined ? { access: options.access } : {} )
-            },
-            ...( options?.context !== undefined ? { context: options.context } : {} ),
-            ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+            query           : { ids: [ id ], access: options?.access },
+            context         : options?.context,
+            traceID         : options?.traceID
         }), { internal: true, parentOperation: method });
 
         return converted || undefined;
@@ -716,17 +708,17 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         {
             this._emitError( e, parentOperation, Date.now() - preStart,
             {
-                ...( findOptions.filter !== undefined ? { filter: findOptions.filter } : {} ),
-                ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                query :
+                filter      : findOptions.filter,
+                smartFilter : findOptions.smartFilter as Record<string, unknown>,
+                query       :
                 {
-                    ...( findOptions.filter !== undefined ? { filter: findOptions.filter } : {} ),
-                    ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                    ...( limit !== undefined ? { limit } : {} ),
-                    ...( findOptions.access !== undefined ? { access: findOptions.access } : {} )
+                    filter      : findOptions.filter,
+                    smartFilter : findOptions.smartFilter as Record<string, unknown>,
+                    limit,
+                    access      : findOptions.access
                 },
-                ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
-                ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
+                context     : findOptions.context,
+                traceID     : findOptions.traceID
             });
 
             throw e;
@@ -741,13 +733,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             parentOperation,
             query           :
             {
-                ...( findOptions.filter !== undefined ? { filter: findOptions.filter } : {} ),
-                ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                ...( limit !== undefined ? { limit } : {} ),
-                ...( findOptions.access !== undefined ? { access: findOptions.access } : {} )
+                filter      : findOptions.filter,
+                smartFilter : findOptions.smartFilter as Record<string, unknown>,
+                limit,
+                access      : findOptions.access
             },
-            ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
-            ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
+            context         : findOptions.context,
+            traceID         : findOptions.traceID
         }), { internal: true, parentOperation });
 
         return docs.map( d => d.id ).filter( id => id !== undefined );
@@ -856,9 +848,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     modifiedCount   : 0,
                     ids             : cacheIds.length > 0 ? cacheIds : undefined,
                     filter          : findOptions.filter,
-                    ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                    ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
-                    ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
+                    smartFilter     : findOptions.smartFilter as Record<string, unknown>,
+                    context         : findOptions.context,
+                    traceID         : findOptions.traceID
                 });
 
                 return attachPropertyUpdateMetadata<DBE>({ matchedCount: 0, modifiedCount: 0 });
@@ -934,10 +926,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                     matchedCount    : 0,
                     modifiedCount   : 0,
                     ids             : cacheIdsToInvalidate ?? undefined,
-                    ...( findOptions?.filter !== undefined ? { filter: findOptions.filter } : {} ),
-                    ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                    ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
-                    ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                    filter          : findOptions?.filter,
+                    smartFilter     : findOptions?.smartFilter as Record<string, unknown>,
+                    context         : effectiveContext,
+                    traceID         : effectiveTraceID
                 });
 
                 return { matchedRootCount: 0, modifiedRootCount: 0 };
@@ -968,10 +960,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             {
                 this._emitError( e, 'updateMany', Date.now() - start,
                 {
-                    filter : findOptions?.filter ?? match,
-                    ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                    ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
-                    ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                    filter      : findOptions?.filter ?? match,
+                    smartFilter : findOptions?.smartFilter as Record<string, unknown>,
+                    context     : effectiveContext,
+                    traceID     : effectiveTraceID
                 });
 
                 throw e;
@@ -987,10 +979,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
                 ids             : cacheIdsToInvalidate ?? undefined,
-                ...( findOptions?.filter !== undefined ? { filter: findOptions.filter } : {} ),
-                ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
-                ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                filter          : findOptions?.filter,
+                smartFilter     : findOptions?.smartFilter as Record<string, unknown>,
+                context         : effectiveContext,
+                traceID         : effectiveTraceID
             });
 
             flowGet( 'log' ) && LOG({ res });
@@ -1221,8 +1213,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                         modifiedCount   : 0,
                         deletedCount    : 0,
                         ids             : [ id ],
-                        ...( options?.context !== undefined ? { context: options.context } : {} ),
-                        ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                        context         : options?.context,
+                        traceID         : options?.traceID
                     });
 
                     return false;
@@ -1251,9 +1243,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             {
                 this._emitError( e, 'delete', Date.now() - start,
                 {
-                    filter : match,
-                    ...( options?.context !== undefined ? { context: options.context } : {} ),
-                    ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                    filter  : match,
+                    context : options?.context,
+                    traceID : options?.traceID
                 });
 
                 throw e;
@@ -1266,8 +1258,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 modifiedCount   : res.modifiedCount,
                 deletedCount    : res.modifiedCount,
                 ids             : [ id ],
-                ...( options?.context !== undefined ? { context: options.context } : {} ),
-                ...( options?.traceID !== undefined ? { traceID: options.traceID } : {} )
+                context         : options?.context,
+                traceID         : options?.traceID
             });
 
             return res.modifiedCount > 0;
@@ -1313,10 +1305,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 {
                     deletedCount : 0,
                     ids          : cacheIdsToInvalidate ?? undefined,
-                    ...( findOptions?.filter !== undefined ? { filter: findOptions.filter } : {} ),
-                    ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                    ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
-                    ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                    filter       : findOptions?.filter,
+                    smartFilter  : findOptions?.smartFilter as Record<string, unknown>,
+                    context      : effectiveContext,
+                    traceID      : effectiveTraceID
                 });
 
                 return 0;
@@ -1344,10 +1336,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             {
                 this._emitError( e, 'deleteMany', Date.now() - start,
                 {
-                    filter : findOptions?.filter ?? match,
-                    ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                    ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
-                    ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                    filter      : findOptions?.filter ?? match,
+                    smartFilter : findOptions?.smartFilter as Record<string, unknown>,
+                    context     : effectiveContext,
+                    traceID     : effectiveTraceID
                 });
 
                 throw e;
@@ -1364,10 +1356,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 modifiedCount   : res.modifiedCount,
                 deletedCount    : res.modifiedCount,
                 ids             : cacheIdsToInvalidate ?? undefined,
-                ...( findOptions?.filter !== undefined ? { filter: findOptions.filter } : {} ),
-                ...( findOptions?.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter as Record<string, unknown> } : {} ),
-                ...( effectiveContext !== undefined ? { context: effectiveContext } : {} ),
-                ...( effectiveTraceID !== undefined ? { traceID: effectiveTraceID } : {} )
+                filter          : findOptions?.filter,
+                smartFilter     : findOptions?.smartFilter as Record<string, unknown>,
+                context         : effectiveContext,
+                traceID         : effectiveTraceID
             });
 
             return res.modifiedCount;

@@ -911,4 +911,190 @@ describe( 'Observability query context, selective operations & internal pre-quer
 
         await models.shutdown();
     });
+
+    test( 'emits error events across all read and mutation failure paths and supports remaining operation filter tokens', async() =>
+    {
+        const errors: ModelErrorEvent[] = [];
+        const mutations: ModelMutationEvent[] = [];
+        const models = new TestModels(
+        {
+            observability:
+            {
+                operations  : [ 'query', 'create', 'update', 'delete', 'cache', 'error', 'slowQuery', 'internal' ],
+                onError     : ( e ) => errors.push( e ),
+                onMutation  : ( e ) => mutations.push( e )
+            }
+        });
+
+        const aggregate = vi.fn(() =>
+        ({
+            toArray: async() => [{ _id: 'u1', name: 'Ada', items: [{ id: 'i1', label: 'A' }] }],
+            async *[Symbol.asyncIterator]()
+            {
+                throw new Error( 'stream-cursor-boom' );
+            }
+        }));
+        const findOne = vi.fn( async() => ({ _id: 'u1', name: 'Ada' }));
+        const insertOne = vi.fn( async() => ({ insertedId: 'u1' }));
+        const insertMany = vi.fn( async() => { throw new Error( 'insertMany-boom' ) });
+        const updateOne = vi.fn( async() => { throw new Error( 'updateOne-boom' ) });
+        const updateMany = vi.fn( async() => { throw new Error( 'updateMany-boom' ) });
+        const deleteOne = vi.fn( async() => { throw new Error( 'deleteOne-boom' ) });
+        const deleteMany = vi.fn( async() => { throw new Error( 'deleteMany-boom' ) });
+
+        const collection =
+        {
+            collectionName: 'users',
+            aggregate,
+            findOne,
+            insertOne,
+            insertMany,
+            updateOne,
+            updateMany,
+            deleteOne,
+            deleteMany
+        };
+
+        class FullUserModel extends AbstractModel<UserDBE, UserDTO,
+        {
+            converters:
+            {
+                dto : { converter: ( dbe: UserDBE ) => UserDTO }
+                dbe : { converter: ( dbe: UserDBE ) => UserDBE }
+                from: { broken: () => Promise<UserDBE> }
+            }
+            smartFilters:
+            {
+                byPipe: () => { pipeline: Document[] }
+            }
+        }>
+        {
+            constructor()
+            {
+                super( models, collection as any,
+                {
+                    observability   : true,
+                    cache           : { max: 10 },
+                    converters      :
+                    {
+                        dto : { converter: ( dbe ) => ({ id: dbe._id, name: dbe.name }) },
+                        dbe : { converter: ( dbe ) => dbe },
+                        from: { broken: async() => { throw new Error( 'from-boom' ) } }
+                    },
+                    smartFilters    :
+                    {
+                        byPipe: () => ({ pipeline: [{ $match: { name: 'Ada' } }] })
+                    }
+                });
+            }
+        }
+
+        class FullItemModel extends AbstractPropertyModel<UserDBE, ItemDBE, ItemDTO,
+        {
+            converters:
+            {
+                dto : { converter: ( dbe: ItemDBE ) => ItemDTO }
+                dbe : { converter: ( dbe: ItemDBE ) => ItemDTO }
+                from: { broken: () => Promise<ItemDBE> }
+            }
+            smartFilters:
+            {
+                byLabel: () => { filter: Document }
+            }
+        }>
+        {
+            constructor()
+            {
+                super( models, collection as any, 'items[]',
+                {
+                    observability   : { enabled: true },
+                    cache           : { max: 10 },
+                    converters      :
+                    {
+                        dto : { converter: ( dbe ) => ({ id: dbe.id, label: dbe.label }) },
+                        dbe : { converter: ( dbe ) => ({ id: dbe.id, label: dbe.label }) },
+                        from: { broken: async() => { throw new Error( 'prop-from-boom' ) } }
+                    },
+                    smartFilters    :
+                    {
+                        byLabel: () => ({ filter: { label: 'A' } })
+                    }
+                });
+            }
+        }
+
+        const users = new FullUserModel();
+        const items = new FullItemModel();
+
+        // BaseModel read failures: list, stream, aggregate, exists
+        aggregate.mockImplementationOnce(() => ({ toArray: async() => { throw new Error( 'list-boom' ) } }) as any );
+        await expect( users.list({ filter: { name: 'Ada' }, count: true }) ).rejects.toThrow( 'list-boom' );
+
+        await expect( ( async() =>
+        {
+            for await( const _ of users.stream({ filter: { name: 'Ada' } }) )
+            {
+                // consume
+            }
+        })() ).rejects.toThrow( 'stream-cursor-boom' );
+
+        aggregate.mockImplementationOnce(() => ({ toArray: async() => { throw new Error( 'agg-boom' ) } }) as any );
+        await expect( users.aggregate([{ $match: { name: 'Ada' } }]) ).rejects.toThrow( 'agg-boom' );
+
+        aggregate.mockImplementationOnce(() => ({ toArray: async() => { throw new Error( 'exists-boom' ) } }) as any );
+        await expect( users.exists( 'u1' ) ).rejects.toThrow( 'exists-boom' );
+
+        // Model mutation failures: create duplicateIgnore findOne error, createMany, update, updateOne, updateMany (array & filter), delete, deleteMany (array & filter)
+        insertOne.mockImplementationOnce( async() =>
+        {
+            const err: any = new Error( 'dup' );
+            err.code = 11000;
+            err.keyValue = { name: 'Ada' };
+            throw err;
+        });
+        findOne.mockImplementationOnce( async() => { throw new Error( 'dup-find-boom' ) });
+        await expect( users.create({ name: 'Ada' }, 'u1', { duplicateIgnore: true }) ).rejects.toThrow( 'dup-find-boom' );
+
+        await expect( users.createMany([{ name: 'Ada' }], [ 'u1' ]) ).rejects.toThrow( 'insertMany-boom' );
+        await expect( users.update( 'u1', { name: 'B' }) ).rejects.toThrow( 'updateOne-boom' );
+        await expect( users.updateOne({ name: 'Ada' }, { name: 'B' }) ).rejects.toThrow( 'updateOne-boom' );
+        await expect( users.updateMany([ 'u1' ], { name: 'B' }) ).rejects.toThrow( 'updateMany-boom' );
+        await expect( users.updateMany({ name: 'Ada' }, { name: 'B' }) ).rejects.toThrow( 'updateMany-boom' );
+        await expect( users.delete( 'u1' ) ).rejects.toThrow( 'deleteOne-boom' );
+        await expect( users.deleteMany([ 'u1' ]) ).rejects.toThrow( 'deleteMany-boom' );
+        await expect( users.deleteMany({ name: 'Ada' }) ).rejects.toThrow( 'deleteMany-boom' );
+
+        // Model #resolveFilterMatch aggregate failure & empty pipeline match with targetIds
+        aggregate.mockImplementationOnce(() => ({ toArray: async() => { throw new Error( 'smart-pre-boom' ) } }) as any );
+        await expect( users.updateOne({ filter: { _id: 'u1' }, smartFilter: { byPipe: true as any } }, { name: 'B' }) ).rejects.toThrow( 'smart-pre-boom' );
+
+        aggregate.mockImplementation(() => ({ toArray: async() => [] }) as any );
+        await users.updateOne({ filter: { _id: 'u1' }, smartFilter: { byPipe: true as any } }, { name: 'B' });
+        await users.updateMany({ filter: { _id: 'u1' }, smartFilter: { byPipe: true as any } }, { name: 'B' });
+        await users.deleteMany({ filter: { _id: 'u1' }, smartFilter: { byPipe: true as any } });
+
+        // Restore aggregate to return parent/subdoc for PropertyModel failure tests
+        aggregate.mockImplementation(() => ({ toArray: async() => [{ _id: 'u1', id: 'i1', name: 'Ada', items: [{ id: 'i1', label: 'A' }] }] }) as any );
+
+        // PropertyModel failures: create, createFrom, createMany, update, snapshot fetch, #findMatchingSubdocIds, updateMany, delete, deleteMany
+        await expect( items.create( 'u1', { label: 'X' }, 'i1' ) ).rejects.toThrow( 'updateOne-boom' );
+        await expect( items.createFrom( 'u1', {}, 'broken' ) ).rejects.toThrow( 'MODEL_CONVERTER_ERROR' );
+        await expect( items.createMany( 'u1', [{ label: 'X' }], [ 'i1' ]) ).rejects.toThrow( 'updateOne-boom' );
+        await expect( items.update( 'i1', { label: 'X' }) ).rejects.toThrow( 'updateOne-boom' );
+
+        aggregate.mockImplementationOnce(() => ({ toArray: async() => { throw new Error( 'snap-boom' ) } }) as any );
+        await expect( items.update( 'i1', { label: 'X' }, { documentBefore: true }) ).rejects.toThrow( 'snap-boom' );
+
+        aggregate.mockImplementationOnce(() => ({ toArray: async() => { throw new Error( 'subdoc-pre-boom' ) } }) as any );
+        await expect( items.updateMany({ filter: { label: 'A' } }, { label: 'X' }) ).rejects.toThrow( 'subdoc-pre-boom' );
+
+        await expect( items.updateMany([ 'i1' ], { label: 'X' }) ).rejects.toThrow( 'updateMany-boom' );
+        await expect( items.delete( 'i1' ) ).rejects.toThrow( 'updateOne-boom' );
+        await expect( items.deleteMany([ 'i1' ]) ).rejects.toThrow( 'updateMany-boom' );
+
+        expect( errors.length ).toBeGreaterThanOrEqual( 18 );
+        expect( mutations.some( m => m.operation === 'updateOne' && m.matchedCount === 0 ) ).toBe( true );
+
+        await models.shutdown();
+    });
 });
