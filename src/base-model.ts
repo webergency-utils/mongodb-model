@@ -182,27 +182,36 @@ export abstract class AbstractBaseModel
                 batchOperation = 'getMany';
             }
 
-            let batchContext: Record<string, unknown> | undefined;
-            let batchTraceID: string | undefined;
-
-            for( const entry of batchEntries )
+            const resolveBatchMeta = () =>
             {
-                if( entry.context )
+                let batchContext: Record<string, unknown> | undefined;
+                let batchTraceID: string | undefined;
+
+                for( const entry of batchEntries )
                 {
-                    batchContext = batchContext ? { ...batchContext, ...entry.context } : { ...entry.context };
+                    if( entry.context )
+                    {
+                        batchContext = Object.assign( batchContext ?? {}, entry.context );
+                    }
+
+                    if( entry.traceID !== undefined )
+                    {
+                        batchTraceID = entry.traceID;
+                    }
                 }
 
-                if( entry.traceID !== undefined )
-                {
-                    batchTraceID = entry.traceID;
-                }
-            }
+                return {
+                    ...( batchContext !== undefined ? { context: batchContext } : {} ),
+                    ...( batchTraceID !== undefined ? { traceID: batchTraceID } : {} )
+                };
+            };
 
             let start = Date.now();
+            let dtoIds: Array<DTO['id']> | undefined;
 
             try
             {
-                const dtoIds = ids.map( id => this.dtoID( id ));
+                dtoIds = ids.map( id => this.dtoID( id ));
                 const dbeIds = ids.map( id => this.dbeID( id ));
 
                 let pipeline = await this.pipeline(
@@ -231,11 +240,10 @@ export abstract class AbstractBaseModel
                     conversion  : String( conversion ),
                     query       :
                     {
-                        ids : dtoIds,
+                        ids : dtoIds!,
                         ...( accessCtx?.access !== undefined ? { access: accessCtx.access } : {} )
                     },
-                    ...( batchContext !== undefined ? { context: batchContext } : {} ),
-                    ...( batchTraceID !== undefined ? { traceID: batchTraceID } : {} )
+                    ...resolveBatchMeta()
                 }));
 
                 return map(
@@ -250,11 +258,10 @@ export abstract class AbstractBaseModel
                 {
                     query :
                     {
-                        ids : ids.map( id => this.dtoID( id )),
+                        ids : dtoIds ?? ids.map( id => this.dtoID( id )),
                         ...( accessCtx?.access !== undefined ? { access: accessCtx.access } : {} )
                     },
-                    ...( batchContext !== undefined ? { context: batchContext } : {} ),
-                    ...( batchTraceID !== undefined ? { traceID: batchTraceID } : {} )
+                    ...resolveBatchMeta()
                 });
 
                 if( e instanceof ModelError )
@@ -288,6 +295,7 @@ export abstract class AbstractBaseModel
         {
             list = [];
             this.#pendingBatchMeta.set( key, list );
+            process.nextTick(() => this.#pendingBatchMeta.delete( key ));
         }
 
         list.push( entry );
@@ -478,6 +486,7 @@ export abstract class AbstractBaseModel
     protected _emitCache(
         operation: ModelCacheEvent['operation'],
         extra?: Partial<Omit<ModelCacheEvent, 'collection' | 'operation'>>
+            | ( () => Partial<Omit<ModelCacheEvent, 'collection' | 'operation'>> )
     ): void
     {
         if( !this._shouldObserve( 'cache', operation ) )
@@ -485,13 +494,15 @@ export abstract class AbstractBaseModel
             return;
         }
 
+        const resolvedExtra = typeof extra === 'function' ? extra() : extra;
+
         dispatchObservabilityEvent(
             'cache',
             {
                 collection  : this._collectionLabel,
                 model       : this.constructor.name,
                 operation,
-                ...extra
+                ...resolvedExtra
             },
             this._events,
             this._models,
@@ -668,29 +679,34 @@ export abstract class AbstractBaseModel
 
                 if( cached !== undefined )
                 {
-                    this._emitCache( 'hit',
+                    this._emitCache( 'hit', () => (
                     {
                         key         : cacheKey,
                         ids         : [ dtoId ],
                         conversion  : String( conversion ),
                         ...( options.context !== undefined ? { context: options.context } : {} ),
                         ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                    });
+                    }));
 
                     return cached;
                 }
 
-                this._emitCache( 'miss',
+                this._emitCache( 'miss', () => (
                 {
                     key         : cacheKey,
                     ids         : [ dtoId ],
                     conversion  : String( conversion ),
                     ...( options.context !== undefined ? { context: options.context } : {} ),
                     ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                });
+                }));
             }
 
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
+            const batchPromise = this.#findAggregator.execute(
+                Arr( idOrIds ),
+                conversion,
+                { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
+            ) as unknown as Promise<Array<DBE | null>>;
 
             this.#enqueueBatchMeta( conversion, options.access, scopeKey,
             {
@@ -700,11 +716,7 @@ export abstract class AbstractBaseModel
                 traceID     : options.traceID
             });
 
-            const documents = await this.#findAggregator.execute(
-                Arr( idOrIds ),
-                conversion,
-                { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-            ) as unknown as Array<DBE | null>;
+            const documents = await batchPromise;
 
             benchmark?.step( 'QUERY' );
 
@@ -717,14 +729,14 @@ export abstract class AbstractBaseModel
             if( this._cache && cacheKey && result !== null )
             {
                 this._cache.set( cacheKey, result, [ dtoId ]);
-                this._emitCache( 'set',
+                this._emitCache( 'set', () => (
                 {
                     key         : cacheKey,
                     ids         : [ dtoId ],
                     conversion  : String( conversion ),
                     ...( options.context !== undefined ? { context: options.context } : {} ),
                     ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                });
+                }));
             }
 
             return result;
@@ -786,31 +798,37 @@ export abstract class AbstractBaseModel
                     if( cached !== undefined )
                     {
                         results[i] = cached;
-                        this._emitCache( 'hit',
+                        this._emitCache( 'hit', () => (
                         {
                             key         : cacheKey,
                             ids         : [ dtoId ],
                             conversion  : String( conversion ),
                             ...( options.context !== undefined ? { context: options.context } : {} ),
                             ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                        });
+                        }));
                     }
                     else
                     {
-                        this._emitCache( 'miss',
+                        this._emitCache( 'miss', () => (
                         {
                             key         : cacheKey,
                             ids         : [ dtoId ],
                             conversion  : String( conversion ),
                             ...( options.context !== undefined ? { context: options.context } : {} ),
                             ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                        });
+                        }));
                         missing.push({ index: i, id, dtoId, cacheKey });
                     }
                 }
 
                 if( missing.length > 0 )
                 {
+                    const batchPromise = this.#findAggregator.execute(
+                        missing.map( m => m.id ),
+                        conversion,
+                        { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
+                    ) as unknown as Promise<Array<DBE | null>>;
+
                     this.#enqueueBatchMeta( conversion, options.access, scopeKey,
                     {
                         operation   : 'getMany',
@@ -819,11 +837,7 @@ export abstract class AbstractBaseModel
                         traceID     : options.traceID
                     });
 
-                    const documents = await this.#findAggregator.execute(
-                        missing.map( m => m.id ),
-                        conversion,
-                        { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-                    ) as unknown as Array<DBE | null>;
+                    const documents = await batchPromise;
 
                     benchmark?.step( 'QUERY' );
 
@@ -841,14 +855,14 @@ export abstract class AbstractBaseModel
                         if( entry !== null )
                         {
                             this._cache.set( target.cacheKey, entry, [ target.dtoId ]);
-                            this._emitCache( 'set',
+                            this._emitCache( 'set', () => (
                             {
                                 key         : target.cacheKey,
                                 ids         : [ target.dtoId ],
                                 conversion  : String( conversion ),
                                 ...( options.context !== undefined ? { context: options.context } : {} ),
                                 ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                            });
+                            }));
                         }
                     }
                 }
@@ -856,19 +870,24 @@ export abstract class AbstractBaseModel
                 return options.filter ? results.filter( Boolean ) : results;
             }
 
-            this.#enqueueBatchMeta( conversion, options.access, scopeKey,
-            {
-                operation   : 'getMany',
-                access      : options.access,
-                context     : options.context,
-                traceID     : options.traceID
-            });
-
-            const documents = await this.#findAggregator.execute(
+            const batchPromise = this.#findAggregator.execute(
                 ids,
                 conversion,
                 { access: options.access, scopeKey, [RESOLVED_ACCESS]: access }
-            ) as unknown as Array<DBE | null>;
+            ) as unknown as Promise<Array<DBE | null>>;
+
+            if( ids.length > 0 )
+            {
+                this.#enqueueBatchMeta( conversion, options.access, scopeKey,
+                {
+                    operation   : 'getMany',
+                    access      : options.access,
+                    context     : options.context,
+                    traceID     : options.traceID
+                });
+            }
+
+            const documents = await batchPromise;
 
             benchmark?.step( 'QUERY' );
 
@@ -884,6 +903,33 @@ export abstract class AbstractBaseModel
         }
     }
 
+    #hasQueryKeys( query: ModelQueryContext ): boolean
+    {
+        for( const _ in query )
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    protected _buildListQueryContext( options: any, sort?: Document ): ModelQueryContext
+    {
+        const query: ModelQueryContext = {};
+
+        if( options?.filter !== undefined ){ query.filter = options.filter }
+        if( options?.smartFilter !== undefined ){ query.smartFilter = options.smartFilter as Record<string, unknown> }
+        if( Array.isArray( options?.computedProperties ) ){ query.computedProperties = options.computedProperties }
+        else if( options?.computedProperties && typeof options.computedProperties === 'object' ){ query.computedProperties = Object.keys( options.computedProperties ) }
+        if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
+        if( options?.limit !== undefined ){ query.limit = options.limit }
+        if( options?.skip !== undefined ){ query.skip = options.skip }
+        if( options?.cursor !== undefined ){ query.cursor = options.cursor }
+        if( options?.access !== undefined ){ query.access = options.access }
+
+        return query;
+    }
+
     #buildFindQueryContext( options: any, sort?: FindOptions['sort'] ): ModelQueryContext | undefined
     {
         if( !options && !sort ){ return undefined }
@@ -895,25 +941,26 @@ export abstract class AbstractBaseModel
         if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
         if( options?.access !== undefined ){ query.access = options.access }
 
-        return Object.keys( query ).length > 0 ? query : undefined;
+        return this.#hasQueryKeys( query ) ? query : undefined;
     }
 
     #buildAggregateQueryContext( options: any ): ModelQueryContext | undefined
     {
         if( !options ){ return undefined }
 
-        const query: ModelQueryContext = {};
+        const query = this._buildListQueryContext( options, options.sort );
 
-        if( options.filter !== undefined ){ query.filter = options.filter }
-        if( options.smartFilter !== undefined ){ query.smartFilter = options.smartFilter }
-        if( Array.isArray( options.computedProperties ) ){ query.computedProperties = options.computedProperties }
-        else if( options.computedProperties && typeof options.computedProperties === 'object' ){ query.computedProperties = Object.keys( options.computedProperties ) }
-        if( options.sort !== undefined ){ query.sort = options.sort as Record<string, 1 | -1> }
-        if( options.limit !== undefined ){ query.limit = options.limit }
-        if( options.skip !== undefined ){ query.skip = options.skip }
-        if( options.access !== undefined ){ query.access = options.access }
+        return this.#hasQueryKeys( query ) ? query : undefined;
+    }
 
-        return Object.keys( query ).length > 0 ? query : undefined;
+    #buildExistsQueryContext( idOrFilter: unknown, isPrimitiveId: boolean, findOptions: any ): ModelQueryContext
+    {
+        return {
+            ...( isPrimitiveId ? { ids: [ this.dtoID( idOrFilter ) ] } : {} ),
+            filter : findOptions.filter,
+            ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter } : {} ),
+            ...( findOptions.access !== undefined ? { access: findOptions.access } : {} )
+        };
     }
 
     public async find<K extends keyof Extensions['converters']>(
@@ -1148,14 +1195,6 @@ export abstract class AbstractBaseModel
 
             pipeline = this._optimizePipeline( pipeline );
 
-            const buildExistsQueryContext = (): ModelQueryContext => (
-            {
-                ...( isPrimitiveId ? { ids: [ this.dtoID( idOrFilter ) ] } : {} ),
-                filter : findOptions.filter,
-                ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter } : {} ),
-                ...( findOptions.access !== undefined ? { access: findOptions.access } : {} )
-            });
-
             const start = Date.now();
             let res: Document[];
 
@@ -1169,7 +1208,7 @@ export abstract class AbstractBaseModel
                 {
                     filter : findOptions.filter,
                     ...( findOptions.smartFilter !== undefined ? { smartFilter: findOptions.smartFilter } : {} ),
-                    query  : buildExistsQueryContext(),
+                    query  : this.#buildExistsQueryContext( idOrFilter, isPrimitiveId, findOptions ),
                     ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
                     ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
                 });
@@ -1182,7 +1221,7 @@ export abstract class AbstractBaseModel
             this._emitQuery( 'exists', pipeline, duration, () => (
             {
                 resultCount : res.length,
-                query       : buildExistsQueryContext(),
+                query       : this.#buildExistsQueryContext( idOrFilter, isPrimitiveId, findOptions ),
                 ...( findOptions.context !== undefined ? { context: findOptions.context } : {} ),
                 ...( findOptions.traceID !== undefined ? { traceID: findOptions.traceID } : {} )
             }));

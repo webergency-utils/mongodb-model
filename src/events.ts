@@ -385,6 +385,16 @@ function isPlainRecord( value: unknown ): value is Record<string, unknown>
     return typeof value === 'object' && value !== null && !Array.isArray( value );
 }
 
+function hasEnumerableKey( obj: Record<string, unknown> ): boolean
+{
+    for( const _ in obj )
+    {
+        return true;
+    }
+
+    return false;
+}
+
 export function resolveObservabilityContext(
     optionsContext?: ObservabilityContextResolver,
     payloadContext?: Record<string, unknown>
@@ -413,7 +423,7 @@ export function resolveObservabilityContext(
 
             if( isPlainRecord( resolved ) )
             {
-                merged = { ...resolved };
+                merged = Object.assign( merged ?? {}, resolved );
             }
         }
         catch( err )
@@ -426,15 +436,15 @@ export function resolveObservabilityContext(
 
     if( isPlainRecord( scopedContext ) )
     {
-        merged = merged ? { ...merged, ...scopedContext } : { ...scopedContext };
+        merged = Object.assign( merged ?? {}, scopedContext );
     }
 
     if( isPlainRecord( payloadContext ) )
     {
-        merged = merged ? { ...merged, ...payloadContext } : { ...payloadContext };
+        merged = Object.assign( merged ?? {}, payloadContext );
     }
 
-    if( !merged || Object.keys( merged ).length === 0 )
+    if( !merged || !hasEnumerableKey( merged ) )
     {
         return undefined;
     }
@@ -540,8 +550,7 @@ export function dispatchObservabilityEvent<E extends ModelEventName>(
     }
 
     const traceID = payload.traceID ?? ( flowGet( 'traceID' ) as string | undefined );
-    const payloadContext = ( payload as { context?: Record<string, unknown> } ).context;
-    const context = resolveObservabilityContext( options?.context, payloadContext );
+    const context = resolveObservabilityContext( options?.context, payload.context );
 
     let enriched = payload;
 

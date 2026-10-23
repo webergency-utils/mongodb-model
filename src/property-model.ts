@@ -11,7 +11,7 @@ from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { extractTargetIdsFromFilter } from './cache.js';
 import { ModelAccessDeniedError, ModelError } from './errors.js';
-import { ModelMutationOperation, ModelQueryContext } from './events.js';
+import { ModelMutationOperation } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
@@ -1007,23 +1007,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         return super.find( options, conversion, sort );
     }
 
-    #buildListQueryContext( options: any, sort?: Document ): ModelQueryContext
-    {
-        const query: ModelQueryContext = {};
-
-        if( options?.filter !== undefined ){ query.filter = options.filter }
-        if( options?.smartFilter !== undefined ){ query.smartFilter = options.smartFilter as Record<string, unknown> }
-        if( Array.isArray( options?.computedProperties ) ){ query.computedProperties = options.computedProperties }
-        else if( options?.computedProperties && typeof options.computedProperties === 'object' ){ query.computedProperties = Object.keys( options.computedProperties ) }
-        if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
-        if( options?.limit !== undefined ){ query.limit = options.limit }
-        if( options?.skip !== undefined ){ query.skip = options.skip }
-        if( options?.cursor !== undefined ){ query.cursor = options.cursor }
-        if( options?.access !== undefined ){ query.access = options.access }
-
-        return query;
-    }
-
     public async list<K extends keyof Extensions['converters']>(
         options: PropertyModelListOptions<RootDBE, DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
         conversion: K = 'dto' as K
@@ -1033,7 +1016,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         try
         {
-            const { context, traceID, ...bsonInput } = options;
+            const { context, traceID } = options;
+            const bsonInput = ( context !== undefined || traceID !== undefined )
+                ? (({ context: _c, traceID: _t, ...restOpts }) => restOpts )( options )
+                : options;
             const { projection } = this.converters[conversion];
             const prev = options.cursor?.startsWith( 'prev:' );
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
@@ -1107,7 +1093,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                             this._emitQuery( 'count', countPipeline!, duration, () => (
                             {
                                 resultCount : r[0]?.count ?? 0,
-                                query       : this.#buildListQueryContext( options, sort ),
+                                query       : this._buildListQueryContext( options, sort ),
                                 ...( context !== undefined ? { context } : {} ),
                                 ...( traceID !== undefined ? { traceID } : {} )
                             }));
@@ -1123,7 +1109,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 {
                     ...( options.filter !== undefined ? { filter: options.filter } : {} ),
                     ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this.#buildListQueryContext( options, sort ),
+                    query : this._buildListQueryContext( options, sort ),
                     ...( context !== undefined ? { context } : {} ),
                     ...( traceID !== undefined ? { traceID } : {} )
                 });
@@ -1148,7 +1134,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 converterDuration,
                 resultCount : items.length,
                 conversion  : String( conversion ),
-                query       : this.#buildListQueryContext( options, sort ),
+                query       : this._buildListQueryContext( options, sort ),
                 ...( context !== undefined ? { context } : {} ),
                 ...( traceID !== undefined ? { traceID } : {} )
             }));
@@ -1182,7 +1168,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         try
         {
-            const { context, traceID, ...bsonInput } = options;
+            const { context, traceID } = options;
+            const bsonInput = ( context !== undefined || traceID !== undefined )
+                ? (({ context: _c, traceID: _t, ...restOpts }) => restOpts )( options )
+                : options;
             const { projection } = this.converters[conversion];
             const prev = options.cursor?.startsWith( 'prev:' );
 
@@ -1220,7 +1209,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 this._emitQuery( 'stream', pipeline, duration, () => (
                 {
                     conversion  : String( conversion ),
-                    query       : this.#buildListQueryContext( options, sort ),
+                    query       : this._buildListQueryContext( options, sort ),
                     ...( context !== undefined ? { context } : {} ),
                     ...( traceID !== undefined ? { traceID } : {} )
                 }));
@@ -1277,7 +1266,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 {
                     ...( options.filter !== undefined ? { filter: options.filter } : {} ),
                     ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this.#buildListQueryContext( options, sort ),
+                    query : this._buildListQueryContext( options, sort ),
                     ...( context !== undefined ? { context } : {} ),
                     ...( traceID !== undefined ? { traceID } : {} )
                 });

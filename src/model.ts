@@ -11,7 +11,7 @@ from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { ModelCacheConfig, extractTargetIdsFromFilter } from './cache.js';
 import { ModelAccessDeniedError } from './errors.js';
-import { ModelMutationOperation, ModelQueryContext, ObservabilityConfig } from './events.js';
+import { ModelMutationOperation, ObservabilityConfig } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
@@ -951,23 +951,6 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         return super.find( options, conversion, sort );
     }
 
-    #buildListQueryContext( options: any, sort?: Document ): ModelQueryContext
-    {
-        const query: ModelQueryContext = {};
-
-        if( options?.filter !== undefined ){ query.filter = options.filter }
-        if( options?.smartFilter !== undefined ){ query.smartFilter = options.smartFilter as Record<string, unknown> }
-        if( Array.isArray( options?.computedProperties ) ){ query.computedProperties = options.computedProperties }
-        else if( options?.computedProperties && typeof options.computedProperties === 'object' ){ query.computedProperties = Object.keys( options.computedProperties ) }
-        if( sort !== undefined ){ query.sort = sort as Record<string, 1 | -1> }
-        if( options?.limit !== undefined ){ query.limit = options.limit }
-        if( options?.skip !== undefined ){ query.skip = options.skip }
-        if( options?.cursor !== undefined ){ query.cursor = options.cursor }
-        if( options?.access !== undefined ){ query.access = options.access }
-
-        return query;
-    }
-
     public async list<K extends keyof Extensions['converters']>(
         options: ModelListOptions<DBE, ExtractSmartFilters<Extensions>, ExtractComputedProperties<Extensions>>,
         conversion: K = 'dto' as K
@@ -977,7 +960,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
         try
         {
-            const { context, traceID, ...bsonInput } = options;
+            const { context, traceID } = options;
+            const bsonInput = ( context !== undefined || traceID !== undefined )
+                ? (({ context: _c, traceID: _t, ...restOpts }) => restOpts )( options )
+                : options;
             const { projection: convProjection, computedProperties: compProps } = this.converters[conversion];
             let { filter = {}, sort = { _id: 1 }, cursor, limit, countLimit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( bsonInput );
             const prev = cursor?.startsWith( 'prev:' );
@@ -1069,7 +1055,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         this._emitQuery( 'count', countPipeline!, duration, () => (
                         {
                             resultCount : r[0]?.count ?? 0,
-                            query       : this.#buildListQueryContext( options, sort ),
+                            query       : this._buildListQueryContext( options, sort ),
                             ...( context !== undefined ? { context } : {} ),
                             ...( traceID !== undefined ? { traceID } : {} )
                         }));
@@ -1084,7 +1070,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     ...( options.filter !== undefined ? { filter: options.filter } : {} ),
                     ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this.#buildListQueryContext( options, sort ),
+                    query : this._buildListQueryContext( options, sort ),
                     ...( context !== undefined ? { context } : {} ),
                     ...( traceID !== undefined ? { traceID } : {} )
                 });
@@ -1110,7 +1096,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 converterDuration,
                 resultCount : items.length,
                 conversion  : String( conversion ),
-                query       : this.#buildListQueryContext( options, sort ),
+                query       : this._buildListQueryContext( options, sort ),
                 ...( context !== undefined ? { context } : {} ),
                 ...( traceID !== undefined ? { traceID } : {} )
             }));
@@ -1144,7 +1130,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
         try
         {
-            const { context, traceID, ...bsonInput } = options;
+            const { context, traceID } = options;
+            const bsonInput = ( context !== undefined || traceID !== undefined )
+                ? (({ context: _c, traceID: _t, ...restOpts }) => restOpts )( options )
+                : options;
             const { projection: convProjection, computedProperties: compProps } = this.converters[conversion];
             let { filter = {}, sort = { _id: 1 }, cursor, limit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( bsonInput );
             const prev = cursor?.startsWith( 'prev:' );
@@ -1202,7 +1191,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 this._emitQuery( 'stream', pipeline, duration, () => (
                 {
                     conversion  : String( conversion ),
-                    query       : this.#buildListQueryContext( options, sort ),
+                    query       : this._buildListQueryContext( options, sort ),
                     ...( context !== undefined ? { context } : {} ),
                     ...( traceID !== undefined ? { traceID } : {} )
                 }));
@@ -1259,7 +1248,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     ...( options.filter !== undefined ? { filter: options.filter } : {} ),
                     ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this.#buildListQueryContext( options, sort ),
+                    query : this._buildListQueryContext( options, sort ),
                     ...( context !== undefined ? { context } : {} ),
                     ...( traceID !== undefined ? { traceID } : {} )
                 });
