@@ -105,25 +105,28 @@ export class SmartFilterResolver
             result[prefix] = { filter, pipeline };
         }
 
-        if( this.#parentResolve )
+        if( Object.keys( extraFilters ).length > 0 )
         {
-            const resolved = await this.#parentResolve( extraFilters );
+            if( this.#parentResolve )
+            {
+                const resolved = await this.#parentResolve( extraFilters );
 
-            if( 'filter' in resolved && 'pipeline' in resolved )
-            {
-                result[''] = resolved;
-            }
-            else if( Object.keys( resolved ).length > 0 )
-            {
-                for( const path in resolved )
+                if( 'filter' in resolved && 'pipeline' in resolved )
                 {
-                    result[path] = ( resolved as any )[path];
+                    result[''] = resolved;
+                }
+                else if( Object.keys( resolved ).length > 0 )
+                {
+                    for( const path in resolved )
+                    {
+                        result[path] = ( resolved as any )[path];
+                    }
                 }
             }
-        }
-        else if( Object.keys( extraFilters ).length > 0 )
-        {
-            throw new ModelError( 'MODEL_SMART_FILTER_UNSUPPORTED', this.#model, `Unsupported smart filters - ${JSON.stringify( extraFilters, null, 2 )}` );
+            else
+            {
+                throw new ModelError( 'MODEL_SMART_FILTER_UNSUPPORTED', this.#model, `Unsupported smart filters - ${JSON.stringify( extraFilters, null, 2 )}` );
+            }
         }
 
         return result;
@@ -152,6 +155,11 @@ export class ComputedPropertyResolver
             properties = properties();
         }
 
+        if( Array.isArray( properties ) )
+        {
+            properties = properties.reduce(( acc, val ) => { acc[val] = null; return acc }, {} as any );
+        }
+
         if( this.#prefix !== undefined )
         {
             return this.#resolveProperty( properties );
@@ -163,16 +171,6 @@ export class ComputedPropertyResolver
     async #resolveRoot( properties?: ComputedPropertiesParam<any> ): Promise<Awaited<ReturnType<SyncComputedPropertyMethod>>>
     {
         const result: ReturnType<ComputedPropertyMethod> = { fields: {}, pipeline: [] };
-
-        if( typeof properties === 'function' )
-        {
-            properties = properties();
-        }
-
-        if( Array.isArray( properties ) )
-        {
-            properties = properties.reduce(( acc, val ) => { acc[val] = null; return acc }, {} as any );
-        }
 
         for( const property in ( properties as object ) )
         {
@@ -198,16 +196,6 @@ export class ComputedPropertyResolver
         let fields: Document = {};
         const extraProperties: any = {};
         const prefix = this.#prefix!;
-
-        if( typeof properties === 'function' )
-        {
-            properties = properties();
-        }
-
-        if( Array.isArray( properties ) )
-        {
-            properties = properties.reduce(( acc, val ) => { acc[val] = null; return acc }, {} as any );
-        }
 
         for( const property in ( properties as object ) )
         {
@@ -236,25 +224,28 @@ export class ComputedPropertyResolver
             result[prefix] = { fields, pipeline };
         }
 
-        if( this.#parentResolve )
+        if( Object.keys( extraProperties ).length > 0 )
         {
-            const resolvedProperties = await this.#parentResolve( extraProperties );
+            if( this.#parentResolve )
+            {
+                const resolvedProperties = await this.#parentResolve( extraProperties );
 
-            if( 'fields' in resolvedProperties && 'pipeline' in resolvedProperties )
-            {
-                result[''] = resolvedProperties as { fields: Document, pipeline: Document[] };
-            }
-            else if( Object.keys( resolvedProperties ).length > 0 )
-            {
-                for( const path in resolvedProperties )
+                if( 'fields' in resolvedProperties && 'pipeline' in resolvedProperties )
                 {
-                    result[path] = resolvedProperties[path];
+                    result[''] = resolvedProperties as { fields: Document, pipeline: Document[] };
+                }
+                else if( Object.keys( resolvedProperties ).length > 0 )
+                {
+                    for( const path in resolvedProperties )
+                    {
+                        result[path] = resolvedProperties[path];
+                    }
                 }
             }
-        }
-        else if( Object.keys( extraProperties ).length > 0 )
-        {
-            throw new ModelError( 'MODEL_COMPUTED_PROPERTY_UNSUPPORTED', this.#model, `Unsupported computed properties - ${Object.keys( extraProperties ).join( ', ' )}` );
+            else
+            {
+                throw new ModelError( 'MODEL_COMPUTED_PROPERTY_UNSUPPORTED', this.#model, `Unsupported computed properties - ${Object.keys( extraProperties ).join( ', ' )}` );
+            }
         }
 
         return result;

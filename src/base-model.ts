@@ -12,7 +12,7 @@ import { optimizePipeline } from '@webergency-utils/mongodb-query-optimizer';
 import { AccessControl } from './access-control.js';
 import { ModelCache, ModelCacheConfig, buildCacheKey } from './cache.js';
 import { ConverterManager } from './converters.js';
-import { ModelError } from './errors.js';
+import { ModelConverterError, ModelError } from './errors.js';
 import
 {
     ModelCacheEvent,
@@ -40,6 +40,7 @@ import
     Arr,
     DUMP,
     LOG_FILE,
+    getCursor,
     isSet,
     map,
     objectHash,
@@ -49,6 +50,8 @@ from './helpers/index.js';
 import { AbstractModels } from './models.js';
 import
 {
+    attachCursorToItem,
+    attachListMetadata,
     convertDocuments,
     normalizeExistsOptions,
     normalizeGetManyOptions,
@@ -79,7 +82,8 @@ import
     ModelExistsOptions,
     MongoRootDocument,
     OptimizerConfig,
-    OptimizerOptions
+    OptimizerOptions,
+    WithTotal
 }
 from './types/external.js';
 import { ComputedPropertiesParam } from './types/internal.js';
@@ -170,10 +174,12 @@ export abstract class AbstractBaseModel
             const metaKey = this.#batchMetaKey( conversion, accessCtx?.access, accessCtx?.scopeKey );
             const queue = this.#pendingBatchMeta.get( metaKey );
             const batchEntries: ObservabilityBatchEntry[] = [];
+            let dtoIds: Array<DTO['id']> | undefined;
 
             if( queue && queue.length > 0 )
             {
-                const requestedIdSet = new Set( ids.map( id => String( this.dtoID( id ))));
+                dtoIds = ids.map( id => this.dtoID( id ));
+                const requestedIdSet = new Set( dtoIds.map( String ));
 
                 for( let i = 0; i < queue.length; i++ )
                 {
@@ -241,11 +247,10 @@ export abstract class AbstractBaseModel
             };
 
             let start = Date.now();
-            let dtoIds: Array<DTO['id']> | undefined;
 
             try
             {
-                dtoIds = ids.map( id => this.dtoID( id ));
+                dtoIds ??= ids.map( id => this.dtoID( id ));
                 const dbeIds = ids.map( id => this.dbeID( id ));
 
                 let pipeline = await this.pipeline(
@@ -734,6 +739,24 @@ export abstract class AbstractBaseModel
         method?: string
     ): Promise<Document[]>;
 
+    #emitCacheEntry(
+        operation: 'hit' | 'miss' | 'set',
+        key: string,
+        dtoId: string,
+        conversion: string | number | symbol,
+        options: { context?: Record<string, unknown>, traceID?: string }
+    ): void
+    {
+        this._emitCache( operation, () => (
+        {
+            key,
+            ids         : [ dtoId ],
+            conversion  : String( conversion ),
+            ...( options.context !== undefined ? { context: options.context } : {} ),
+            ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
+        }));
+    }
+
     public async get<K extends keyof Extensions['converters'] = 'dto'>(
         id: any,
         options?: GetOptions<K> | K
@@ -767,9 +790,7 @@ export abstract class AbstractBaseModel
             return this.getMany( idOrIds, normalizeGetManyOptions<K>( optionsOrConversion as GetManyOptions<K> | K, filtered ));
         }
 
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async(): Promise<any> =>
         {
             const options = normalizeGetOptions<K>( optionsOrConversion as GetOptions<K> | K );
             const conversion = ( options.as ?? 'dto' ) as K;
@@ -778,35 +799,23 @@ export abstract class AbstractBaseModel
             if( access.denied ){ return null }
 
             const scopeKey = access.filter ? objectHash( access.filter ) : undefined;
-            const dtoId = String( this.dtoID( idOrIds ));
-            const cacheKey = this._cache ? buildCacheKey( String( conversion ), dtoId, scopeKey ) : undefined;
+            let dtoId: string | undefined;
+            let cacheKey: string | undefined;
 
-            if( this._cache && cacheKey )
+            if( this._cache )
             {
+                dtoId = String( this.dtoID( idOrIds ));
+                cacheKey = buildCacheKey( String( conversion ), dtoId, scopeKey );
                 const cached = this._cache.get<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>( cacheKey );
 
                 if( cached !== undefined )
                 {
-                    this._emitCache( 'hit', () => (
-                    {
-                        key         : cacheKey,
-                        ids         : [ dtoId ],
-                        conversion  : String( conversion ),
-                        ...( options.context !== undefined ? { context: options.context } : {} ),
-                        ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                    }));
+                    this.#emitCacheEntry( 'hit', cacheKey, dtoId, conversion, options );
 
                     return cached;
                 }
 
-                this._emitCache( 'miss', () => (
-                {
-                    key         : cacheKey,
-                    ids         : [ dtoId ],
-                    conversion  : String( conversion ),
-                    ...( options.context !== undefined ? { context: options.context } : {} ),
-                    ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                }));
+                this.#emitCacheEntry( 'miss', cacheKey, dtoId, conversion, options );
             }
 
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':get(' + String( conversion ) + ')' ) : undefined;
@@ -842,25 +851,14 @@ export abstract class AbstractBaseModel
 
             const result = ( entries[0] ?? null ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null;
 
-            if( this._cache && cacheKey && result !== null )
+            if( this._cache && cacheKey && dtoId !== undefined && result !== null )
             {
                 this._cache.set( cacheKey, result, [ dtoId ]);
-                this._emitCache( 'set', () => (
-                {
-                    key         : cacheKey,
-                    ids         : [ dtoId ],
-                    conversion  : String( conversion ),
-                    ...( options.context !== undefined ? { context: options.context } : {} ),
-                    ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                }));
+                this.#emitCacheEntry( 'set', cacheKey, dtoId, conversion, options );
             }
 
             return result;
-        }
-        finally
-        {
-            release();
-        }
+        });
     }
 
     public async getMany<K extends keyof Extensions['converters'] = 'dto'>(
@@ -883,9 +881,7 @@ export abstract class AbstractBaseModel
         filtered?: boolean
     ): Promise<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>>
     {
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async() =>
         {
             const options = normalizeGetManyOptions<K>( optionsOrConversion, filtered );
             const conversion = ( options.as ?? 'dto' ) as K;
@@ -918,28 +914,14 @@ export abstract class AbstractBaseModel
 
                         if( observeCache )
                         {
-                            this._emitCache( 'hit',
-                            {
-                                key         : cacheKey,
-                                ids         : [ dtoId ],
-                                conversion  : String( conversion ),
-                                ...( options.context !== undefined ? { context: options.context } : {} ),
-                                ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                            });
+                            this.#emitCacheEntry( 'hit', cacheKey, dtoId, conversion, options );
                         }
                     }
                     else
                     {
                         if( observeCache )
                         {
-                            this._emitCache( 'miss',
-                            {
-                                key         : cacheKey,
-                                ids         : [ dtoId ],
-                                conversion  : String( conversion ),
-                                ...( options.context !== undefined ? { context: options.context } : {} ),
-                                ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                            });
+                            this.#emitCacheEntry( 'miss', cacheKey, dtoId, conversion, options );
                         }
 
                         missing.push({ index: i, id, dtoId, cacheKey });
@@ -991,14 +973,7 @@ export abstract class AbstractBaseModel
 
                             if( observeCache )
                             {
-                                this._emitCache( 'set',
-                                {
-                                    key         : target.cacheKey,
-                                    ids         : [ target.dtoId ],
-                                    conversion  : String( conversion ),
-                                    ...( options.context !== undefined ? { context: options.context } : {} ),
-                                    ...( options.traceID !== undefined ? { traceID: options.traceID } : {} )
-                                });
+                                this.#emitCacheEntry( 'set', target.cacheKey, target.dtoId, conversion, options );
                             }
                         }
                     }
@@ -1037,10 +1012,205 @@ export abstract class AbstractBaseModel
             benchmark?.step( 'CONVERTER' );
 
             return entries as Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> | null>;
-        }
-        finally
+        });
+    }
+
+    protected _stripObservabilityOptions<T extends { context?: Record<string, unknown>, traceID?: string }>( options: T ): Omit<T, 'context' | 'traceID'>
+    {
+        if( options.context === undefined && options.traceID === undefined )
         {
-            release();
+            return options;
+        }
+
+        const { context: _c, traceID: _t, ...rest } = options;
+
+        return rest;
+    }
+
+    protected async _executeList<K extends keyof Extensions['converters']>(
+        pipeline: Document[],
+        countPipeline: Document[] | undefined,
+        options: any,
+        sort: Document,
+        conversion: K,
+        benchmark?: Benchmark,
+        includeCount?: boolean
+    ): Promise<WithTotal<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>>>
+    {
+        const { context, traceID } = options;
+        const prev = options.cursor?.startsWith( 'prev:' );
+        const start = Date.now();
+        let queryDuration = 0;
+        let entries: Document[];
+        let total: number | undefined;
+
+        try
+        {
+            [ entries, total ] = await Promise.all(
+            [
+                this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+                {
+                    queryDuration = Date.now() - start;
+
+                    LOG_FILE( `Collection: ${this._collectionLabel}` );
+                    LOG_FILE( `TIME: ${queryDuration} ms` );
+                    LOG_FILE( pipeline, true );
+
+                    return r;
+                }),
+                countPipeline
+                    ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
+                    {
+                        const duration = Date.now() - start;
+
+                        LOG_FILE( `Collection: ${this._collectionLabel}` );
+                        LOG_FILE( `TIME: ${duration} ms` );
+                        LOG_FILE( countPipeline, true );
+                        this._emitQuery( 'count', countPipeline, duration, () => (
+                        {
+                            resultCount : r[0]?.count ?? 0,
+                            query       : this._buildListQueryContext( options, sort ),
+                            ...( context !== undefined ? { context } : {} ),
+                            ...( traceID !== undefined ? { traceID } : {} )
+                        }));
+
+                        return r[0]?.count ?? 0;
+                    })
+                    : undefined
+            ]);
+        }
+        catch( e )
+        {
+            this._emitError( e, 'list', Date.now() - start, () => (
+            {
+                ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
+                query : this._buildListQueryContext( options, sort ),
+                ...( context !== undefined ? { context } : {} ),
+                ...( traceID !== undefined ? { traceID } : {} )
+            }));
+
+            throw e;
+        }
+
+        benchmark?.step( 'QUERY' );
+
+        const orderedEntries = prev ? [ ...entries ].reverse() : entries;
+        const convStart = Date.now();
+        const items = await Promise.all( orderedEntries.map( async( dbe ) =>
+        {
+            const dto = await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
+
+            return attachCursorToItem( dto, dbe, sort );
+        }));
+        const converterDuration = Date.now() - convStart;
+
+        this._emitQuery( 'list', pipeline, queryDuration, () => (
+        {
+            converterDuration,
+            resultCount : items.length,
+            conversion  : String( conversion ),
+            query       : this._buildListQueryContext( options, sort ),
+            ...( context !== undefined ? { context } : {} ),
+            ...( traceID !== undefined ? { traceID } : {} )
+        }));
+
+        benchmark?.step( 'CONVERTER' );
+
+        const first = orderedEntries[0];
+        const last = orderedEntries[orderedEntries.length - 1];
+
+        return attachListMetadata(
+            items,
+            ( includeCount ?? options.count ) ? total : undefined,
+            {
+                prev    : first ? getCursor( first, sort ) : undefined,
+                next    : last ? getCursor( last, sort ) : undefined
+            }
+        );
+    }
+
+    protected async *_executeStream<K extends keyof Extensions['converters']>(
+        pipeline: Document[],
+        options: any,
+        sort: Document,
+        conversion: K
+    ): AsyncGenerator<Awaited<ReturnType<Extensions['converters'][K]['converter']>>>
+    {
+        const { context, traceID } = options;
+        const prev = options.cursor?.startsWith( 'prev:' );
+        const start = Date.now();
+        const emitStreamQuery = ( duration: number ) =>
+        {
+            this._emitQuery( 'stream', pipeline, duration, () => (
+            {
+                conversion  : String( conversion ),
+                query       : this._buildListQueryContext( options, sort ),
+                ...( context !== undefined ? { context } : {} ),
+                ...( traceID !== undefined ? { traceID } : {} )
+            }));
+        };
+
+        try
+        {
+            const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
+
+            if( prev )
+            {
+                const entries = await cursorDocs.toArray();
+                const duration = Date.now() - start;
+
+                LOG_FILE( `Collection: ${this._collectionLabel}` );
+                LOG_FILE( `TIME: ${duration} ms` );
+                LOG_FILE( pipeline, true );
+                emitStreamQuery( duration );
+
+                for( const dbe of entries.reverse() )
+                {
+                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+                }
+
+                return;
+            }
+
+            let emitted = false;
+
+            for await( const dbe of cursorDocs )
+            {
+                if( !emitted )
+                {
+                    emitted = true;
+                    const duration = Date.now() - start;
+
+                    LOG_FILE( `Collection: ${this._collectionLabel}` );
+                    LOG_FILE( `TIME: ${duration} ms` );
+                    LOG_FILE( pipeline, true );
+                    emitStreamQuery( duration );
+                }
+
+                yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
+            }
+
+            if( !emitted )
+            {
+                emitStreamQuery( Date.now() - start );
+            }
+        }
+        catch( e )
+        {
+            if( !( e instanceof ModelConverterError ) )
+            {
+                this._emitError( e, 'stream', Date.now() - start, () => (
+                {
+                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
+                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
+                    query : this._buildListQueryContext( options, sort ),
+                    ...( context !== undefined ? { context } : {} ),
+                    ...( traceID !== undefined ? { traceID } : {} )
+                }));
+            }
+
+            throw e;
         }
     }
 

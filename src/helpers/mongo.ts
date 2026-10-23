@@ -61,12 +61,7 @@ function addPrefixToValue( filter: Filter | any, prefix: string, prefixKeys: boo
             return { [key]:  Object.fromEntries( Object.entries( filter[key] ).map(([ key, value ]) => [ key, addPrefixToValue( value, prefix )]))};
         }
     }
-    if( typeof filter === 'object' &&
-    (
-        ( isLibraryObjectId( filter ) || isForeignObjectIdLike( filter ) ) ||
-        ( filter instanceof Date )  ||
-        ( filter instanceof RegExp ) // TODO is basic object alternative?
-    ))
+    if( typeof filter === 'object' && isNonPlainOptimizerValue( filter ) )
     {
         return filter;
     }
@@ -120,7 +115,6 @@ export function coerceToLibraryObjectId( value: unknown ): unknown
     return value;
 }
 
-//export function resolveFilterValue( filter: Filter | any ): Filter | any
 export function resolveBSONValue( value: any ): any
 {
     if( typeof value === 'string' ){ return value; }
@@ -139,7 +133,7 @@ export function resolveBSONValue( value: any ): any
     if( typeof value === 'object' && Object.keys( value ).length === 1 )
     {
         if( value.hasOwnProperty('$oid') ){ return new ObjectId( value.$oid as string )}
-        if( value.hasOwnProperty('$date') ){ return new Date( value.$date )} // TODO verify it is not colliding
+        if( value.hasOwnProperty('$date') ){ return new Date( value.$date )}
         if( value.hasOwnProperty('$function') )
         {
             if( typeof value.$function.body === 'function' )
@@ -154,7 +148,6 @@ export function resolveBSONValue( value: any ): any
     return resolveBSONObject( value );
 }
 
-//export function resolveFilterOIDs( filter: Filter ): Filter
 export function resolveBSONObject( obj: Record<string, any> ): Record<string, any>
 {
     if( Array.isArray( obj ))
@@ -215,7 +208,7 @@ export function addPrefixToFilter( filter: Filter, prefix: string, prefixKeys: b
     return newFilter;
 }
 
-/**/export function addPrefixToPipeline( pipeline: Document[], prefix: string ): Document[]
+export function addPrefixToPipeline( pipeline: Document[], prefix: string ): Document[]
 {
     if( !prefix ){ return pipeline; }
 
@@ -227,7 +220,7 @@ export function addPrefixToFilter( filter: Filter, prefix: string, prefixKeys: b
 
         if([ '$addFields', '$facet', '$match', '$set', '$sort' ].includes( stage ))
         {
-            prefixed.push( { [stage]: addPrefixToValue( query, prefix )}); // Object.entries( query ).map(([ key, value ]) => [ prefix + '.' + key, ]))});
+            prefixed.push( { [stage]: addPrefixToValue( query, prefix )});
         }
         else if([ '$group' ].includes( stage ))
         {
@@ -273,7 +266,7 @@ export function addPrefixToFilter( filter: Filter, prefix: string, prefixKeys: b
             {
                 ...query,
                 from: query.from,
-                ...( query.localField ? { localField: prefix + '.' + query.localField } : undefined ), // TODO root?
+                ...( query.localField ? { localField: prefix + '.' + query.localField } : undefined ),
                 ...( query.foreignField ? { foreignField: query.foreignField } : undefined ),
                 as: prefix + '.' + query.as,
                 ...(query.let ? { let: Object.fromEntries( Object.entries( query.let ).map(([ key, value ]) => [ key, addPrefixToValue( value, prefix )]) ) } : undefined),
@@ -281,8 +274,6 @@ export function addPrefixToFilter( filter: Filter, prefix: string, prefixKeys: b
         }
         else if([ '$bucket', '$bucketAuto', '$fill', '$graphLookup', '$replaceRoot', '$replaceWith', '$sample', '$unwind' ].includes( stage ))
         {
-            // TODO toto nie je uplne dobre
-
             if( typeof query === 'string' )
             {
                 prefixed.push( { [stage]: addPrefixToValue( query, prefix )});
@@ -292,18 +283,14 @@ export function addPrefixToFilter( filter: Filter, prefix: string, prefixKeys: b
                 prefixed.push( { [stage]: Object.fromEntries( Object.entries( query ).map(([ key, value ]) => [ key, addPrefixToValue( value, prefix )]))});
             }
         }
-        // zakazat graphLookup, collStats, indexStats merge, out, $redact $search, $searchMeta, $setWindowFields, $sortByCount, '$unionWith' vectorSearch
         else
         {
             throw new Error(`Unsupported pipeline stage: "${stage}"`);
         }
-
-        //lookup - prefixovat localField a as
     }
 
     return prefixed;
 }
-/**/
 
 export function addPrefixToUpdate<RootDBE,DBE>( update: Partial<DBE> | UpdateFilter<DBE>, prefix: string ): Partial<RootDBE> | UpdateFilter<RootDBE>
 {
@@ -670,7 +657,6 @@ export function optimizeMatch( obj: MongoFilter<any> ): MongoFilter<any> | undef
  * Builds update parameters for property model update
  * @param paths
  * @param parentID
- // * @param operation - create or update - determines if filtering should be done on parentID or _id
  */
 export function propertyModelUpdateParams( paths: { path: string, array: boolean }[], parentID: any, ancestorIds?: any[] )
 {
@@ -733,16 +719,7 @@ export function propertyModelTargetUpdateParams( paths: { path: string, array: b
         };
     }
 
-    let lastArrayIdx = -1;
-
-    for( let i = paths.length - 1; i >= 0; i-- )
-    {
-        if( paths[i].array )
-        {
-            lastArrayIdx = i;
-            break;
-        }
-    }
+    const lastArrayIdx = paths.findLastIndex( p => p.array );
 
     if( lastArrayIdx === -1 )
     {
@@ -774,21 +751,27 @@ export function propertyModelTargetUpdateParams( paths: { path: string, array: b
     };
 }
 
-export function mergeComputedProperties( ...objects: { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>>}[] ): { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>>}
+export function mergeComputedProperties( ...objects: Array<{ [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> | undefined } | undefined> ): { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> }
 {
-    const computed: { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>>} = {}
+    const computed: { [path: string]: Awaited<ReturnType<SyncComputedPropertyMethod>> } = {};
 
-    for ( const properties of objects )
+    for( const properties of objects )
     {
-        for ( const prefix in properties )
+        if( !properties ){ continue }
+
+        for( const prefix in properties )
         {
-            if ( !computed[prefix] )
+            const prop = properties[prefix];
+
+            if( !prop ){ continue }
+
+            if( !computed[prefix] )
             {
                 computed[prefix] = { fields: {}, pipeline: [] };
             }
 
-            computed[prefix].fields = { ...computed[prefix].fields, ...properties[prefix].fields };
-            properties[prefix].pipeline && computed[prefix].pipeline!.push( ...properties[prefix].pipeline );
+            computed[prefix].fields = { ...computed[prefix].fields, ...prop.fields };
+            prop.pipeline && computed[prefix].pipeline!.push( ...prop.pipeline );
         }
     }
 
@@ -1281,29 +1264,3 @@ function getOperations( obj: object )
 
 export const isSet = ( value: any ): boolean => value !== undefined && value !== null && ( Array.isArray( value ) ? value.length > 0 : ( typeof value === 'object' ? Object.keys( value ).length > 0 : true ));
 export const Arr = ( value: any ): any[] => Array.isArray( value ) ? value : [ value ];
-
-
-/*
-LOG( addPrefixToFilter(
-{
-    $and:
-    [
-        { active: true, $root: { active: true }, '$root.events.closed': { $exists: false }, $eq: [ '$events.closed', '$root.events.closed' ]},
-        { $or:
-        [
-            { $root: { programmeID: { $gt: 1 }}},
-            { $root: { programmeID: { $eq: 1 }}, '$root.events.closed': { $gt: 1 }},
-            { $root: { programmeID: { $eq: 1 }}, '$root.events.closed': { $eq: 1 }, 'events.closed': { $gt: 1 }},
-            { $root: { programmeID: { $eq: 1 }}, '$root.events.closed': { $eq: 1 }, 'events.closed': { $eq: 1 }, events: { created: { $gt: 1 }}},
-            { $root: { programmeID: { $eq: 1 }}, '$root.events.closed': { $eq: 1 }, 'events.closed': { $eq: 1 }, events: { created: { $eq: 1 }}, id: { $gt: 1 }},
-        ]}
-    ]
-},
-'prefix' ));*/
-
-//console.log( projectionToProject({ test: 1, 'foo.bar': 1 }));
-
-// TODO podpora subobjektu
-//console.log( projectionToProject({ testik: 'test', 'foo.bar': 1, 'jobID': '$root._id', zamestnanec: { janko: '$employer' } }));
-//console.log( projectionToProject({ testik: 'test', 'foo.bar': 1, 'jobID': '$root._id' }) );
-//console.log( addPrefixToFilter( projectionToProject({ testik: 'test', 'foo.bar': 1, 'jobID': '$root._id' }), 'prefixik', false ) )

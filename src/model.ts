@@ -10,24 +10,21 @@ import
 from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { ModelCacheConfig, extractTargetIdsFromFilter } from './cache.js';
-import { ModelAccessDeniedError, ModelConverterError } from './errors.js';
+import { ModelAccessDeniedError } from './errors.js';
 import { ModelMutationOperation, ObservabilityConfig } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
 {
     DUMP,
-    LOG_FILE,
     mergeComputedProperties,
     resolveBSONObject,
     toUpdateOperations
 }
 from './helpers/index.js';
-import { getCursor } from './helpers/mongo.js';
 import { AbstractModels } from './models.js';
 import
 {
-    attachCursorToItem,
     attachListMetadata,
     normalizeFindMatch,
     resolveCreateFromArgs
@@ -113,12 +110,12 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
         const [ convProps, optProps, accessResult, resolvedSmartFilter ] = await Promise.all(
         [
-            this.resolveComputedProperties( converterComputedProperties ),
-            this.resolveComputedProperties( optionsComputedProperties ),
+            converterComputedProperties ? this.resolveComputedProperties( converterComputedProperties ) : undefined,
+            optionsComputedProperties ? this.resolveComputedProperties( optionsComputedProperties ) : undefined,
             preResolvedAccess ?? this._access.resolveOrDeny({ operation: 'read', method, access }),
             smartFilter ? this.resolveSmartFilter( smartFilter ) : undefined
         ]);
-        const computedProperties = mergeComputedProperties({ '': convProps }, { '': optProps })[''];
+        const computedProperties = ( convProps || optProps ) ? mergeComputedProperties({ '': convProps }, { '': optProps })[''] : undefined;
         const accessFilter = accessResult.denied ? ({ _id: { $exists: false } } as Filter<DBE>) : accessResult.filter;
 
         return this._pipelineBuilder.pipeline(
@@ -137,9 +134,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
     public async create( dbe: Omit<DBE, '_id'>, id?: DTO['id'], options?: ModelCreateOptions ): Promise<DTO['id']>
     {
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async() =>
         {
             const access = await this._access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
 
@@ -221,11 +216,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             }
 
             return _id;
-        }
-        finally
-        {
-            release();
-        }
+        });
     }
 
     public async createFrom(
@@ -352,9 +343,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
     public async update( id: DTO['id'] | DBE['_id'], update: Partial<DBE> | UpdateFilter<DBE>, options?: ModelUpdateOptions ): Promise<ModelUpdateResponse<DBE>>
     {
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async() =>
         {
             const match = await this._access.match(
                 resolveBSONObject({ _id: this.dbeID( id ) }) as Filter<DBE>,
@@ -422,11 +411,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
                 throw e;
             }
-        }
-        finally
-        {
-            release();
-        }
+        });
     }
 
     async #findOneAndUpdateWithSnapshots(
@@ -504,7 +489,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         limit?: number
     ): Promise<{
         finalMatch  : Filter<DBE> | null
-        targetIds   : string[] | null
+        targetIds   : string[]
         empty?      : boolean
         rawFilter   : Filter<DBE>
         smartFilter?: Record<string, unknown>
@@ -513,18 +498,21 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
     }>
     {
         const { filter: rawFilter, smartFilter, access, context, traceID } = normalizeFindMatch<Filter<DBE>, any>( matchInput, options );
+        const [ resolvedSmart, accessResult ] = await Promise.all(
+        [
+            smartFilter ? this.resolveSmartFilter( smartFilter ) : undefined,
+            this._access.resolveOrDeny({ operation, method, access })
+        ]);
+
+        if( accessResult.denied )
+        {
+            return { finalMatch: null, targetIds: [], rawFilter, smartFilter, context, traceID };
+        }
+
         const targetIds = extractTargetIdsFromFilter( matchInput, '_id', id => String( this.dtoID( id )));
-        const resolvedSmart = smartFilter ? await this.resolveSmartFilter( smartFilter ) : undefined;
 
         if( resolvedSmart?.pipeline?.length )
         {
-            const accessResult = await this._access.resolveOrDeny({ operation, method, access });
-
-            if( accessResult.denied )
-            {
-                return { finalMatch: null, targetIds, rawFilter, smartFilter, context, traceID };
-            }
-
             let pipeline = await this._pipelineBuilder.pipeline(
             {
                 filter          : resolveBSONObject( rawFilter ) as Filter<DBE>,
@@ -586,7 +574,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             if( matchedDbeIds.length === 0 )
             {
-                return { finalMatch: null, targetIds: targetIds ?? matchedDtoIds, empty: true, rawFilter, smartFilter, context, traceID };
+                return { finalMatch: null, targetIds: targetIds.length > 0 ? targetIds : matchedDtoIds, empty: true, rawFilter, smartFilter, context, traceID };
             }
 
             const finalMatch = ( limit === 1
@@ -599,11 +587,10 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         const combinedFilter = resolvedSmart?.filter
             ? ( Object.keys( rawFilter ).length > 0 ? { $and: [ rawFilter, resolvedSmart.filter ] } : resolvedSmart.filter )
             : rawFilter;
-
-        const finalMatch = await this._access.match(
-            resolveBSONObject( combinedFilter ) as Filter<DBE>,
-            { operation, method, access }
-        );
+        const resolvedBase = resolveBSONObject( combinedFilter ) as Filter<DBE>;
+        const finalMatch = accessResult.filter
+            ? ({ $and: [ resolvedBase, accessResult.filter ] } as Filter<DBE>)
+            : resolvedBase;
 
         return { finalMatch, targetIds, rawFilter, smartFilter, context, traceID };
     }
@@ -614,9 +601,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         options?: ModelUpdateOptions
     ): Promise<ModelUpdateResponse<DBE>>
     {
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async() =>
         {
             if( Array.isArray( idsOrFilter ) )
             {
@@ -691,7 +676,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 if( empty )
                 {
-                    if( targetIds && targetIds.length > 0 )
+                    if( targetIds.length > 0 )
                     {
                         this._invalidateCache( targetIds, false );
                     }
@@ -700,7 +685,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     {
                         matchedCount    : 0,
                         modifiedCount   : 0,
-                        ids             : targetIds ?? undefined,
+                        ids             : targetIds.length > 0 ? targetIds : undefined,
                         filter          : rawFilter,
                         ...( smartFilter !== undefined ? { smartFilter } : {} ),
                         ...( context !== undefined ? { context } : {} ),
@@ -731,7 +716,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 throw e;
             }
 
-            if( targetIds && targetIds.length > 0 )
+            if( targetIds.length > 0 )
             {
                 this._invalidateCache( targetIds, res.matchedCount > 0 );
             }
@@ -744,7 +729,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount,
-                ids             : targetIds ?? undefined,
+                ids             : targetIds.length > 0 ? targetIds : undefined,
                 filter          : finalMatch,
                 ...( smartFilter !== undefined ? { smartFilter } : {} ),
                 ...( context !== undefined ? { context } : {} ),
@@ -755,11 +740,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 matchedCount    : res.matchedCount,
                 modifiedCount   : res.modifiedCount
             };
-        }
-        finally
-        {
-            release();
-        }
+        });
     }
 
     public async updateOne(
@@ -782,7 +763,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 if( empty )
                 {
-                    if( targetIds && targetIds.length > 0 )
+                    if( targetIds.length > 0 )
                     {
                         this._invalidateCache( targetIds, false );
                     }
@@ -791,7 +772,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     {
                         matchedCount    : 0,
                         modifiedCount   : 0,
-                        ids             : targetIds ?? undefined,
+                        ids             : targetIds.length > 0 ? targetIds : undefined,
                         filter          : rawFilter,
                         ...( smartFilter !== undefined ? { smartFilter } : {} ),
                         ...( context !== undefined ? { context } : {} ),
@@ -814,7 +795,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                         { ...options, context, traceID },
                         'updateOne'
                     );
-                    const idsToEvict = targetIds && targetIds.length > 0
+                    const idsToEvict = targetIds.length > 0
                         ? targetIds
                         : ( snapshot.document?._id !== undefined ? [ String( this.dtoID( snapshot.document._id )) ] : null );
 
@@ -848,7 +829,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
                 const res = await this.collection.updateOne( finalMatch, toUpdateOperations( update ));
 
-                if( targetIds && targetIds.length > 0 )
+                if( targetIds.length > 0 )
                 {
                     this._invalidateCache( targetIds, res.matchedCount > 0 );
                 }
@@ -861,7 +842,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 {
                     matchedCount    : res.matchedCount,
                     modifiedCount   : res.modifiedCount,
-                    ids             : targetIds ?? undefined,
+                    ids             : targetIds.length > 0 ? targetIds : undefined,
                     filter          : finalMatch,
                     ...( smartFilter !== undefined ? { smartFilter } : {} ),
                     ...( context !== undefined ? { context } : {} ),
@@ -956,17 +937,11 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
         conversion: K = 'dto' as K
     ): Promise<WithTotal<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>>>
     {
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async() =>
         {
-            const { context, traceID } = options;
-            const bsonInput = ( context !== undefined || traceID !== undefined )
-                ? (({ context: _c, traceID: _t, ...restOpts }) => restOpts )( options )
-                : options;
+            const bsonInput = this._stripObservabilityOptions( options );
             const { projection: convProjection, computedProperties: compProps } = this.converters[conversion];
             let { filter = {}, sort = { _id: 1 }, cursor, limit, countLimit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( bsonInput );
-            const prev = cursor?.startsWith( 'prev:' );
 
             if( !sort._id )
             {
@@ -974,30 +949,20 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             }
 
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'list', access: options.access });
 
-            let accessFilter: Filter<DBE> | undefined;
-
-            try
+            if( access.denied )
             {
-                accessFilter = await this._access.resolve({ operation: 'read', method: 'list', access: options.access });
-            }
-            catch( e )
-            {
-                if( e instanceof ModelAccessDeniedError )
-                {
-                    return attachListMetadata([], options.count ? 0 : undefined, {});
-                }
-
-                throw e;
+                return attachListMetadata([], options.count ? 0 : undefined, {});
             }
 
             const [ smartFilter, convProps, optProps ] = await Promise.all(
             [
                 options.smartFilter ? this.resolveSmartFilter( options.smartFilter ) : undefined,
-                this.resolveComputedProperties( compProps ),
-                this.resolveComputedProperties( optionsCompProps )
+                compProps ? this.resolveComputedProperties( compProps ) : undefined,
+                optionsCompProps ? this.resolveComputedProperties( optionsCompProps ) : undefined
             ]);
-            const computedProperties = mergeComputedProperties({ '': convProps }, { '': optProps })[''];
+            const computedProperties = ( convProps || optProps ) ? mergeComputedProperties({ '': convProps }, { '': optProps })[''] : undefined;
 
             const params =
             {
@@ -1009,8 +974,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 cursor,
                 limit,
                 countLimit,
-                accessFilter,
-                pipeline: options.pipeline,
+                accessFilter : access.filter,
+                pipeline     : options.pipeline,
                 computedProperties
             };
 
@@ -1026,99 +991,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             flowGet( 'log' ) && DUMP( pipeline );
             flowGet( 'log' ) && countPipeline && DUMP( countPipeline );
 
-            const start = Date.now();
-            let queryDuration = 0;
-            let entries: Document[];
-            let total: number | undefined;
-
-            try
-            {
-                [ entries, total ] = await Promise.all(
-                [
-                    this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
-                    {
-                        queryDuration = Date.now() - start;
-
-                        LOG_FILE( `Collection: ${this._collectionLabel}` );
-                        LOG_FILE( `TIME: ${queryDuration} ms` );
-                        LOG_FILE( pipeline, true );
-
-                        return r;
-                    }),
-                    options.count ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
-                    {
-                        const duration = Date.now() - start;
-
-                        LOG_FILE( `Collection: ${this._collectionLabel}` );
-                        LOG_FILE( `TIME: ${duration} ms` );
-                        LOG_FILE( countPipeline, true );
-                        this._emitQuery( 'count', countPipeline!, duration, () => (
-                        {
-                            resultCount : r[0]?.count ?? 0,
-                            query       : this._buildListQueryContext( options, sort ),
-                            ...( context !== undefined ? { context } : {} ),
-                            ...( traceID !== undefined ? { traceID } : {} )
-                        }));
-
-                        return r[0]?.count ?? 0;
-                    }) : undefined
-                ]);
-            }
-            catch( e )
-            {
-                this._emitError( e, 'list', Date.now() - start, () => (
-                {
-                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this._buildListQueryContext( options, sort ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
-                }));
-
-                throw e;
-            }
-
-            benchmark?.step( 'QUERY' );
-
-            let orderedEntries = prev ? [ ...entries ].reverse() : entries;
-
-            const convStart = Date.now();
-            const items = await Promise.all( orderedEntries.map( async( dbe ) =>
-            {
-                const dto = await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
-
-                return attachCursorToItem( dto, dbe, sort );
-            }));
-            const converterDuration = Date.now() - convStart;
-
-            this._emitQuery( 'list', pipeline, queryDuration, () => (
-            {
-                converterDuration,
-                resultCount : items.length,
-                conversion  : String( conversion ),
-                query       : this._buildListQueryContext( options, sort ),
-                ...( context !== undefined ? { context } : {} ),
-                ...( traceID !== undefined ? { traceID } : {} )
-            }));
-
-            benchmark?.step( 'CONVERTER' );
-
-            const first = orderedEntries[0];
-            const last = orderedEntries[orderedEntries.length - 1];
-
-            return attachListMetadata(
-                items,
-                options.count ? total : undefined,
-                {
-                    prev    : first ? getCursor( first, sort ) : undefined,
-                    next    : last ? getCursor( last, sort ) : undefined
-                }
-            );
-        }
-        finally
-        {
-            release();
-        }
+            return this._executeList( pipeline, countPipeline, options, sort, conversion, benchmark );
+        });
     }
 
     public async *stream<K extends keyof Extensions['converters']>(
@@ -1130,42 +1004,29 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
         try
         {
-            const { context, traceID } = options;
-            const bsonInput = ( context !== undefined || traceID !== undefined )
-                ? (({ context: _c, traceID: _t, ...restOpts }) => restOpts )( options )
-                : options;
+            const bsonInput = this._stripObservabilityOptions( options );
             const { projection: convProjection, computedProperties: compProps } = this.converters[conversion];
             let { filter = {}, sort = { _id: 1 }, cursor, limit, projection = convProjection, computedProperties: optionsCompProps, smartFilter: _rawSmartFilter, ...rest } = resolveBSONObject( bsonInput );
-            const prev = cursor?.startsWith( 'prev:' );
 
             if( !sort._id )
             {
                 sort = { ...sort, _id: 1 };
             }
 
-            let accessFilter: Filter<DBE> | undefined;
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'stream', access: options.access });
 
-            try
+            if( access.denied )
             {
-                accessFilter = await this._access.resolve({ operation: 'read', method: 'stream', access: options.access });
-            }
-            catch( e )
-            {
-                if( e instanceof ModelAccessDeniedError )
-                {
-                    return;
-                }
-
-                throw e;
+                return;
             }
 
             const [ smartFilter, convProps, optProps ] = await Promise.all(
             [
                 options.smartFilter ? this.resolveSmartFilter( options.smartFilter ) : undefined,
-                this.resolveComputedProperties( compProps ),
-                this.resolveComputedProperties( optionsCompProps )
+                compProps ? this.resolveComputedProperties( compProps ) : undefined,
+                optionsCompProps ? this.resolveComputedProperties( optionsCompProps ) : undefined
             ]);
-            const computedProperties = mergeComputedProperties({ '': convProps }, { '': optProps })[''];
+            const computedProperties = ( convProps || optProps ) ? mergeComputedProperties({ '': convProps }, { '': optProps })[''] : undefined;
 
             let pipeline = await this._pipelineBuilder.pipeline(
             {
@@ -1176,8 +1037,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 smartFilter,
                 cursor,
                 limit,
-                accessFilter,
-                pipeline: options.pipeline,
+                accessFilter : access.filter,
+                pipeline     : options.pipeline,
                 computedProperties
             });
 
@@ -1185,79 +1046,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
 
             flowGet( 'log' ) && DUMP( pipeline );
 
-            const start = Date.now();
-            const emitStreamQuery = ( duration: number ) =>
-            {
-                this._emitQuery( 'stream', pipeline, duration, () => (
-                {
-                    conversion  : String( conversion ),
-                    query       : this._buildListQueryContext( options, sort ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
-                }));
-            };
-
-            try
-            {
-                const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
-
-                if( prev )
-                {
-                    const entries = await cursorDocs.toArray();
-                    const duration = Date.now() - start;
-
-                    LOG_FILE( `Collection: ${this._collectionLabel}` );
-                    LOG_FILE( `TIME: ${duration} ms` );
-                    LOG_FILE( pipeline, true );
-                    emitStreamQuery( duration );
-
-                    for( const dbe of entries.reverse() )
-                    {
-                        yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-                    }
-
-                    return;
-                }
-
-                let emitted = false;
-
-                for await( const dbe of cursorDocs )
-                {
-                    if( !emitted )
-                    {
-                        emitted = true;
-                        const duration = Date.now() - start;
-
-                        LOG_FILE( `Collection: ${this._collectionLabel}` );
-                        LOG_FILE( `TIME: ${duration} ms` );
-                        LOG_FILE( pipeline, true );
-                        emitStreamQuery( duration );
-                    }
-
-                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-                }
-
-                if( !emitted )
-                {
-                    emitStreamQuery( Date.now() - start );
-                }
-            }
-            catch( e )
-            {
-                if( !( e instanceof ModelConverterError ) )
-                {
-                    this._emitError( e, 'stream', Date.now() - start, () => (
-                    {
-                        ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                        ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                        query : this._buildListQueryContext( options, sort ),
-                        ...( context !== undefined ? { context } : {} ),
-                        ...( traceID !== undefined ? { traceID } : {} )
-                    }));
-                }
-
-                throw e;
-            }
+            yield* this._executeStream( pipeline, options, sort, conversion );
         }
         finally
         {
@@ -1422,7 +1211,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             {
                 if( empty )
                 {
-                    if( targetIds && targetIds.length > 0 )
+                    if( targetIds.length > 0 )
                     {
                         this._invalidateCache( targetIds, false );
                     }
@@ -1430,7 +1219,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                     this._emitMutation( 'deleteMany', 0,
                     {
                         deletedCount    : 0,
-                        ids             : targetIds ?? undefined,
+                        ids             : targetIds.length > 0 ? targetIds : undefined,
                         filter          : rawFilter,
                         ...( smartFilter !== undefined ? { smartFilter } : {} ),
                         ...( context !== undefined ? { context } : {} ),
@@ -1461,7 +1250,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
                 throw e;
             }
 
-            if( targetIds && targetIds.length > 0 )
+            if( targetIds.length > 0 )
             {
                 this._invalidateCache( targetIds, res.deletedCount > 0 );
             }
@@ -1473,7 +1262,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, DBE>
             this._emitMutation( 'deleteMany', Date.now() - start,
             {
                 deletedCount    : res.deletedCount,
-                ids             : targetIds ?? undefined,
+                ids             : targetIds.length > 0 ? targetIds : undefined,
                 filter          : finalMatch,
                 ...( smartFilter !== undefined ? { smartFilter } : {} ),
                 ...( context !== undefined ? { context } : {} ),

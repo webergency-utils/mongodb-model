@@ -359,7 +359,9 @@ export class ModelCache implements ModelCacheInstance
                 continue;
             }
 
-            for( const key of Array.from( keys ) )
+            this.#idIndex.delete( id );
+
+            for( const key of keys )
             {
                 const entry = this.#entries.get( key );
 
@@ -369,8 +371,6 @@ export class ModelCache implements ModelCacheInstance
                     evictedKeys.push( key );
                 }
             }
-
-            this.#idIndex.delete( id );
         }
 
         return evictedKeys;

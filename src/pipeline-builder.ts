@@ -39,15 +39,21 @@ export class PipelineBuilder<DBE extends MongoRootDocument = MongoRootDocument>
         };
 
         const prev = options.cursor?.startsWith( 'prev:' );
+        const addedFieldsSmartFilterAll = options.smartFilter?.pipeline?.length
+            ? new Set( collectAddedFields( options.smartFilter.pipeline ))
+            : undefined;
+        let addedFieldsSmartFilter: string[] = [];
 
-        const addedFieldsComputedProperties = new Set( collectAddedFields(
-        [
-            ...( computedFields && Object.keys( computedFields ).length ? [{ $addFields: computedFields }] : [] ),
-            ...( computedPipeline?.length && computedPipeline || [] )
-        ]));
-        const addedFieldsSmartFilterAll = new Set( collectAddedFields( options.smartFilter?.pipeline || [] ));
+        if( addedFieldsSmartFilterAll && addedFieldsSmartFilterAll.size > 0 )
+        {
+            const addedFieldsComputedProperties = new Set( collectAddedFields(
+            [
+                ...( computedFields && Object.keys( computedFields ).length ? [{ $addFields: computedFields }] : [] ),
+                ...( computedPipeline?.length && computedPipeline || [] )
+            ]));
 
-        const addedFieldsSmartFilter = [ ...addedFieldsSmartFilterAll ].filter( x => !addedFieldsComputedProperties.has( x ));
+            addedFieldsSmartFilter = [ ...addedFieldsSmartFilterAll ].filter( x => !addedFieldsComputedProperties.has( x ));
+        }
 
         return resolveBSONObject(
         [

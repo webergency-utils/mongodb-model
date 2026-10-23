@@ -1,5 +1,6 @@
 import { Document } from 'mongodb';
 import { flowGet } from './flow.js';
+import { isSet } from './helpers/mongo.js';
 import { EMIT_OBSERVABILITY_EVENT, GET_OBSERVABILITY_OPTIONS, RESOLVED_OPERATION_FILTER } from './symbols.js';
 
 export type ModelQueryOperation = 'get' | 'getMany' | 'list' | 'stream' | 'aggregate' | 'count' | 'find' | 'exists';
@@ -401,16 +402,6 @@ function isPlainRecord( value: unknown ): value is Record<string, unknown>
     return typeof value === 'object' && value !== null && !Array.isArray( value );
 }
 
-function hasEnumerableKey( obj: Record<string, unknown> ): boolean
-{
-    for( const _ in obj )
-    {
-        return true;
-    }
-
-    return false;
-}
-
 export function resolveObservabilityContext(
     optionsContext?: ObservabilityContextResolver,
     payloadContext?: Record<string, unknown>
@@ -460,12 +451,7 @@ export function resolveObservabilityContext(
         merged = Object.assign( merged ?? {}, payloadContext );
     }
 
-    if( !merged || !hasEnumerableKey( merged ) )
-    {
-        return undefined;
-    }
-
-    return merged;
+    return isSet( merged ) ? merged : undefined;
 }
 
 export class ModelEventEmitter

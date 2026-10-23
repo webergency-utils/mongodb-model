@@ -10,19 +10,17 @@ import
 from 'mongodb';
 import { AbstractBaseModel } from './base-model.js';
 import { extractTargetIdsFromFilter } from './cache.js';
-import { ModelAccessDeniedError, ModelConverterError, ModelError } from './errors.js';
+import { ModelAccessDeniedError, ModelError } from './errors.js';
 import { ModelMutationOperation } from './events.js';
 import { flowGet } from './flow.js';
 import { Benchmark } from './helpers/benchmark.js';
 import
 {
     LOG,
-    LOG_FILE,
     addPrefixToFilter,
     addPrefixToUpdate,
     collectAddedFields,
     generateCursorCondition,
-    getCursor,
     getSubPaths,
     getUsedFields,
     isExclusionProjection,
@@ -41,7 +39,6 @@ import { propertyModelTargetUpdateParams } from './helpers/mongo.js';
 import { AbstractModels } from './models.js';
 import
 {
-    attachCursorToItem,
     attachListMetadata,
     attachPropertyUpdateMetadata,
     buildPropertyDeleteOperation,
@@ -161,9 +158,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
     {
         const preResolvedAccess = ( options as any )?.[RESOLVED_ACCESS] as { denied: boolean, filter?: Filter<DBE> } | undefined;
         const { computedProperties } = this.converters[conversion ?? 'dto'];
-        let { filter = {} as PropertyModelFilter<RootDBE, DBE>, sort = { id: -1 }, ...rest } = resolveBSONObject( options );
-
-        void filter;
+        const { sort = { id: -1 }, projection, skip, limit, pipeline: userPipeline } = resolveBSONObject( options );
 
         let pipeline: Document[] = [], prefix = '$';
 
@@ -172,43 +167,48 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             options.smartFilter
                 ? this.resolveSmartFilter( options.smartFilter as any ) as Promise<{ [prefix: string]: { filter?: Filter<any>, pipeline?: Document[] } }>
                 : undefined,
-            this.resolveComputedProperties( computedProperties ),
-            this.resolveComputedProperties( options.computedProperties )
+            computedProperties ? this.resolveComputedProperties( computedProperties ) : undefined,
+            options.computedProperties ? this.resolveComputedProperties( options.computedProperties ) : undefined
         ]);
-        const computed = mergeComputedProperties( converterProperties as any, optionsProperties as any );
+        const computed = ( converterProperties || optionsProperties )
+            ? mergeComputedProperties( converterProperties as any, optionsProperties as any )
+            : undefined;
 
-        const gatheredFields = Object.values( computed || { fields: null, pipeline: null })
-            .reduce(( acc, val ) =>
+        const gatheredFields = computed
+            ? Object.values( computed ).reduce<{ fields: Record<string, any>, pipeline: Document[] }>(( acc, val ) =>
             {
-                const fields = { ...acc?.fields, ...val?.fields };
-                const stages = [ ...acc?.pipeline!, ...( val?.pipeline || [] ) ];
+                const fields = { ...acc.fields, ...val?.fields };
+                const stages = [ ...acc.pipeline, ...( val?.pipeline || [] ) ];
 
                 return { fields, pipeline: stages };
-            }, { fields: {}, pipeline: [] as Document[] });
+            }, { fields: {}, pipeline: [] })
+            : { fields: {} as Record<string, any>, pipeline: [] as Document[] };
 
-        let computedAddedFields = Object.fromEntries(([
-            ...collectAddedFields( [{ $addFields: gatheredFields?.fields || {} }] ),
-            ...collectAddedFields( gatheredFields?.pipeline || [] )
-        ]).map( f =>
+        let computedAddedFields: Record<string, any> = {};
+
+        if( isSet( gatheredFields.fields ) || gatheredFields.pipeline.length > 0 )
         {
-            if( f.startsWith( this.#prefix + '.' ) )
+            const prefixDot = this.#prefix + '.';
+
+            computedAddedFields = Object.fromEntries(([
+                ...( isSet( gatheredFields.fields ) ? collectAddedFields( [{ $addFields: gatheredFields.fields }] ) : [] ),
+                ...( gatheredFields.pipeline.length > 0 ? collectAddedFields( gatheredFields.pipeline ) : [] )
+            ]).map( f =>
             {
-                return [ f.replace( new RegExp( '^' + this.#prefix + '.' ), '' ), 1 ];
-            }
+                if( f.startsWith( prefixDot ) )
+                {
+                    return [ f.slice( prefixDot.length ), 1 ];
+                }
 
-            return [ f.split( '.' ).reverse()[0], '$_root.' + f ];
-        }));
-        computedAddedFields = projectionToReplace( computedAddedFields, this.#prefix ) as {[p: string]: any};
+                return [ f.split( '.' ).reverse()[0], '$_root.' + f ];
+            }));
+            computedAddedFields = projectionToReplace( computedAddedFields, this.#prefix ) as Record<string, any>;
+        }
 
-        const gatheredFilters = Object.values( smartFilter || {})
-            .reduce(( acc, val ) =>
-            {
-                const nextFilter = { ...acc?.filter, ...val?.filter } as Filter<DBE>;
-                const stages = [ ...acc?.pipeline!, ...( val?.pipeline || [] ) ] as Document[];
-
-                return { filter: nextFilter, pipeline: stages };
-            }, { filter: {} as Filter<DBE>, pipeline: [] as Document[] });
-        const needRoot = getUsedFields( gatheredFilters?.pipeline ?? [] ).used.some( el => el.startsWith( '_root.' ));
+        const gatheredPipeline = smartFilter
+            ? Object.values( smartFilter ).flatMap( val => val?.pipeline || [] )
+            : [];
+        const needRoot = gatheredPipeline.length > 0 && getUsedFields( gatheredPipeline ).used.some( el => el.startsWith( '_root.' ));
 
         const stages = await this.#filterStages( options, method, preResolvedAccess );
         const subPaths = getSubPaths( this.#paths );
@@ -236,7 +236,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         let $project: string | Record<string, unknown> = '$' + this.#prefix, $rootProject;
 
-        const { rootProjection, propertyProjection } = this.#splitProjection( rest.projection ?? {});
+        const { rootProjection, propertyProjection } = this.#splitProjection( projection ?? {});
 
         const unsetFieldsRoot = isExclusionProjection( rootProjection ) && getUsedFields( [{ $match: rootProjection }] ).used.map( el => ( '_root.' + el )) || [];
         const unsetFieldsProperty = isExclusionProjection( propertyProjection ) && getUsedFields( [{ $match: propertyProjection }] ).used || [];
@@ -272,9 +272,9 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         pipeline.push( ...await this._pipelineBuilder.pipeline(
         {
             sort        : prev ? reverseSort( sort ) : sort,
-            skip        : rest.skip,
-            limit       : rest.limit,
-            pipeline    : rest.pipeline
+            skip,
+            limit,
+            pipeline    : userPipeline
         }));
 
         return pipeline;
@@ -282,9 +282,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
     public async create( parentID: any, dbe: Omit<DBE, 'id'>, id?: DTO['id'], options?: ModelCreateOptions ): Promise<DTO['id']>
     {
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async() =>
         {
             const access = await this._access.resolveOrDeny({ operation: 'create', method: 'create', access: options?.access });
 
@@ -337,11 +335,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
                 throw e;
             }
-        }
-        finally
-        {
-            release();
-        }
+        });
     }
 
     public async createFrom(
@@ -904,9 +898,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         options?: ModelUpdateOptions
     ): Promise<PropertyModelUpdateResponse<DBE>>
     {
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async() =>
         {
             const path = `${this.#prefix}.id`;
             const isIdArray = Array.isArray( idsOrFilter );
@@ -1004,11 +996,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             flowGet( 'log' ) && LOG({ res });
 
             return { matchedRootCount: res.matchedCount, modifiedRootCount: res.modifiedCount };
-        }
-        finally
-        {
-            release();
-        }
+        });
     }
 
     public override async get<K extends keyof Extensions['converters'] = 'dto'>(
@@ -1079,32 +1067,16 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
         conversion: K = 'dto' as K
     ): Promise<WithTotal<Array<Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string }>>>
     {
-        const release = this.trackOperation();
-
-        try
+        return this.runOperation( async() =>
         {
-            const { context, traceID } = options;
-            const bsonInput = ( context !== undefined || traceID !== undefined )
-                ? (({ context: _c, traceID: _t, ...restOpts }) => restOpts )( options )
-                : options;
+            const bsonInput = this._stripObservabilityOptions( options );
             const { projection } = this.converters[conversion];
-            const prev = options.cursor?.startsWith( 'prev:' );
             const benchmark = flowGet( 'benchmark' ) ? new Benchmark( this.constructor.name + ':list(' + String( conversion ) + ')' ) : undefined;
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'list', access: options.access });
 
-            let accessFilter: Filter<DBE> | undefined;
-
-            try
+            if( access.denied )
             {
-                accessFilter = await this._access.resolve({ operation: 'read', method: 'list', access: options.access });
-            }
-            catch( e )
-            {
-                if( e instanceof ModelAccessDeniedError )
-                {
-                    return attachListMetadata([], options.count ? 0 : undefined, {});
-                }
-
-                throw e;
+                return attachListMetadata([], options.count ? 0 : undefined, {});
             }
 
             const resolvedList = resolveBSONObject( bsonInput );
@@ -1117,7 +1089,7 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 sort = { ...sort, id: 1 };
             }
 
-            const resolvedAccess = { denied: false, filter: accessFilter };
+            const resolvedAccess = { denied: false, filter: access.filter };
             let [ pipeline, countPipeline ] = await Promise.all(
             [
                 this.pipeline({ ...resolvedList, sort, projection, [RESOLVED_ACCESS]: resolvedAccess } as any, conversion, 'list' ),
@@ -1130,100 +1102,8 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
             pipeline = this._optimizePipeline( pipeline );
             countPipeline && ( countPipeline = this._optimizePipeline( countPipeline ));
 
-            const start = Date.now();
-            let queryDuration = 0;
-            let entries: Document[];
-            let total: number | undefined;
-
-            try
-            {
-                [ entries, total ] = await Promise.all(
-                [
-                    this.collection.aggregate( pipeline, { collation: { locale: 'en' } }).toArray().then( r =>
-                    {
-                        queryDuration = Date.now() - start;
-
-                        LOG_FILE( `Collection: ${this._collectionLabel}` );
-                        LOG_FILE( `TIME: ${queryDuration} ms` );
-                        LOG_FILE( pipeline, true );
-
-                        return r;
-                    }),
-                    countPipeline
-                        ? this.collection.aggregate( countPipeline, { collation: { locale: 'en' } }).toArray().then( r =>
-                        {
-                            const duration = Date.now() - start;
-
-                            LOG_FILE( `Collection: ${this._collectionLabel}` );
-                            LOG_FILE( `TIME: ${duration} ms` );
-                            LOG_FILE( countPipeline, true );
-                            this._emitQuery( 'count', countPipeline!, duration, () => (
-                            {
-                                resultCount : r[0]?.count ?? 0,
-                                query       : this._buildListQueryContext( options, sort ),
-                                ...( context !== undefined ? { context } : {} ),
-                                ...( traceID !== undefined ? { traceID } : {} )
-                            }));
-
-                            return r[0]?.count ?? 0;
-                        })
-                        : undefined
-                ]);
-            }
-            catch( e )
-            {
-                this._emitError( e, 'list', Date.now() - start, () => (
-                {
-                    ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                    ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                    query : this._buildListQueryContext( options, sort ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
-                }));
-
-                throw e;
-            }
-
-            benchmark?.step( 'QUERY' );
-
-            const orderedEntries = prev ? [ ...entries ].reverse() : entries;
-            const convStart = Date.now();
-            const items = await Promise.all( orderedEntries.map( async( dbe ) =>
-            {
-                const dto = await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>> & { $cursor?: string };
-
-                return attachCursorToItem( dto, dbe, sort );
-            }));
-            const converterDuration = Date.now() - convStart;
-
-            this._emitQuery( 'list', pipeline, queryDuration, () => (
-            {
-                converterDuration,
-                resultCount : items.length,
-                conversion  : String( conversion ),
-                query       : this._buildListQueryContext( options, sort ),
-                ...( context !== undefined ? { context } : {} ),
-                ...( traceID !== undefined ? { traceID } : {} )
-            }));
-
-            benchmark?.step( 'CONVERTER' );
-
-            const first = orderedEntries[0];
-            const last = orderedEntries[orderedEntries.length - 1];
-
-            return attachListMetadata(
-                items,
-                resolvedList.count ? total : undefined,
-                {
-                    prev    : first ? getCursor( first, sort ) : undefined,
-                    next    : last ? getCursor( last, sort ) : undefined
-                }
-            );
-        }
-        finally
-        {
-            release();
-        }
+            return this._executeList( pipeline, countPipeline, options, sort, conversion, benchmark, Boolean( resolvedList.count ));
+        });
     }
 
     public async *stream<K extends keyof Extensions['converters']>(
@@ -1235,27 +1115,13 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
 
         try
         {
-            const { context, traceID } = options;
-            const bsonInput = ( context !== undefined || traceID !== undefined )
-                ? (({ context: _c, traceID: _t, ...restOpts }) => restOpts )( options )
-                : options;
+            const bsonInput = this._stripObservabilityOptions( options );
             const { projection } = this.converters[conversion];
-            const prev = options.cursor?.startsWith( 'prev:' );
+            const access = await this._access.resolveOrDeny({ operation: 'read', method: 'stream', access: options.access });
 
-            let accessFilter: Filter<DBE> | undefined;
-
-            try
+            if( access.denied )
             {
-                accessFilter = await this._access.resolve({ operation: 'read', method: 'stream', access: options.access });
-            }
-            catch( e )
-            {
-                if( e instanceof ModelAccessDeniedError )
-                {
-                    return;
-                }
-
-                throw e;
+                return;
             }
 
             const resolvedList = resolveBSONObject( bsonInput );
@@ -1266,83 +1132,11 @@ extends AbstractBaseModel<DBE, DTO, Extensions, RootDBE, PropertyModelFilter<Roo
                 sort = { ...sort, id: 1 };
             }
 
-            let pipeline = await this.pipeline({ ...resolvedList, sort, projection, [RESOLVED_ACCESS]: { denied: false, filter: accessFilter } } as any, conversion, 'stream' );
+            let pipeline = await this.pipeline({ ...resolvedList, sort, projection, [RESOLVED_ACCESS]: { denied: false, filter: access.filter } } as any, conversion, 'stream' );
 
             pipeline = this._optimizePipeline( pipeline );
 
-            const start = Date.now();
-            const emitStreamQuery = ( duration: number ) =>
-            {
-                this._emitQuery( 'stream', pipeline, duration, () => (
-                {
-                    conversion  : String( conversion ),
-                    query       : this._buildListQueryContext( options, sort ),
-                    ...( context !== undefined ? { context } : {} ),
-                    ...( traceID !== undefined ? { traceID } : {} )
-                }));
-            };
-
-            try
-            {
-                const cursorDocs = this.collection.aggregate( pipeline, { collation: { locale: 'en' } });
-
-                if( prev )
-                {
-                    const entries = await cursorDocs.toArray();
-                    const duration = Date.now() - start;
-
-                    LOG_FILE( `Collection: ${this._collectionLabel}` );
-                    LOG_FILE( `TIME: ${duration} ms` );
-                    LOG_FILE( pipeline, true );
-                    emitStreamQuery( duration );
-
-                    for( const dbe of entries.reverse() )
-                    {
-                        yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-                    }
-
-                    return;
-                }
-
-                let emitted = false;
-
-                for await( const dbe of cursorDocs )
-                {
-                    if( !emitted )
-                    {
-                        emitted = true;
-                        const duration = Date.now() - start;
-
-                        LOG_FILE( `Collection: ${this._collectionLabel}` );
-                        LOG_FILE( `TIME: ${duration} ms` );
-                        LOG_FILE( pipeline, true );
-                        emitStreamQuery( duration );
-                    }
-
-                    yield await this._converters.convert( dbe as DBE, conversion ) as Awaited<ReturnType<Extensions['converters'][K]['converter']>>;
-                }
-
-                if( !emitted )
-                {
-                    emitStreamQuery( Date.now() - start );
-                }
-            }
-            catch( e )
-            {
-                if( !( e instanceof ModelConverterError ) )
-                {
-                    this._emitError( e, 'stream', Date.now() - start, () => (
-                    {
-                        ...( options.filter !== undefined ? { filter: options.filter } : {} ),
-                        ...( options.smartFilter !== undefined ? { smartFilter: options.smartFilter as Record<string, unknown> } : {} ),
-                        query : this._buildListQueryContext( options, sort ),
-                        ...( context !== undefined ? { context } : {} ),
-                        ...( traceID !== undefined ? { traceID } : {} )
-                    }));
-                }
-
-                throw e;
-            }
+            yield* this._executeStream( pipeline, options, sort, conversion );
         }
         finally
         {
