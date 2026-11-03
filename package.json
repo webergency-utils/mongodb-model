@@ -44,7 +44,7 @@
     "@liqd-js/flow": "^1.5.0",
     "@webergency-utils/aggregator": "^0.0.4",
     "@webergency-utils/mongodb-query-optimizer": "^0.2.1",
-    "@webergency-utils/object-hash": "^1.1.2",
+    "@webergency-utils/object-hash": "^1.2.0",
     "mongodb": "^7.7.0",
     "snappy": "^7.4.3"
   },
